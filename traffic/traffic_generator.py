@@ -4,8 +4,10 @@ import argparse
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from statistics import fmean
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,7 +17,6 @@ from telemetry.iperf_parser import parse_iperf_output, write_jsonl
 SERVER_IP = "10.0.0.5"
 DURATION = 20
 BOTTLENECK_INTERFACE = "s1-eth5"
-_LAST_QDISC_DROPS = {}
 
 
 def run_on_host(host, command):
@@ -67,6 +68,16 @@ def wait_for_process(process):
     return output
 
 
+def _stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
 def measure_latency(source, destination_ip="10.0.0.5", count=5):
     """Measure average RTT from a Mininet host to the server."""
 
@@ -97,7 +108,32 @@ def measure_latency(source, destination_ip="10.0.0.5", count=5):
     return float(match.group(1))
 
 
-def measure_queue_stats(interface=BOTTLENECK_INTERFACE):
+def _drop_delta(initial_drops, current_drops):
+    """Return interval drops; missing baselines remain unknown.
+
+    A counter reset is treated as a new counter epoch, so the current
+    non-negative cumulative value is used rather than reporting a negative
+    interval.
+    """
+    if initial_drops is None or current_drops is None:
+        return None
+    if current_drops < initial_drops:
+        return current_drops
+    return current_drops - initial_drops
+
+
+def _queue_stats_from_output(output, initial_drops=None):
+    backlog_packets = re.findall(r"\bbacklog\s+\d+\w*\s+(\d+)p\b", output)
+    drop_counts = re.findall(r"\bdropped\s+(\d+)\b", output)
+    current_drops = sum(map(int, drop_counts)) if drop_counts else None
+    return {
+        "queue_size": max(map(int, backlog_packets)) if backlog_packets else None,
+        "queue_drops": _drop_delta(initial_drops, current_drops),
+        "cumulative_drops": current_drops,
+    }
+
+
+def measure_queue_stats(interface=BOTTLENECK_INTERFACE, initial_drops=None):
     """Read queue backlog and drops from the shared bottleneck qdiscs."""
 
     result = subprocess.run(
@@ -111,22 +147,109 @@ def measure_queue_stats(interface=BOTTLENECK_INTERFACE):
         print(f"[TELEMETRY] Could not read qdisc stats: {result.stderr.strip()}")
         return {"queue_size": None, "queue_drops": None}
 
-    backlog_packets = re.findall(r"\bbacklog\s+\d+\w*\s+(\d+)p\b", result.stdout)
-    drop_counts = re.findall(r"\bdropped\s+(\d+)\b", result.stdout)
+    stats = _queue_stats_from_output(result.stdout, initial_drops)
+    stats.pop("cumulative_drops")
+    return stats
 
-    queue_size = max(map(int, backlog_packets)) if backlog_packets else None
-    cumulative_drops = sum(map(int, drop_counts)) if drop_counts else None
-    queue_drops = None
 
-    if cumulative_drops is not None:
-        previous_drops = _LAST_QDISC_DROPS.get(interface)
-        if previous_drops is None or cumulative_drops < previous_drops:
-            queue_drops = cumulative_drops
-        else:
-            queue_drops = cumulative_drops - previous_drops
-        _LAST_QDISC_DROPS[interface] = cumulative_drops
+def _initial_queue_drops(interface=BOTTLENECK_INTERFACE):
+    """Capture the cumulative qdisc drop baseline without resetting qdiscs."""
+    try:
+        result = subprocess.run(
+            ["tc", "-s", "qdisc", "show", "dev", interface],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"[TELEMETRY] Could not read initial qdisc stats: {exc}")
+        return None
+    if result.returncode != 0:
+        print(f"[TELEMETRY] Could not read initial qdisc stats: {result.stderr.strip()}")
+        return None
+    return _queue_stats_from_output(result.stdout)["cumulative_drops"]
 
-    return {"queue_size": queue_size, "queue_drops": queue_drops}
+
+def summarize_measurements(latencies, queues, drops):
+    """Summarize shared in-scenario samples for the telemetry schema."""
+    valid_latencies = [value for value in latencies if value is not None]
+    valid_queues = [value for value in queues if value is not None]
+    valid_drops = [value for value in drops if value is not None]
+    return {
+        "latency_ms": fmean(valid_latencies) if valid_latencies else None,
+        "queue_size": max(valid_queues) if valid_queues else None,
+        "queue_drops": max(valid_drops) if valid_drops else None,
+    }
+
+
+class ScenarioMonitor:
+    """Sample shared queue state and host RTTs while traffic is active.
+
+    Queue samples describe the bottleneck as a whole. If copied into multiple
+    flow records, they are shared scenario measurements, not per-flow values.
+    """
+
+    def __init__(
+        self,
+        hosts,
+        interface=BOTTLENECK_INTERFACE,
+        interval=1.0,
+        latency_probe_count=1,
+    ):
+        self.hosts = tuple(hosts)
+        self.interface = interface
+        self.interval = interval
+        self.latency_probe_count = latency_probe_count
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._latencies = []
+        self._queue_sizes = []
+        self._queue_drops = []
+        self._initial_drops = None
+
+    def start(self):
+        self._initial_drops = _initial_queue_drops(self.interface)
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="scenario-telemetry-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _sample(self):
+        for host in self.hosts:
+            try:
+                latency = measure_latency(
+                    host, count=self.latency_probe_count
+                )
+                self._latencies.append(latency)
+            except Exception as exc:
+                print(f"[TELEMETRY] RTT measurement failed for {host}: {exc}")
+                self._latencies.append(None)
+        try:
+            queue_stats = measure_queue_stats(
+                self.interface, initial_drops=self._initial_drops
+            )
+            self._queue_sizes.append(queue_stats["queue_size"])
+            self._queue_drops.append(queue_stats["queue_drops"])
+        except Exception as exc:
+            print(f"[TELEMETRY] Queue measurement failed: {exc}")
+            self._queue_sizes.append(None)
+            self._queue_drops.append(None)
+
+    def _run(self):
+        while not self._stop_event.wait(self.interval):
+            self._sample()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        return summarize_measurements(
+            self._latencies, self._queue_sizes, self._queue_drops
+        )
 
 
 def save_telemetry(
@@ -194,14 +317,18 @@ def normal():
     print("\n=== NORMAL SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
-    process = run_on_host(
-        "h1",
-        ["iperf3", "-c", SERVER_IP, "-u", "-b", "3M", "-t", str(DURATION)]
-    )
-
-    output = wait_for_process(process)
-    latency_ms = measure_latency("h1")
-    queue_stats = measure_queue_stats()
+    process = None
+    monitor = ScenarioMonitor(["h1"]).start()
+    try:
+        process = run_on_host(
+            "h1",
+            ["iperf3", "-c", SERVER_IP, "-u", "-b", "3M", "-t", str(DURATION)]
+        )
+        output = wait_for_process(process)
+    finally:
+        summary = monitor.stop()
+        if process is not None:
+            _stop_process(process)
 
     save_telemetry(
         output,
@@ -210,15 +337,19 @@ def normal():
         experiment_id=experiment_id,
         requested_mbps=3,
         active_flows=1,
-        latency_ms=latency_ms,
-        **queue_stats,
+        **summary,
     )
 
     print("\n[TRAFFIC] Normal scenario completed.")
 
 
 def congestion():
-    """Four 4 Mbps UDP flows for 20 seconds through the bottleneck."""
+    """Four 4 Mbps UDP flows for 20 seconds through the bottleneck.
+
+    A startup or collection failure aborts the scenario without writing
+    incomplete flow records; successfully collected output is not persisted
+    because the scenario result is intentionally all-or-nothing.
+    """
 
     print("\n=== CONGESTION SCENARIO ===")
     experiment_id = str(uuid.uuid4())
@@ -231,29 +362,31 @@ def congestion():
     ]
 
     processes = []
-
-    for host, rate, port in flows:
-
-        process = run_on_host(
-            host,
-            [
-                "iperf3",
-                "-c", SERVER_IP,
-                "-u",
-                "-b", f"{rate}M",
-                "-p", str(port),
-                "-t", str(DURATION),
-            ],
-        )
-
-        processes.append(process)
-
-    print("\n[TRAFFIC] All congestion flows started.")
-
+    monitor = ScenarioMonitor(["h1", "h2", "h3", "h4"]).start()
     flow_outputs = []
-    for process, flow in zip(processes, flows):
-        output = wait_for_process(process)
-        flow_outputs.append((output, flow))
+    try:
+        for host, rate, port in flows:
+            process = run_on_host(
+                host,
+                [
+                    "iperf3",
+                    "-c", SERVER_IP,
+                    "-u",
+                    "-b", f"{rate}M",
+                    "-p", str(port),
+                    "-t", str(DURATION),
+                ],
+            )
+            processes.append(process)
+
+        print("\n[TRAFFIC] All congestion flows started.")
+        for process, flow in zip(processes, flows):
+            output = wait_for_process(process)
+            flow_outputs.append((output, flow))
+    finally:
+        summary = monitor.stop()
+        for process in processes:
+            _stop_process(process)
 
     records = [
         parse_iperf_output(
@@ -270,10 +403,7 @@ def congestion():
     total_throughput_mbps = sum(
         record["throughput_mbps"] for record in records
     )
-    queue_stats = measure_queue_stats()
-
     for output, (host, rate, port) in flow_outputs:
-        latency_ms = measure_latency(host)
         save_telemetry(
             output,
             source=host,
@@ -282,8 +412,7 @@ def congestion():
             requested_mbps=rate,
             active_flows=4,
             total_throughput_mbps=total_throughput_mbps,
-            latency_ms=latency_ms,
-            **queue_stats,
+            **summary,
         )
 
     print("\n[TRAFFIC] Congestion scenario completed.")
@@ -298,14 +427,18 @@ def burst():
 
         print(f"\n[TRAFFIC] Starting burst {i + 1}/5")
 
-        process = run_on_host(
-            "h1",
-            ["iperf3", "-c", SERVER_IP, "-u", "-b", "8M", "-t", "3"]
-        )
-
-        output = wait_for_process(process)
-        latency_ms = measure_latency("h1")
-        queue_stats = measure_queue_stats()
+        process = None
+        monitor = ScenarioMonitor(["h1"]).start()
+        try:
+            process = run_on_host(
+                "h1",
+                ["iperf3", "-c", SERVER_IP, "-u", "-b", "8M", "-t", "3"]
+            )
+            output = wait_for_process(process)
+        finally:
+            summary = monitor.stop()
+            if process is not None:
+                _stop_process(process)
 
         save_telemetry(
             output,
@@ -314,8 +447,7 @@ def burst():
             experiment_id=experiment_id,
             requested_mbps=8,
             active_flows=1,
-            latency_ms=latency_ms,
-            **queue_stats,
+            **summary,
         )
 
         print(f"[TRAFFIC] Burst {i + 1}/5 completed.")
