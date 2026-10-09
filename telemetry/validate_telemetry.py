@@ -29,6 +29,18 @@ REQUIRED_FIELDS = (
     "queue_drops",
 )
 
+OPTIONAL_INTERVAL_FIELDS = (
+    "observation_timestamp",
+    "interval_start_seconds",
+    "interval_end_seconds",
+    "interval_duration_seconds",
+    "interval_id",
+    "latency_measurement_timestamp",
+    "queue_measurement_timestamp",
+    "latency_measurement_age_seconds",
+    "queue_measurement_age_seconds",
+)
+
 STRING_FIELDS = (
     "timestamp",
     "experiment_id",
@@ -86,7 +98,8 @@ def _validate_record(record):
         return ["record must be a JSON object"]
 
     missing = [field for field in REQUIRED_FIELDS if field not in record]
-    extra = [field for field in record if field not in REQUIRED_FIELDS]
+    allowed_fields = set(REQUIRED_FIELDS) | set(OPTIONAL_INTERVAL_FIELDS)
+    extra = [field for field in record if field not in allowed_fields]
     if missing:
         errors.append(f"missing fields: {', '.join(missing)}")
     if extra:
@@ -96,20 +109,43 @@ def _validate_record(record):
         if field in record and not isinstance(record[field], str):
             errors.append(f"{field} must be a string")
 
-    timestamp = record.get("timestamp")
-    if isinstance(timestamp, str):
-        try:
-            parsed_timestamp = datetime.fromisoformat(
-                timestamp.replace("Z", "+00:00")
-            )
-        except ValueError:
-            errors.append("timestamp must be a valid ISO-8601 datetime")
-        else:
-            if (
-                parsed_timestamp.tzinfo is None
-                or parsed_timestamp.utcoffset() != timezone.utc.utcoffset(None)
-            ):
-                errors.append("timestamp must include a UTC timezone")
+    for field in (
+        "observation_timestamp",
+        "latency_measurement_timestamp",
+        "queue_measurement_timestamp",
+        "interval_id",
+    ):
+        if field in record and not isinstance(record[field], str):
+            errors.append(f"{field} must be a string")
+
+    for timestamp_field in (
+        "timestamp",
+        "observation_timestamp",
+        "latency_measurement_timestamp",
+        "queue_measurement_timestamp",
+    ):
+        timestamp = record.get(timestamp_field)
+        if timestamp is None and timestamp_field != "timestamp":
+            continue
+        if isinstance(timestamp, str):
+            try:
+                parsed_timestamp = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")
+                )
+            except ValueError:
+                errors.append(
+                    f"{timestamp_field} must be a valid ISO-8601 datetime"
+                )
+            else:
+                if (
+                    parsed_timestamp.tzinfo is None
+                    or parsed_timestamp.utcoffset() != timezone.utc.utcoffset(None)
+                ):
+                    errors.append(
+                        f"{timestamp_field} must include a UTC timezone"
+                    )
+        elif timestamp is not None:
+            errors.append(f"{timestamp_field} must be a string")
 
     for field in NUMERIC_FIELDS:
         if field not in record:
@@ -140,6 +176,20 @@ def _validate_record(record):
             0 <= value <= 100
         ):
             errors.append(f"{field} must be between 0 and 100")
+
+    for field in (
+        "interval_start_seconds",
+        "interval_end_seconds",
+        "interval_duration_seconds",
+        "latency_measurement_age_seconds",
+        "queue_measurement_age_seconds",
+    ):
+        if field in record:
+            value = record[field]
+            if not _is_number(value) or not math.isfinite(value):
+                errors.append(f"{field} must be a finite number")
+            elif value < 0:
+                errors.append(f"{field} must be non-negative")
 
     active_flows = record.get("active_flows")
     if isinstance(active_flows, int) and active_flows < 0:

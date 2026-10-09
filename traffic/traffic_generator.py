@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import math
 import re
 import subprocess
@@ -9,16 +10,24 @@ import threading
 import time
 import uuid
 from statistics import fmean
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from telemetry.iperf_parser import parse_iperf_output, write_jsonl
+from telemetry.iperf_parser import (
+    parse_iperf_interval_events,
+    parse_iperf_output,
+    write_interval_jsonl,
+    write_jsonl,
+)
 
 
 SERVER_IP = "10.0.0.5"
 DURATION = 20
 BOTTLENECK_INTERFACE = "s1-eth5"
 DATASET_DIR = Path(__file__).resolve().parents[1] / "telemetry" / "datasets"
+INTERVAL_DATASET_DIR = DATASET_DIR
+MONITOR_FRESHNESS_SECONDS = 2.0
 
 
 def run_on_host(host, command):
@@ -52,8 +61,97 @@ def run_on_host(host, command):
 )
 
 
+class _IperfIntervalReader:
+    """Own one iperf stdout pipe while retaining interval and final output."""
+
+    def __init__(self, process, callback):
+        self.process = process
+        self.callback = callback
+        self.lines = []
+        self.error = None
+        self._thread = threading.Thread(target=self._read, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _read(self):
+        try:
+            for line in self.process.stdout:
+                self.lines.append(line)
+                try:
+                    event = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    if str(line).strip():
+                        if self.error is None:
+                            self.error = ValueError(
+                                "iperf JSON stream contained malformed JSON"
+                            )
+                    continue
+                if not isinstance(event, dict):
+                    if self.error is None:
+                        self.error = ValueError(
+                            "iperf JSON stream event must be an object"
+                        )
+                    continue
+                if event.get("event") == "error":
+                    if self.error is None:
+                        data = event.get("data")
+                        self.error = RuntimeError(
+                            f"iperf reported an error: {data}"
+                        )
+                    continue
+                if event.get("event") == "interval":
+                    try:
+                        self.callback(line)
+                    except Exception as exc:
+                        # Continue draining stdout so a writer/parser failure
+                        # cannot deadlock the iperf process on a full pipe.
+                        if self.error is None:
+                            self.error = exc
+        except Exception as exc:
+            self.error = exc
+
+    def join(self):
+        self._thread.join()
+        return "".join(self.lines)
+
+
+def start_interval_reader(process, callback):
+    """Start the sole stdout reader for an iperf JSON-stream process."""
+    if getattr(process, "stdout", None) is None:
+        return None
+    reader = _IperfIntervalReader(process, callback).start()
+    process._interval_reader = reader
+    return reader
+
+
 def wait_for_process(process):
     """Wait for a traffic process and return its iperf3 output."""
+
+    reader = getattr(process, "_interval_reader", None)
+    if reader is not None:
+        process.wait()
+        output = reader.join()
+        process_error = None
+        if process.returncode != 0:
+            process_error = subprocess.CalledProcessError(
+                process.returncode, process.args, output
+            )
+        if reader.error is not None and process_error is not None:
+            raise RuntimeError(
+                "iperf exited with an error and interval collection failed: "
+                f"{process_error}; {reader.error}"
+            ) from reader.error
+        if reader.error is not None:
+            raise RuntimeError(
+                "iperf interval collection failed"
+            ) from reader.error
+        if process_error is not None:
+            print(output)
+            raise process_error
+        print(output)
+        return output
 
     output, _ = process.communicate()
 
@@ -208,6 +306,15 @@ class ScenarioMonitor:
         self._queue_sizes = []
         self._queue_drops = []
         self._initial_drops = None
+        self._latest_latency = None
+        self._latest_queue = {
+            "queue_size": None,
+            "queue_drops": None,
+        }
+        self._latency_timestamp = None
+        self._queue_timestamp = None
+        self._latency_monotonic = None
+        self._queue_monotonic = None
 
     def start(self):
         self._initial_drops = _initial_queue_drops(self.interface)
@@ -221,12 +328,15 @@ class ScenarioMonitor:
         return self
 
     def _sample(self):
+        current_latencies = []
         for host in self.hosts:
             try:
                 latency = measure_latency(
                     host, count=self.latency_probe_count
                 )
                 self._latencies.append(latency)
+                if latency is not None:
+                    current_latencies.append(latency)
             except Exception as exc:
                 print(f"[TELEMETRY] RTT measurement failed for {host}: {exc}")
                 self._latencies.append(None)
@@ -236,10 +346,56 @@ class ScenarioMonitor:
             )
             self._queue_sizes.append(queue_stats["queue_size"])
             self._queue_drops.append(queue_stats["queue_drops"])
+            self._latest_queue = {
+                "queue_size": queue_stats["queue_size"],
+                "queue_drops": queue_stats["queue_drops"],
+            }
+            self._queue_timestamp = datetime.now(timezone.utc).isoformat()
+            self._queue_monotonic = time.monotonic()
         except Exception as exc:
             print(f"[TELEMETRY] Queue measurement failed: {exc}")
             self._queue_sizes.append(None)
             self._queue_drops.append(None)
+            self._latest_queue = {"queue_size": None, "queue_drops": None}
+        if current_latencies:
+            self._latest_latency = fmean(current_latencies)
+            self._latency_timestamp = datetime.now(timezone.utc).isoformat()
+            self._latency_monotonic = time.monotonic()
+
+    def latest_measurement(self, max_age=MONITOR_FRESHNESS_SECONDS):
+        """Return fresh shared values and diagnostic age metadata."""
+        now = time.monotonic()
+        latency_age = (
+            now - self._latency_monotonic
+            if self._latency_monotonic is not None
+            else None
+        )
+        queue_age = (
+            now - self._queue_monotonic
+            if self._queue_monotonic is not None
+            else None
+        )
+        return {
+            "latency_ms": (
+                self._latest_latency
+                if latency_age is not None and latency_age <= max_age
+                else None
+            ),
+            "queue_size": (
+                self._latest_queue["queue_size"]
+                if queue_age is not None and queue_age <= max_age
+                else None
+            ),
+            "queue_drops": (
+                self._latest_queue["queue_drops"]
+                if queue_age is not None and queue_age <= max_age
+                else None
+            ),
+            "latency_measurement_timestamp": self._latency_timestamp,
+            "queue_measurement_timestamp": self._queue_timestamp,
+            "latency_measurement_age_seconds": latency_age,
+            "queue_measurement_age_seconds": queue_age,
+        }
 
     def _run(self):
         while not self._stop_event.wait(self.interval):
@@ -314,6 +470,39 @@ def save_telemetry(
     print(f"[TELEMETRY] {record}")
 
 
+def save_interval_telemetry(
+    line,
+    source,
+    scenario,
+    experiment_id,
+    requested_mbps,
+    active_flows,
+    monitor,
+):
+    """Parse and persist one genuine iperf interval observation.
+
+    Interval files are intentionally separate from the existing final
+    aggregate files, so current consumers continue to see only final records.
+    RTT and queue values are the latest monitor sample at interval-report
+    receipt time; the two measurements are therefore aligned approximately,
+    not guaranteed simultaneous.
+    """
+    filename = INTERVAL_DATASET_DIR / f"{scenario}_intervals.jsonl"
+    records = parse_iperf_interval_events(
+        line,
+        source=source,
+        experiment_id=experiment_id,
+        scenario=scenario,
+        requested_mbps=requested_mbps,
+        active_flows=active_flows,
+        bandwidth_mbps=10.0,
+    )
+    measurement = monitor.latest_measurement()
+    for record in records:
+        record.update(measurement)
+        write_interval_jsonl(record, filename)
+
+
 def normal():
     """One 3 Mbps UDP flow for 20 seconds."""
 
@@ -325,7 +514,16 @@ def normal():
     try:
         process = run_on_host(
             "h1",
-            ["iperf3", "-c", SERVER_IP, "-u", "-b", "3M", "-t", str(DURATION)]
+            [
+                "iperf3", "-c", SERVER_IP, "-u", "-b", "3M",
+                "-t", str(DURATION), "--json-stream",
+            ]
+        )
+        start_interval_reader(
+            process,
+            lambda line: save_interval_telemetry(
+                line, "h1", "normal", experiment_id, 3, 1, monitor
+            ),
         )
         output = wait_for_process(process)
     finally:
@@ -378,9 +576,16 @@ def congestion():
                     "-b", f"{rate}M",
                     "-p", str(port),
                     "-t", str(DURATION),
+                    "--json-stream",
                 ],
             )
             processes.append(process)
+            start_interval_reader(
+                process,
+                lambda line, host=host, rate=rate: save_interval_telemetry(
+                    line, host, "congestion", experiment_id, rate, 4, monitor
+                ),
+            )
 
         print("\n[TRAFFIC] All congestion flows started.")
         for process, flow in zip(processes, flows):
@@ -435,7 +640,16 @@ def burst():
         try:
             process = run_on_host(
                 "h1",
-                ["iperf3", "-c", SERVER_IP, "-u", "-b", "8M", "-t", "3"]
+                [
+                    "iperf3", "-c", SERVER_IP, "-u", "-b", "8M",
+                    "-t", "3", "--json-stream",
+                ]
+            )
+            start_interval_reader(
+                process,
+                lambda line: save_interval_telemetry(
+                    line, "h1", "burst", experiment_id, 8, 1, monitor
+                ),
             )
             output = wait_for_process(process)
         finally:
@@ -486,7 +700,14 @@ def moderate(rate_mbps: float = 6.0):
                 "-u",
                 "-b", f"{rate_mbps:g}M",
                 "-t", str(DURATION),
+                "--json-stream",
             ],
+        )
+        start_interval_reader(
+            process,
+            lambda line: save_interval_telemetry(
+                line, "h1", "moderate", experiment_id, rate_mbps, 1, monitor
+            ),
         )
         output = wait_for_process(process)
     finally:

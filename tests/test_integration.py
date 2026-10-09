@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
-
+import json
+from pathlib import Path
 import pytest
 
 from ai.prediction import train_random_forest
@@ -184,3 +185,50 @@ def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path):
     result["dry_run"] = False
     apply_integration_commands(result, runner=runner)
     assert calls
+
+def test_combined_person1_dataset_through_ml_to_qos(tmp_path):
+    """Exercise every combined telemetry record without executing tc commands."""
+    model_path = tmp_path / "model.joblib"
+    train_fixture_model(model_path)
+
+    dataset_path = Path("telemetry/datasets/combined.jsonl")
+    assert dataset_path.exists(), f"Dataset not found: {dataset_path}"
+
+    records = [
+        json.loads(line)
+        for line in dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records, "Combined telemetry dataset is empty"
+
+    config = QoSIntegrationConfig(
+        interface="configured-bottleneck",
+        total_bandwidth_mbps=10.0,
+        dry_run=True,
+    )
+
+    for index, record in enumerate(records, start=1):
+        result = build_qos_integration(
+            record,
+            model_path=model_path,
+            config=config,
+        )
+
+        prediction = result["prediction"]
+        assert prediction["congestion"] in {"LOW", "MEDIUM", "HIGH"}, (
+            f"Record {index}: invalid congestion class"
+        )
+        assert 0.0 <= prediction["confidence"] <= 1.0, (
+            f"Record {index}: invalid confidence"
+        )
+
+        allocations = result["qos_decision"]["allocation_mbps"]
+        assert sum(allocations.values()) == pytest.approx(10.0), (
+            f"Record {index}: bandwidth allocation does not total 10 Mbps"
+        )
+        assert result["tc_commands"], f"Record {index}: no tc commands generated"
+        assert result["dry_run"] is True
+
+        # Generated commands must not be executed by this test.
+        with pytest.raises(RuntimeError, match="dry_run"):
+            apply_integration_commands(result)
