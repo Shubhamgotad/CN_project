@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import re
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from telemetry.iperf_parser import parse_iperf_output, write_jsonl
 SERVER_IP = "10.0.0.5"
 DURATION = 20
 BOTTLENECK_INTERFACE = "s1-eth5"
+DATASET_DIR = Path(__file__).resolve().parents[1] / "telemetry" / "datasets"
 
 
 def run_on_host(host, command):
@@ -303,11 +305,12 @@ def save_telemetry(
         "queue_drops": queue_drops,
     }
 
-    filename = f"telemetry/datasets/{scenario}.jsonl"
+    filename = DATASET_DIR / f"{scenario}.jsonl"
 
     write_jsonl(record, filename)
 
     print(f"[TELEMETRY] Saved: {filename}")
+    print(f"[EXPERIMENT] experiment_id={experiment_id}")
     print(f"[TELEMETRY] {record}")
 
 
@@ -457,6 +460,52 @@ def burst():
 
     print("\n[TRAFFIC] Burst scenario completed.")
 
+def moderate(rate_mbps: float = 6.0):
+    """One configurable-rate UDP flow for 20 seconds."""
+    if (
+        isinstance(rate_mbps, bool)
+        or not isinstance(rate_mbps, (int, float))
+        or not math.isfinite(rate_mbps)
+        or rate_mbps <= 0
+    ):
+        raise ValueError("moderate rate must be a positive finite number")
+
+    print("\n=== MODERATE SCENARIO ===")
+    experiment_id = str(uuid.uuid4())
+    print(f"[EXPERIMENT] experiment_id={experiment_id}")
+
+    process = None
+    monitor = ScenarioMonitor(["h1"]).start()
+
+    try:
+        process = run_on_host(
+            "h1",
+            [
+                "iperf3",
+                "-c", SERVER_IP,
+                "-u",
+                "-b", f"{rate_mbps:g}M",
+                "-t", str(DURATION),
+            ],
+        )
+        output = wait_for_process(process)
+    finally:
+        summary = monitor.stop()
+        if process is not None:
+            _stop_process(process)
+
+    save_telemetry(
+        output,
+        source="h1",
+        scenario="moderate",
+        experiment_id=experiment_id,
+        requested_mbps=rate_mbps,
+        active_flows=1,
+        **summary,
+    )
+
+    print("\n[TRAFFIC] Moderate scenario completed.")
+
 
 def main():
 
@@ -466,11 +515,21 @@ def main():
 
     parser.add_argument(
         "--scenario",
-        choices=["normal", "congestion", "burst"],
+        choices=["normal", "moderate","congestion", "burst"],
         required=True
+    )
+    parser.add_argument(
+        "--rate-mbps",
+        type=float,
+        default=6.0,
+        help="offered UDP rate for the moderate scenario (default: 6 Mbps)",
     )
 
     args = parser.parse_args()
+    if args.scenario == "moderate" and (
+        not math.isfinite(args.rate_mbps) or args.rate_mbps <= 0
+    ):
+        parser.error("--rate-mbps must be a positive finite number")
 
     if args.scenario == "normal":
         normal()
@@ -480,6 +539,8 @@ def main():
 
     elif args.scenario == "burst":
         burst()
+    elif args.scenario == "moderate":
+        moderate(args.rate_mbps)
 
 
 if __name__ == "__main__":

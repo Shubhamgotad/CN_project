@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -95,6 +96,111 @@ class TelemetryRecord:
             field: getattr(self, field)
             for field in REQUIRED_FIELDS
         }
+
+
+PERSON1_METADATA_FIELDS = (
+    "experiment_id",
+    "scenario",
+    "source",
+    "destination",
+    "traffic_type",
+    "requested_mbps",
+    "lost_packets",
+    "total_packets",
+    "queue_size",
+    "queue_drops",
+)
+
+PERSON1_REQUIRED_FIELDS = (
+    "timestamp",
+    "experiment_id",
+    "scenario",
+    "source",
+    "destination",
+    "traffic_type",
+    "requested_mbps",
+    "throughput_mbps",
+    "latency_ms",
+    "jitter_ms",
+    "packet_loss_percent",
+    "lost_packets",
+    "total_packets",
+    "bandwidth_mbps",
+    "utilization_percent",
+    "active_flows",
+    "queue_size",
+    "queue_drops",
+)
+
+
+@dataclass(frozen=True)
+class AdaptedTelemetry:
+    """Validated telemetry plus source metadata kept out of model features."""
+
+    record: TelemetryRecord
+    metadata: dict[str, Any]
+
+
+def _timestamp_to_epoch(value: Any) -> float:
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be an ISO-8601 string")
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"malformed ISO-8601 timestamp: {value!r}") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone offset")
+    return timestamp.timestamp()
+
+
+def adapt_person1_telemetry(
+    telemetry: Mapping[str, Any],
+    *,
+    interface: str,
+) -> AdaptedTelemetry:
+    """Map Person 1 telemetry to the canonical record without using metadata as features."""
+    if not isinstance(telemetry, Mapping):
+        raise TypeError("Person 1 telemetry must be a mapping")
+    missing = [field for field in PERSON1_REQUIRED_FIELDS if field not in telemetry]
+    if missing:
+        raise ValueError("missing Person 1 telemetry fields: " + ", ".join(missing))
+
+    adapted = {
+        "timestamp": _timestamp_to_epoch(telemetry["timestamp"]),
+        "interface": interface,
+        "throughput_mbps": telemetry["throughput_mbps"],
+        "bandwidth_mbps": telemetry["bandwidth_mbps"],
+        "utilization": telemetry["utilization_percent"],
+        "latency_ms": telemetry["latency_ms"],
+        "jitter_ms": telemetry["jitter_ms"],
+        "packet_loss_pct": telemetry["packet_loss_percent"],
+        "active_flows": telemetry["active_flows"],
+    }
+    record = validate_telemetry(adapted)
+    metadata = {field: telemetry[field] for field in PERSON1_METADATA_FIELDS}
+    return AdaptedTelemetry(record=record, metadata=metadata)
+
+
+def read_person1_jsonl(
+    source: str | Path,
+    *,
+    interface: str,
+) -> list[AdaptedTelemetry]:
+    """Read Person 1 JSON Lines and include source line numbers in validation errors."""
+    path = Path(source)
+    results = []
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+                results.append(adapt_person1_telemetry(payload, interface=interface))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid Person 1 telemetry at line {line_number}: {exc}"
+                ) from exc
+    return results
 
 
 def validate_telemetry(record: Mapping[str, Any]) -> TelemetryRecord:

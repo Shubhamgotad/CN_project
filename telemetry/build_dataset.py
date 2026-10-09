@@ -6,12 +6,16 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from validate_telemetry import REQUIRED_FIELDS, _validate_record
+if __package__:
+    from .validate_telemetry import REQUIRED_FIELDS, _validate_record
+else:
+    from validate_telemetry import REQUIRED_FIELDS, _validate_record
 
 
 DATASET_DIR = Path(__file__).parent / "datasets"
 INPUT_FILES = (
     DATASET_DIR / "normal.jsonl",
+    DATASET_DIR / "moderate.jsonl",
     DATASET_DIR / "congestion.jsonl",
     DATASET_DIR / "burst.jsonl",
 )

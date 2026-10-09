@@ -4,59 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
-import json
 from pathlib import Path
 from typing import Any
 
 from ai.prediction.congestion_predictor import CongestionPredictor
-from ai.prediction.telemetry import TelemetryRecord, validate_telemetry
+from ai.prediction.telemetry import (
+    AdaptedTelemetry,
+    PERSON1_METADATA_FIELDS,
+    PERSON1_REQUIRED_FIELDS,
+    TelemetryRecord,
+    adapt_person1_telemetry as _adapt_person1_telemetry,
+    read_person1_jsonl as _read_person1_jsonl,
+)
 from qos.policy import build_qos_decision_from_prediction
 from qos.tc_controller import apply_tc_commands, generate_tc_commands
 from qos.validator import validate_interface, validate_total_bandwidth
-
-PERSON1_METADATA_FIELDS = (
-    "experiment_id",
-    "scenario",
-    "source",
-    "destination",
-    "traffic_type",
-    "requested_mbps",
-    "lost_packets",
-    "total_packets",
-    "queue_size",
-    "queue_drops",
-)
-
-PERSON1_REQUIRED_FIELDS = (
-    "timestamp",
-    "experiment_id",
-    "scenario",
-    "source",
-    "destination",
-    "traffic_type",
-    "requested_mbps",
-    "throughput_mbps",
-    "latency_ms",
-    "jitter_ms",
-    "packet_loss_percent",
-    "lost_packets",
-    "total_packets",
-    "bandwidth_mbps",
-    "utilization_percent",
-    "active_flows",
-    "queue_size",
-    "queue_drops",
-)
-
-
-@dataclass(frozen=True)
-class AdaptedTelemetry:
-    """Validated Stage 1 telemetry plus Person 1 metadata kept out of ML features."""
-
-    record: TelemetryRecord
-    metadata: dict[str, Any]
-
 
 @dataclass(frozen=True)
 class QoSIntegrationConfig:
@@ -82,45 +44,14 @@ class QoSIntegrationConfig:
                 raise ValueError(f"filter for {flow_id} must be a mapping")
 
 
-def _timestamp_to_epoch(value: Any) -> float:
-    if not isinstance(value, str):
-        raise ValueError("timestamp must be an ISO-8601 string")
-    try:
-        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"malformed ISO-8601 timestamp: {value!r}") from exc
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("timestamp must include a timezone offset")
-    return timestamp.timestamp()
-
-
 def adapt_person1_telemetry(
     telemetry: Mapping[str, Any],
     *,
     interface: str,
 ) -> AdaptedTelemetry:
-    """Adapt one documented Person 1 record without assigning application classes."""
-    if not isinstance(telemetry, Mapping):
-        raise TypeError("Person 1 telemetry must be a mapping")
-    missing = [field for field in PERSON1_REQUIRED_FIELDS if field not in telemetry]
-    if missing:
-        raise ValueError("missing Person 1 telemetry fields: " + ", ".join(missing))
+    """Adapt one Person 1 record after validating its configured interface."""
     validate_interface(interface)
-
-    adapted = {
-        "timestamp": _timestamp_to_epoch(telemetry["timestamp"]),
-        "interface": interface,
-        "throughput_mbps": telemetry["throughput_mbps"],
-        "bandwidth_mbps": telemetry["bandwidth_mbps"],
-        "utilization": telemetry["utilization_percent"],
-        "latency_ms": telemetry["latency_ms"],
-        "jitter_ms": telemetry["jitter_ms"],
-        "packet_loss_pct": telemetry["packet_loss_percent"],
-        "active_flows": telemetry["active_flows"],
-    }
-    record = validate_telemetry(adapted)
-    metadata = {field: telemetry[field] for field in PERSON1_METADATA_FIELDS}
-    return AdaptedTelemetry(record=record, metadata=metadata)
+    return _adapt_person1_telemetry(telemetry, interface=interface)
 
 
 def read_person1_jsonl(
@@ -128,21 +59,9 @@ def read_person1_jsonl(
     *,
     interface: str,
 ) -> list[AdaptedTelemetry]:
-    """Read JSON Lines and report malformed records with their source line number."""
-    path = Path(source)
-    results = []
-    with path.open(encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-                results.append(adapt_person1_telemetry(payload, interface=interface))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"invalid Person 1 telemetry at line {line_number}: {exc}"
-                ) from exc
-    return results
+    """Read Person 1 JSONL after validating the configured interface."""
+    validate_interface(interface)
+    return _read_person1_jsonl(source, interface=interface)
 
 
 def build_qos_integration(

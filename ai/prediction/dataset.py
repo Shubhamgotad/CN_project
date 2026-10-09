@@ -9,7 +9,12 @@ import pandas as pd
 
 from .features import FEATURE_COLUMNS, records_to_features
 from .labeling import CongestionThresholds, DEFAULT_THRESHOLDS, label_congestion
-from .telemetry import TelemetryRecord, load_telemetry_json, validate_telemetry
+from .telemetry import (
+    TelemetryRecord,
+    load_telemetry_json,
+    read_person1_jsonl,
+    validate_telemetry,
+)
 
 
 def create_dataset(
@@ -34,3 +39,20 @@ def split_features_and_labels(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.S
     if missing:
         raise ValueError("dataset is missing columns: " + ", ".join(missing))
     return dataset.loc[:, FEATURE_COLUMNS], dataset["congestion"]
+
+
+def load_person1_dataset(
+    source: str | Path,
+    *,
+    interface: str = "training-bottleneck",
+    thresholds: CongestionThresholds = DEFAULT_THRESHOLDS,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Load Person 1 JSONL as a model dataset and separate experiment groups."""
+    adapted = read_person1_jsonl(source, interface=interface)
+    experiment_ids = [item.metadata["experiment_id"] for item in adapted]
+    if any(not isinstance(value, str) or not value.strip() for value in experiment_ids):
+        raise ValueError("experiment_id must be a non-empty string for every record")
+
+    dataset = create_dataset([item.record for item in adapted], thresholds)
+    groups = pd.Series(experiment_ids, name="experiment_id")
+    return dataset, groups

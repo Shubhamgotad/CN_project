@@ -1,3 +1,4 @@
+import json
 import pytest
 
 from traffic import traffic_generator
@@ -254,3 +255,152 @@ def test_congestion_cleans_all_processes_when_wait_fails(monkeypatch):
     assert monitor.stopped
     assert len(processes) == 4
     assert all(process.terminated for process in processes)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_rate"),
+    [
+        (["traffic_generator", "--scenario", "moderate"], 6.0),
+        (
+            [
+                "traffic_generator",
+                "--scenario",
+                "moderate",
+                "--rate-mbps",
+                "8.5",
+            ],
+            8.5,
+        ),
+    ],
+)
+def test_moderate_rate_cli_keeps_default_and_accepts_sweep_value(
+    monkeypatch, argv, expected_rate
+):
+    observed = []
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setattr(
+        traffic_generator, "moderate", lambda rate: observed.append(rate)
+    )
+
+    traffic_generator.main()
+
+    assert observed == [expected_rate]
+
+
+@pytest.mark.parametrize("rate_mbps", [0, -1, float("inf"), float("nan")])
+def test_moderate_rejects_invalid_rate(rate_mbps):
+    with pytest.raises(ValueError, match="positive finite"):
+        traffic_generator.moderate(rate_mbps)
+
+
+def test_moderate_rate_is_used_in_iperf_and_saved_telemetry(monkeypatch):
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    class FakeMonitor:
+        def start(self):
+            return self
+
+        def stop(self):
+            return {"latency_ms": 20.0, "queue_size": 0, "queue_drops": 0}
+
+    process = FakeProcess()
+    commands = []
+    saved = []
+    monkeypatch.setattr(
+        traffic_generator,
+        "run_on_host",
+        lambda host, command: commands.append((host, command)) or process,
+    )
+    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda _: "iperf")
+    monkeypatch.setattr(
+        traffic_generator,
+        "ScenarioMonitor",
+        lambda *args, **kwargs: FakeMonitor(),
+    )
+    monkeypatch.setattr(
+        traffic_generator,
+        "save_telemetry",
+        lambda *args, **kwargs: saved.append(kwargs),
+    )
+
+    traffic_generator.moderate(8.5)
+
+    assert commands[0][1][commands[0][1].index("-b") + 1] == "8.5M"
+    assert saved[0]["requested_mbps"] == 8.5
+    assert process.terminated
+
+
+def test_moderate_saves_distinct_experiment_ids_and_appends(tmp_path, monkeypatch):
+    output = tmp_path / "moderate.jsonl"
+    monkeypatch.setattr(traffic_generator, "DATASET_DIR", tmp_path)
+    iperf_output = (
+        "[  7] 0.00-20.00 sec 9.54 MBytes 4.00 Mbits/sec "
+        "0.000 ms 0/6906 (0%) receiver"
+    )
+
+    for experiment_id in ("trial-7", "trial-7.5"):
+        traffic_generator.save_telemetry(
+            iperf_output,
+            source="h1",
+            scenario="moderate",
+            experiment_id=experiment_id,
+            requested_mbps=7.0 if experiment_id == "trial-7" else 7.5,
+            active_flows=1,
+            latency_ms=20.0,
+        )
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(records) == 2
+    assert [record["experiment_id"] for record in records] == [
+        "trial-7",
+        "trial-7.5",
+    ]
+    assert [record["requested_mbps"] for record in records] == [7.0, 7.5]
+
+
+def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch):
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    class FakeMonitor:
+        def start(self):
+            return self
+
+        def stop(self):
+            return {"latency_ms": 20.0, "queue_size": 0, "queue_drops": 0}
+
+    generated_ids = iter(("trial-id-1", "trial-id-2"))
+    recorded_ids = []
+    monkeypatch.setattr(traffic_generator.uuid, "uuid4", lambda: next(generated_ids))
+    monkeypatch.setattr(
+        traffic_generator, "ScenarioMonitor", lambda *args, **kwargs: FakeMonitor()
+    )
+    monkeypatch.setattr(
+        traffic_generator, "run_on_host", lambda *args, **kwargs: FakeProcess()
+    )
+    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda _: "iperf")
+    monkeypatch.setattr(
+        traffic_generator,
+        "save_telemetry",
+        lambda *args, **kwargs: recorded_ids.append(kwargs["experiment_id"]),
+    )
+
+    traffic_generator.moderate(7.0)
+    traffic_generator.moderate(7.5)
+
+    assert recorded_ids == ["trial-id-1", "trial-id-2"]

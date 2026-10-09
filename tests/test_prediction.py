@@ -5,6 +5,8 @@ from ai.prediction import (
     create_dataset,
     extract_features,
     label_congestion,
+    load_person1_dataset,
+    train_candidate_model,
     train_random_forest,
     validate_telemetry,
 )
@@ -47,6 +49,23 @@ def test_missing_field():
         validate_telemetry(data)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("throughput_mbps", None),
+        ("latency_ms", float("nan")),
+        ("jitter_ms", float("inf")),
+        ("packet_loss_pct", True),
+        ("active_flows", True),
+    ],
+)
+def test_non_finite_or_missing_feature_values_are_rejected(field, value):
+    data = telemetry()
+    data[field] = value
+    with pytest.raises(ValueError):
+        validate_telemetry(data)
+
+
 def test_labels():
     assert label_congestion(telemetry()) == "LOW"
     assert label_congestion(telemetry(utilization=70, latency=70)) == "MEDIUM"
@@ -73,9 +92,93 @@ def test_dataset_and_training_prediction(tmp_path):
     model_path = tmp_path / "congestion.joblib"
     result = train_random_forest(records, model_path, random_state=7)
     assert model_path.exists()
+    assert list(result["model"].feature_names_in_) == [
+        "utilization", "throughput_mbps", "latency_ms", "jitter_ms",
+        "packet_loss_pct", "active_flows",
+    ]
     assert set(result["evaluation"]) == {
         "accuracy", "precision", "recall", "f1", "confusion_matrix"
     }
     prediction = CongestionPredictor(model_path).predict(records[-1])
     assert prediction["congestion"] in {"LOW", "MEDIUM", "HIGH"}
     assert 0 <= prediction["confidence"] <= 1
+
+
+def test_person1_dataset_preserves_experiment_group_outside_features():
+    dataset, groups = load_person1_dataset(
+        "tests/fixtures/person1_telemetry.jsonl",
+        interface="configured0",
+    )
+
+    assert list(dataset.columns) == [
+        "utilization", "throughput_mbps", "latency_ms", "jitter_ms",
+        "packet_loss_pct", "active_flows", "congestion",
+    ]
+    assert groups.tolist() == ["00000000-0000-0000-0000-000000000001"]
+    assert "experiment_id" not in dataset.columns
+    assert "queue_drops" not in dataset.columns
+
+
+def test_candidate_evaluation_splits_experiments_and_reports_all_classes(tmp_path):
+    records = []
+    groups = []
+    class_records = {
+        "LOW": telemetry(utilization=20, latency=20, loss=0),
+        "MEDIUM": telemetry(utilization=70, latency=50, loss=0),
+        "HIGH": telemetry(utilization=90, latency=20, loss=3),
+    }
+    for label, record in class_records.items():
+        for repetition in range(2):
+            records.append(record)
+            groups.append(f"{label.lower()}-experiment-{repetition}")
+
+    dataset = create_dataset(records)
+    result = train_candidate_model(dataset, groups, random_state=17)
+    evaluation = result["evaluation"]
+
+    assert set(evaluation["train_experiment_ids"]).isdisjoint(
+        evaluation["test_experiment_ids"]
+    )
+    assert evaluation["test_support"] == {
+        "LOW": 1, "MEDIUM": 1, "HIGH": 1,
+    }
+    assert set(evaluation["per_class"]) == {"LOW", "MEDIUM", "HIGH"}
+    assert all(
+        set(metrics) == {"precision", "recall", "f1", "support"}
+        for metrics in evaluation["per_class"].values()
+    )
+    assert len(evaluation["confusion_matrix"]) == 3
+    assert 0 <= evaluation["accuracy"] <= 1
+    assert 0 <= evaluation["macro_f1"] <= 1
+    assert not evaluation["warnings"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_candidate_evaluation_warns_when_a_class_is_missing():
+    records = [
+        telemetry(utilization=20, latency=20),
+        telemetry(utilization=25, latency=20),
+        telemetry(utilization=90, latency=20, loss=3),
+        telemetry(utilization=95, latency=20, loss=4),
+    ]
+    groups = ["low-a", "low-b", "high-a", "high-b"]
+
+    with pytest.warns(RuntimeWarning, match="dataset has no examples for: MEDIUM"):
+        result = train_candidate_model(create_dataset(records), groups)
+
+    assert result["evaluation"]["test_support"]["MEDIUM"] == 0
+    assert any("MEDIUM" in message for message in result["evaluation"]["warnings"])
+
+
+def test_candidate_evaluation_rejects_non_finite_features():
+    records = [
+        telemetry(utilization=20),
+        telemetry(utilization=25),
+        telemetry(utilization=90, loss=3),
+        telemetry(utilization=95, loss=4),
+    ]
+    dataset = create_dataset(records)
+    dataset.loc[0, "utilization"] = float("nan")
+
+    with pytest.raises(ValueError, match="cannot contain missing values"):
+        train_candidate_model(dataset, ["low-a", "low-b", "high-a", "high-b"])
