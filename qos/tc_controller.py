@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 try:
@@ -39,6 +40,15 @@ NETEM_LIMIT = 1000
 FLOW_PORTS = (5201, 5202, 5203, 5204)
 FLOW_CLASS_IDS = {port: f"1:{minor}" for port, minor in zip(FLOW_PORTS, (11, 12, 13, 14))}
 NETEM_HANDLES = {port: f"{110 + index * 10}:" for index, port in enumerate(FLOW_PORTS)}
+SERVICE_CLASS_IDS = {
+    "gaming": "1:11",
+    "video": "1:12",
+    "web": "1:13",
+    "bulk": "1:14",
+}
+UNMATCHED_CLASS_ID = "1:15"
+UNMATCHED_NETEM_HANDLE = "150:"
+MANAGED_FILTER_PRIORITIES = dict(zip(FLOW_PORTS, (10, 20, 30, 40)))
 _APPLY_LOCK = threading.RLock()
 
 
@@ -107,8 +117,122 @@ class TCState:
     filters: str
 
 
+@dataclass(frozen=True)
+class ManagedHTBConfig:
+    """Validated five-leaf managed hierarchy configuration."""
+
+    interface: str
+    total_bandwidth_mbps: float
+    service_allocations_mbps: Mapping[str, float]
+    filter_priorities: Mapping[int, int]
+    unmatched_rate_mbps: float = 1.0
+    unmatched_ceil_mbps: float = 1.0
+    default_class_id: str = UNMATCHED_CLASS_ID
+
+    def __post_init__(self) -> None:
+        validate_interface(self.interface)
+        if self.interface != ROOT_INTERFACE:
+            raise ValueError(f"managed HTB supports only {ROOT_INTERFACE}")
+        total = validate_total_bandwidth(self.total_bandwidth_mbps)
+        if not math.isclose(total, BOTTLENECK_MBPS, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("managed HTB parent bandwidth must remain 10 Mbps")
+        if not isinstance(self.service_allocations_mbps, Mapping) or set(
+            self.service_allocations_mbps
+        ) != set(SERVICE_CLASS_IDS):
+            raise ValueError("service allocations must cover Gaming, Video, Web, and Bulk")
+        rates: dict[str, float] = {}
+        for traffic_class in SERVICE_CLASS_IDS:
+            rate = self.service_allocations_mbps[traffic_class]
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+                raise ValueError(f"allocation for {traffic_class} must be numeric")
+            rate = float(rate)
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError(f"allocation for {traffic_class} must be positive and finite")
+            rates[traffic_class] = rate
+        unmatched_rate = self._validate_unmatched_rate(
+            self.unmatched_rate_mbps, "unmatched rate"
+        )
+        unmatched_ceil = self._validate_unmatched_rate(
+            self.unmatched_ceil_mbps, "unmatched ceil"
+        )
+        if unmatched_rate != 1.0 or unmatched_ceil != 1.0:
+            raise ValueError("unmatched leaf rate and ceil must both be 1 Mbps")
+        if not math.isclose(
+            sum(rates.values()) + unmatched_rate,
+            total,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("service and unmatched allocations must total 10 Mbps")
+        if self.default_class_id != UNMATCHED_CLASS_ID:
+            raise ValueError("default class must be the unmatched leaf 1:15")
+        if (
+            not isinstance(self.filter_priorities, Mapping)
+            or set(self.filter_priorities) != set(FLOW_PORTS)
+            or any(
+                isinstance(priority, bool) or not isinstance(priority, int)
+                for priority in self.filter_priorities.values()
+            )
+            or dict(self.filter_priorities) != MANAGED_FILTER_PRIORITIES
+        ):
+            raise ValueError("managed filters must use priorities 10, 20, 30, and 40")
+        object.__setattr__(self, "total_bandwidth_mbps", total)
+        object.__setattr__(self, "service_allocations_mbps", MappingProxyType(rates))
+        object.__setattr__(
+            self, "filter_priorities", MappingProxyType(dict(MANAGED_FILTER_PRIORITIES))
+        )
+        object.__setattr__(self, "unmatched_rate_mbps", unmatched_rate)
+        object.__setattr__(self, "unmatched_ceil_mbps", unmatched_ceil)
+
+    @staticmethod
+    def _validate_unmatched_rate(value: float, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label} must be numeric")
+        result = float(value)
+        if not math.isfinite(result) or result <= 0:
+            raise ValueError(f"{label} must be positive and finite")
+        return result
+
+
 def _format_rate(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def generate_managed_htb_commands(config: ManagedHTBConfig) -> list[str]:
+    """Build the explicit five-leaf hierarchy; unmatched traffic defaults to 1:15."""
+    if not isinstance(config, ManagedHTBConfig):
+        raise ValueError("config must be a validated ManagedHTBConfig")
+    interface = shlex.quote(config.interface)
+    commands = [
+        f"tc qdisc replace dev {interface} parent 5:1 "
+        f"handle 1: htb default {UNMATCHED_CLASS_ID.split(':', 1)[1]}",
+        f"tc class add dev {interface} parent 1: classid 1:1 "
+        "htb rate 10mbit ceil 10mbit",
+    ]
+    for traffic_class, class_id in SERVICE_CLASS_IDS.items():
+        rate = _format_rate(config.service_allocations_mbps[traffic_class])
+        handle = f"{110 + tuple(SERVICE_CLASS_IDS).index(traffic_class) * 10}:"
+        commands.extend((
+            f"tc class add dev {interface} parent 1:1 classid {class_id} "
+            f"htb rate {rate}mbit ceil {rate}mbit",
+            f"tc qdisc add dev {interface} parent {class_id} handle {handle} "
+            f"netem limit {NETEM_LIMIT} delay {NETEM_DELAY}",
+        ))
+    unmatched_rate = _format_rate(config.unmatched_rate_mbps)
+    commands.extend((
+        f"tc class add dev {interface} parent 1:1 classid {UNMATCHED_CLASS_ID} "
+        f"htb rate {unmatched_rate}mbit ceil "
+        f"{_format_rate(config.unmatched_ceil_mbps)}mbit",
+        f"tc qdisc add dev {interface} parent {UNMATCHED_CLASS_ID} "
+        f"handle {UNMATCHED_NETEM_HANDLE} netem limit {NETEM_LIMIT} delay {NETEM_DELAY}",
+    ))
+    for port, traffic_class in zip(FLOW_PORTS, SERVICE_CLASS_IDS):
+        commands.append(
+            f"tc filter add dev {interface} protocol ip parent 1: "
+            f"prio {config.filter_priorities[port]} u32 match ip protocol 17 0xff "
+            f"match ip dport {port} 0xffff flowid {SERVICE_CLASS_IDS[traffic_class]}"
+        )
+    return commands
 
 
 def _validate_flow_settings(
@@ -278,8 +402,8 @@ def _lines(text: str, prefix: str) -> list[str]:
 
 
 def _baseline_matches(state: TCState) -> bool:
-    qdiscs = _lines(state.qdiscs, "qdisc ")
-    classes = _lines(state.classes, "class ")
+    qdiscs = [line.strip() for line in state.qdiscs.splitlines() if line.strip()]
+    classes = [line.strip() for line in state.classes.splitlines() if line.strip()]
     return (
         len(qdiscs) == 2
         and any(re.search(r"^qdisc htb 5: root .*default 0x1(?:\s|$)", line) for line in qdiscs)
@@ -450,6 +574,181 @@ def _managed_structure_with_any_rates(
     return _filter_signature_matches(state.filters, priorities, default_port)
 
 
+def _managed_htb_filter_matches(text: str) -> bool:
+    lines = text.splitlines()
+    if any(
+        line.strip()
+        and not line.lstrip().startswith(("filter ", "match "))
+        for line in lines
+    ):
+        return False
+    header_indices = [
+        index for index, line in enumerate(lines)
+        if re.fullmatch(r"\s*filter protocol ip pref \d+ u32 chain 0\s*", line)
+    ]
+    if len(header_indices) != len(FLOW_PORTS):
+        return False
+    first_content = next(
+        (index for index, line in enumerate(lines) if line.strip()), None
+    )
+    if first_content != header_indices[0]:
+        return False
+    blocks: dict[int, list[str]] = {}
+    for position, index in enumerate(header_indices):
+        match = re.search(r"pref (\d+)", lines[index])
+        if match is None:
+            return False
+        end = (
+            header_indices[position + 1]
+            if position + 1 < len(header_indices)
+            else len(lines)
+        )
+        priority = int(match.group(1))
+        if priority in blocks:
+            return False
+        block = [line.strip() for line in lines[index + 1:end] if line.strip()]
+        if len(block) != 3:
+            return False
+        blocks[priority] = block
+    if set(blocks) != set(MANAGED_FILTER_PRIORITIES.values()):
+        return False
+    for port, traffic_class in zip(FLOW_PORTS, SERVICE_CLASS_IDS):
+        priority = MANAGED_FILTER_PRIORITIES[port]
+        class_id = SERVICE_CLASS_IDS[traffic_class]
+        port_hex = f"{port:04x}"
+        block = blocks[priority]
+        if re.fullmatch(
+            rf"filter protocol ip pref {priority} u32 chain 0 "
+            rf"fh [0-9a-fA-F]+: order \d+ \*flowid "
+            rf"{re.escape(class_id)}(?: not_in_hw)?",
+            block[0],
+        ) is None:
+            return False
+        if tuple(block[1:]) != (
+            "match 00110000/00ff0000 at 8",
+            f"match 0000{port_hex}/0000ffff at 20",
+        ):
+            return False
+    return True
+
+
+def _managed_htb_owned(state: TCState) -> bool:
+    """Recognize only the complete five-leaf hierarchy owned by this controller."""
+    qdiscs = _lines(state.qdiscs, "qdisc ")
+    classes = _lines(state.classes, "class ")
+    if len(qdiscs) != 7 or len(classes) != 7:
+        return False
+    class_ids = [line.split()[2] for line in classes if len(line.split()) >= 3]
+    expected_class_ids = {"5:1", "1:1", *SERVICE_CLASS_IDS.values(), UNMATCHED_CLASS_ID}
+    if len(class_ids) != len(classes) or set(class_ids) != expected_class_ids:
+        return False
+    if not any(
+        re.search(r"^qdisc htb 5: root .*default 0x1(?:\s|$)", line)
+        for line in qdiscs
+    ):
+        return False
+    if not any(
+        re.search(r"^qdisc htb 1: parent 5:1 .*default 0xf(?:\s|$)", line)
+        for line in qdiscs
+    ):
+        return False
+    if not any(
+        re.search(r"^class htb 5:1 root leaf 1: .*rate 10Mbit ceil 10Mbit(?:\s|$)", line)
+        for line in classes
+    ):
+        return False
+    aggregate = next((line for line in classes if line.startswith("class htb 1:1 ")), None)
+    if (
+        aggregate is None
+        or _rate_from_line(aggregate) != BOTTLENECK_MBPS
+        or _ceil_from_line(aggregate) != BOTTLENECK_MBPS
+    ):
+        return False
+
+    service_total = 0.0
+    for index, traffic_class in enumerate(SERVICE_CLASS_IDS):
+        class_id = SERVICE_CLASS_IDS[traffic_class]
+        handle = f"{110 + index * 10}:"
+        leaf = next(
+            (line for line in classes if line.startswith(f"class htb {class_id} ")),
+            None,
+        )
+        rate = _rate_from_line(leaf) if leaf else None
+        ceil = _ceil_from_line(leaf) if leaf else None
+        if (
+            leaf is None
+            or not re.search(rf"parent 1:1 leaf {re.escape(handle)} ", leaf)
+            or rate is None
+            or ceil is None
+            or rate <= 0
+            or not math.isclose(rate, ceil, rel_tol=0, abs_tol=0.001)
+            or not any(
+                re.search(
+                    rf"^qdisc netem {re.escape(handle)} parent {class_id} "
+                    rf".*limit {NETEM_LIMIT} delay {NETEM_DELAY}(?:\s|$)",
+                    qdisc,
+                )
+                for qdisc in qdiscs
+            )
+        ):
+            return False
+        service_total += rate
+
+    unmatched = next(
+        (
+            line for line in classes
+            if line.startswith(f"class htb {UNMATCHED_CLASS_ID} ")
+        ),
+        None,
+    )
+    unmatched_rate = _rate_from_line(unmatched) if unmatched else None
+    unmatched_ceil = _ceil_from_line(unmatched) if unmatched else None
+    if (
+        unmatched is None
+        or not re.search(
+            rf"parent 1:1 leaf {re.escape(UNMATCHED_NETEM_HANDLE)} ", unmatched
+        )
+        or unmatched_rate != 1.0
+        or unmatched_ceil != 1.0
+        or not any(
+            re.search(
+                rf"^qdisc netem {re.escape(UNMATCHED_NETEM_HANDLE)} "
+                rf"parent {UNMATCHED_CLASS_ID} .*limit {NETEM_LIMIT} "
+                rf"delay {NETEM_DELAY}(?:\s|$)",
+                qdisc,
+            )
+            for qdisc in qdiscs
+        )
+        or not math.isclose(
+            service_total + unmatched_rate, BOTTLENECK_MBPS,
+            rel_tol=0, abs_tol=0.001,
+        )
+    ):
+        return False
+    return _managed_htb_filter_matches(state.filters)
+
+
+def _managed_htb_matches(state: TCState, config: ManagedHTBConfig) -> bool:
+    if not _managed_htb_owned(state):
+        return False
+    classes = _lines(state.classes, "class ")
+    for traffic_class, class_id in SERVICE_CLASS_IDS.items():
+        line = next(
+            entry for entry in classes
+            if entry.startswith(f"class htb {class_id} ")
+        )
+        rate = _rate_from_line(line)
+        ceil = _ceil_from_line(line)
+        expected = config.service_allocations_mbps[traffic_class]
+        if (
+            rate is None or ceil is None
+            or not math.isclose(rate, expected, rel_tol=0, abs_tol=0.001)
+            or not math.isclose(ceil, expected, rel_tol=0, abs_tol=0.001)
+        ):
+            return False
+    return True
+
+
 def _mutate(runner: Callable[..., Any], command: str):
     result = runner(shlex.split(command), capture_output=True, text=True, check=False)
     if result.returncode:
@@ -497,6 +796,9 @@ def restore_original_hierarchy(
         state = inspect_tc_state(interface, execute)
         if _baseline_matches(state):
             return False
+        if _managed_htb_owned(state):
+            _restore_baseline(interface, execute, state)
+            return True
         _validate_flow_settings(
             interface, BOTTLENECK_MBPS,
             {port: BOTTLENECK_MBPS / 4 for port in FLOW_PORTS},
@@ -504,6 +806,26 @@ def restore_original_hierarchy(
         )
         if not _managed_structure_matches(state, filter_priorities, default_port):
             raise TCPreconditionError("refusing cleanup: child subtree is not recognized as controller-owned")
+        _restore_baseline(interface, execute, state)
+        return True
+
+
+def restore_managed_htb_hierarchy(
+    interface: str,
+    runner: Callable[..., Any] | None = None,
+) -> bool:
+    """Restore the original leaf only when the complete managed HTB tree is owned."""
+    if interface != ROOT_INTERFACE:
+        raise TCPreconditionError(f"refusing cleanup outside {ROOT_INTERFACE}")
+    execute = runner or subprocess.run
+    with _interface_lock(interface):
+        state = inspect_tc_state(interface, execute)
+        if _baseline_matches(state):
+            return False
+        if not _managed_htb_owned(state):
+            raise TCPreconditionError(
+                "refusing cleanup: five-leaf subtree is not recognized as controller-owned"
+            )
         _restore_baseline(interface, execute, state)
         return True
 
@@ -614,6 +936,133 @@ def apply_tc_policy(
                     ) from rollback_exc
                 raise TCApplyError(f"policy update failed; prior class rates restored: {exc}") from exc
 
+        return results
+
+
+def apply_managed_htb_policy(
+    config: ManagedHTBConfig,
+    runner: Callable[..., Any] | None = None,
+) -> list[Any]:
+    """Apply or update the validated five-leaf hierarchy with guarded rollback."""
+    if not isinstance(config, ManagedHTBConfig):
+        raise ValueError("config must be a validated ManagedHTBConfig")
+    execute = runner or subprocess.run
+    commands = generate_managed_htb_commands(config)
+    with _interface_lock(config.interface):
+        before = inspect_tc_state(config.interface, execute)
+        if _managed_htb_matches(before, config):
+            return []
+        baseline = _baseline_matches(before)
+        managed = _managed_htb_owned(before)
+        if not baseline and not managed:
+            raise TCPreconditionError(
+                "refusing to change traffic control: expected untouched baseline "
+                "or the exact controller-owned five-leaf hierarchy"
+            )
+
+        if baseline:
+            expected_partial_state = before
+            try:
+                results = []
+                for command in commands:
+                    results.append(_mutate(execute, command))
+                    expected_partial_state = inspect_tc_state(config.interface, execute)
+                after = inspect_tc_state(config.interface, execute)
+                if not _managed_htb_matches(after, config):
+                    raise TCApplyError("post-apply five-leaf hierarchy verification failed")
+            except Exception as exc:
+                try:
+                    _restore_baseline(config.interface, execute, expected_partial_state)
+                except Exception as rollback_exc:
+                    raise TCApplyError(
+                        f"apply failed: {exc}; rollback verification also failed "
+                        f"or rollback was refused: {rollback_exc}"
+                    ) from rollback_exc
+                raise TCApplyError(
+                    f"apply failed; original hierarchy restored and verified: {exc}"
+                ) from exc
+            return results
+
+        old_rates: dict[str, float] = {}
+        classes = _lines(before.classes, "class ")
+        for traffic_class, class_id in SERVICE_CLASS_IDS.items():
+            line = next(
+                (entry for entry in classes if entry.startswith(f"class htb {class_id} ")),
+                None,
+            )
+            rate = _rate_from_line(line) if line else None
+            if rate is None:
+                raise TCPreconditionError(
+                    f"managed class {class_id} has no verifiable rate"
+                )
+            old_rates[traffic_class] = rate
+
+        changed_classes: list[str] = []
+        results = []
+        expected_partial_state = before
+        try:
+            for traffic_class, class_id in SERVICE_CLASS_IDS.items():
+                requested = config.service_allocations_mbps[traffic_class]
+                if math.isclose(
+                    old_rates[traffic_class], requested, rel_tol=0, abs_tol=0.001
+                ):
+                    continue
+                rate = _format_rate(requested)
+                command = (
+                    f"tc class change dev {shlex.quote(config.interface)} parent 1:1 "
+                    f"classid {class_id} htb rate {rate}mbit ceil {rate}mbit"
+                )
+                results.append(_mutate(execute, command))
+                changed_classes.append(traffic_class)
+                expected_partial_state = inspect_tc_state(config.interface, execute)
+            after = inspect_tc_state(config.interface, execute)
+            if not _managed_htb_matches(after, config):
+                raise TCApplyError("post-update five-leaf hierarchy verification failed")
+        except Exception as exc:
+            try:
+                for traffic_class in reversed(changed_classes):
+                    current = inspect_tc_state(config.interface, execute)
+                    if current != expected_partial_state:
+                        raise TCApplyError(
+                            "rollback refused: traffic-control state changed "
+                            "since the last controller-owned state was observed"
+                        )
+                    class_id = SERVICE_CLASS_IDS[traffic_class]
+                    rate = _format_rate(old_rates[traffic_class])
+                    _mutate(
+                        execute,
+                        f"tc class change dev {shlex.quote(config.interface)} "
+                        f"parent 1:1 classid {class_id} htb rate {rate}mbit "
+                        f"ceil {rate}mbit",
+                    )
+                    expected_partial_state = inspect_tc_state(config.interface, execute)
+                restored = inspect_tc_state(config.interface, execute)
+                restored_classes = _lines(restored.classes, "class ")
+                rates_restored = _managed_htb_owned(restored)
+                for name, class_id in SERVICE_CLASS_IDS.items():
+                    line = next(
+                        (
+                            entry for entry in restored_classes
+                            if entry.startswith(f"class htb {class_id} ")
+                        ),
+                        None,
+                    )
+                    rate = _rate_from_line(line) if line else None
+                    if rate is None or not math.isclose(
+                        rate, old_rates[name], rel_tol=0, abs_tol=0.001
+                    ):
+                        rates_restored = False
+                        break
+                if not rates_restored:
+                    raise TCApplyError("rollback class-rate verification failed")
+            except Exception as rollback_exc:
+                raise TCApplyError(
+                    f"managed policy update failed: {exc}; class-rate rollback "
+                    f"verification also failed or rollback was refused: {rollback_exc}"
+                ) from rollback_exc
+            raise TCApplyError(
+                f"managed policy update failed; prior class rates restored: {exc}"
+            ) from exc
         return results
 
 

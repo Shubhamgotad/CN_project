@@ -16,11 +16,14 @@ from ai.prediction.telemetry import (
     adapt_person1_telemetry as _adapt_person1_telemetry,
     read_person1_jsonl as _read_person1_jsonl,
 )
+from qos.allocator import plan_managed_htb
 from qos.policy import build_qos_decision_from_prediction
 from qos.tc_controller import (
     FLOW_PORTS,
-    apply_tc_policy,
-    generate_tc_commands,
+    MANAGED_FILTER_PRIORITIES,
+    ManagedHTBConfig,
+    apply_managed_htb_policy,
+    generate_managed_htb_commands,
 )
 from qos.policy import TRAFFIC_CLASSES
 from qos.validator import validate_interface, validate_total_bandwidth
@@ -33,7 +36,6 @@ class QoSIntegrationConfig:
     total_bandwidth_mbps: float
     flow_policy_classes: Mapping[int, str] | None = None
     filter_priorities: Mapping[int, int] | None = None
-    default_port: int | None = None
     neutral_flow_filters: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     dry_run: bool = True
 
@@ -55,19 +57,16 @@ class QoSIntegrationConfig:
             self._validate_flow_policy_classes()
         if self.filter_priorities is not None:
             self._validate_filter_priorities()
-        if self.default_port is not None and self.default_port not in FLOW_PORTS:
-            raise ValueError("default_port must be one of UDP ports 5201-5204")
-
     def _validate_flow_policy_classes(self) -> None:
         mapping = self.flow_policy_classes
         if not isinstance(mapping, Mapping) or set(mapping) != set(FLOW_PORTS):
             raise ValueError("flow_policy_classes must map every port 5201-5204")
         if any(not isinstance(value, str) for value in mapping.values()):
             raise ValueError("flow policy class names must be strings")
-        if set(mapping.values()) != set(TRAFFIC_CLASSES) or len(set(mapping.values())) != len(FLOW_PORTS):
+        expected = dict(zip(FLOW_PORTS, TRAFFIC_CLASSES))
+        if dict(mapping) != expected:
             raise ValueError(
-                "flow_policy_classes must explicitly map the four ports one-to-one "
-                "to the existing policy classes"
+                "flow_policy_classes must map 5201-5204 to gaming, video, web, and bulk"
             )
 
     def _validate_filter_priorities(self) -> None:
@@ -75,19 +74,17 @@ class QoSIntegrationConfig:
         if not isinstance(priorities, Mapping) or set(priorities) != set(FLOW_PORTS):
             raise ValueError("filter_priorities must explicitly cover ports 5201-5204")
         values = list(priorities.values())
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535
-            for value in values
-        ) or len(set(values)) != len(FLOW_PORTS):
-            raise ValueError("filter priorities must be unique integers from 1 to 65535")
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+            or dict(priorities) != MANAGED_FILTER_PRIORITIES
+        ):
+            raise ValueError("filter priorities must be 10, 20, 30, and 40 for ports 5201-5204")
 
     def require_complete_policy_mapping(self) -> None:
         if self.flow_policy_classes is None:
             raise ValueError("explicit flow-to-policy-class mapping is required")
         if self.filter_priorities is None:
             raise ValueError("explicit per-flow filter priorities are required")
-        if self.default_port is None:
-            raise ValueError("explicit default/unmatched flow port is required")
 
 
 def adapt_person1_telemetry(
@@ -128,14 +125,14 @@ def build_qos_integration(
     decision = build_qos_decision_from_prediction(
         prediction, config.total_bandwidth_mbps
     )
+    managed_config = plan_managed_htb(
+        prediction["congestion"], interface=config.interface
+    )
     flow_allocations = {
-        port: decision["allocation_mbps"][config.flow_policy_classes[port]]
+        port: managed_config.service_allocations_mbps[config.flow_policy_classes[port]]
         for port in FLOW_PORTS
     }
-    commands = generate_tc_commands(
-        config.interface, config.total_bandwidth_mbps, flow_allocations,
-        config.filter_priorities, config.default_port,
-    )
+    commands = generate_managed_htb_commands(managed_config)
     return {
         "adapted": adapted,
         "prediction": prediction,
@@ -144,10 +141,17 @@ def build_qos_integration(
         "dry_run": config.dry_run,
         "interface": config.interface,
         "total_bandwidth_mbps": config.total_bandwidth_mbps,
+        "managed_htb_config": {
+            "service_allocations_mbps": dict(managed_config.service_allocations_mbps),
+            "unmatched_rate_mbps": managed_config.unmatched_rate_mbps,
+            "unmatched_ceil_mbps": managed_config.unmatched_ceil_mbps,
+            "default_class_id": managed_config.default_class_id,
+            "filter_priorities": dict(managed_config.filter_priorities),
+        },
+        "_managed_htb_config": managed_config,
         "flow_policy_classes": dict(config.flow_policy_classes),
         "flow_allocations_mbps": flow_allocations,
-        "filter_priorities": dict(config.filter_priorities),
-        "default_port": config.default_port,
+        "filter_priorities": dict(managed_config.filter_priorities),
         "neutral_flow_filters": dict(config.neutral_flow_filters),
     }
 
@@ -166,15 +170,9 @@ def apply_integration_commands(
     commands = integration_result.get("tc_commands")
     if not isinstance(commands, Sequence):
         raise ValueError("integration result does not contain tc commands")
-    required = ("interface", "total_bandwidth_mbps", "flow_allocations_mbps",
-                "filter_priorities", "default_port")
-    if not all(key in integration_result for key in required):
+    config = integration_result.get("_managed_htb_config")
+    if not isinstance(config, ManagedHTBConfig):
         raise ValueError("integration result is missing validated hierarchy settings")
-    return apply_tc_policy(
-        integration_result["interface"],
-        integration_result["total_bandwidth_mbps"],
-        integration_result["flow_allocations_mbps"],
-        integration_result["filter_priorities"],
-        integration_result["default_port"],
-        runner=runner,
-    )
+    if list(commands) != generate_managed_htb_commands(config):
+        raise ValueError("integration commands do not match the validated managed HTB plan")
+    return apply_managed_htb_policy(config, runner=runner)

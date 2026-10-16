@@ -147,6 +147,25 @@ def test_preconditions_reject_root_delay_class_or_filters_drift():
         assert runner.mutations == []
 
 
+@pytest.mark.parametrize(
+    ("field", "unexpected_line"),
+    [
+        ("qdiscs", "UNEXPECTED OUTPUT"),
+        ("classes", "UNEXPECTED OUTPUT"),
+    ],
+)
+def test_baseline_rejects_unexpected_output_lines(field, unexpected_line):
+    state = baseline_state()
+    state[field] += unexpected_line + "\n"
+    assert not tc_controller._baseline_matches(tc_controller.TCState(**state))
+
+
+def test_baseline_accepts_exact_expected_output():
+    assert tc_controller._baseline_matches(
+        tc_controller.TCState(**baseline_state())
+    )
+
+
 @pytest.fixture
 def representative_tc_output():
     managed = managed_state()

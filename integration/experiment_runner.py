@@ -97,14 +97,21 @@ def _adaptive_result(
     input_features: Mapping[str, float],
 ) -> dict[str, Any]:
     decision = integration_result["qos_decision"]
+    managed = integration_result["managed_htb_config"]
     return {
         "status": "completed",
         "prediction": dict(integration_result["prediction"]),
         "input_features": dict(input_features),
         "policy_percentages": dict(decision["policy"]),
-        "service_class_allocation_mbps": dict(decision["allocation_mbps"]),
+        "service_class_allocation_mbps": dict(managed["service_allocations_mbps"]),
+        "unmatched_leaf": {
+            "classid": managed["default_class_id"],
+            "rate_mbps": managed["unmatched_rate_mbps"],
+            "ceil_mbps": managed["unmatched_ceil_mbps"],
+        },
         "flow_policy_classes": dict(integration_result["flow_policy_classes"]),
         "flow_allocations_mbps": dict(integration_result["flow_allocations_mbps"]),
+        "filter_priorities": dict(managed["filter_priorities"]),
         "planning_only": True,
         "tc_commands_executed": False,
     }
@@ -295,21 +302,15 @@ def main(argv: list[str] | None = None) -> int:
         "--filter-priorities",
         help='JSON mapping, e.g. {"5201":10,"5202":20,"5203":30,"5204":40}',
     )
-    parser.add_argument("--default-port", type=int)
     args = parser.parse_args(argv)
 
     qos_config = None
     if args.mode in {"adaptive", "both"}:
         if args.model is None:
             parser.error("--model is required for adaptive and both modes")
-        if (
-            args.flow_policy_classes is None
-            or args.filter_priorities is None
-            or args.default_port is None
-        ):
+        if args.flow_policy_classes is None or args.filter_priorities is None:
             parser.error(
-                "adaptive modes require explicit flow-policy classes, filter priorities, "
-                "and default port"
+                "adaptive modes require explicit flow-policy classes and filter priorities"
             )
         try:
             classes = _json_object_argument(
@@ -323,7 +324,6 @@ def main(argv: list[str] | None = None) -> int:
                 total_bandwidth_mbps=10.0,
                 flow_policy_classes={int(port): value for port, value in classes.items()},
                 filter_priorities={int(port): value for port, value in priorities.items()},
-                default_port=args.default_port,
                 dry_run=True,
             )
         except (ValueError, TypeError, argparse.ArgumentTypeError) as exc:

@@ -73,7 +73,6 @@ def approved_test_mapping():
             5201: "gaming", 5202: "video", 5203: "web", 5204: "bulk"
         },
         "filter_priorities": {5201: 10, 5202: 20, 5203: 30, 5204: 40},
-        "default_port": 5204,
     }
 
 
@@ -219,7 +218,7 @@ def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path, monkeypa
         apply_calls.append((args, kwargs))
         return ["mocked"]
 
-    monkeypatch.setattr(telemetry_qos, "apply_tc_policy", fake_apply)
+    monkeypatch.setattr(telemetry_qos, "apply_managed_htb_policy", fake_apply)
     apply_integration_commands(result, runner=runner)
     assert not calls
     assert apply_calls

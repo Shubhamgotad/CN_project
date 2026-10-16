@@ -1,58 +1,65 @@
 # Adaptive QoS before/after comparison plan
 
-**Status:** Integration code and offline tests are prepared; 131 repository
-tests passed. The actual controller was exercised on a newly created,
-isolated disposable veth pair. No live Mininet traffic-control changes or
-adaptive comparisons have been run.
+**Status:** The managed five-leaf implementation and offline tests are
+prepared; 186 repository tests passed, with 2 expected warnings. The five-leaf implementation has not
+been live-validated. No `tc`, `ip`, Mininet, iperf, sudo, or live mutation was
+used for this implementation or its validation.
 
 ## Integration design
 
 The topology has root HTB `5:` and the 10 Mbps aggregate class `5:1` on both
 bottleneck interfaces. Client-to-server QoS is scoped to `s1-eth5` egress; the
-controller refuses other interfaces. Its proposed child hierarchy replaces
-only the leaf qdisc below `5:1` with nested HTB handle `1:`. The existing root
-and outer 10 Mbps class remain. Nested classes are flow-specific (`1:11` for
-UDP destination port 5201, through `1:14` for 5204); the nested aggregate class
-is `1:1`. Each flow leaf has netem `limit 1000 delay 10ms`, including the
-explicitly selected default leaf. UDP filters attach under `1:`. The
-default/unmatched flow is a required caller choice and shares that flow's
-class/rate. No service meaning is assigned by port.
+managed controller refuses other interfaces. Its explicit five-leaf
+configuration replaces only the leaf qdisc below `5:1` with nested HTB handle
+`1:` and keeps the existing root and outer 10 Mbps class. The nested aggregate
+class is `1:1`. Service classes are fixed: `1:11` Gaming, `1:12` Video, `1:13`
+Web, and `1:14` Bulk. UDP destination ports 5201–5204 map one-to-one to those
+classes, with filter priorities 10, 20, 30, and 40. Each service class keeps
+`rate=ceil` in this experiment.
 
-Integration requires a complete one-to-one `flow_policy_classes` mapping, an
-explicit unique filter priority per port, and an explicit default port. Those
-values are not selected by this plan. Until configured, the integration fails
-closed. Existing policy allocations are mapped to flows only through this
-caller-provided mapping; this plan does not approve those service assignments.
+Unmatched traffic uses the HTB default class `1:15`, not a service filter or
+service class. That leaf has netem handle `150:` and a 1 Mbps rate and ceil.
+Each leaf has netem `limit 1000 delay 10ms`. The approved profiles, including
+the unmatched 1 Mbps leaf, are:
 
-Before applying, the controller checks the exact baseline qdisc/class/filter
-state or recognizes its own exact child hierarchy. It refuses unknown objects,
-never replaces/deletes root `5:`, treats an identical policy application as a
-no-op, and updates only owned leaf class rates when the mapping is unchanged.
-Initial-apply failure restores the original netem leaf and verifies the
-baseline. An explicit restore operation accepts only a recognized owned
-subtree. Offline mocked tests cover failure branches. A separate actual-kernel
-probe also applied and reapplied the controller hierarchy on a fresh veth,
-exercised command failure and rollback, and verified cleanup. This validates
-the controller on that WSL2 kernel and interface, not on Mininet's OVS-managed
-interfaces. The controller serializes its own calls with a POSIX file lock,
-but cannot coordinate arbitrary external `tc` commands.
+| Congestion | Gaming | Video | Web | Bulk | Unmatched | Total |
+|---|---:|---:|---:|---:|---:|---:|
+| LOW | 2.70 | 2.70 | 2.25 | 1.35 | 1.00 | 10.00 |
+| MEDIUM | 3.60 | 2.70 | 1.80 | 0.90 | 1.00 | 10.00 |
+| HIGH | 4.50 | 2.25 | 1.35 | 0.90 | 1.00 | 10.00 |
 
-The probe evidence is in
-`telemetry/datasets/controller-veth-validation-20261015T192447Z/`; it records
-the command log, original/baseline/applied/restored snapshots, injected
-rollback-readback mismatch, and cleanup verification. The readback mismatch
-was injected in the test runner after real rollback; an independent kernel
-read confirmed the baseline. No broad cleanup was attempted by the controller.
-A later controlled Mininet review must still confirm exact preconditions and
-approved policy settings before application. Example structure (placeholders
-are deliberately unresolved):
+The managed planner validates the complete allocations and fixed class/filter
+configuration before generating commands. It is separate from the existing
+standalone four-class command generator. The telemetry integration requires
+the explicit port-to-service mapping and exact filter priorities; it has no
+default-port setting because unmatched traffic is selected by HTB default
+class configuration.
+
+Before applying, the managed controller checks the exact baseline
+qdisc/class/filter state or recognizes its complete five-leaf hierarchy. It
+rejects unexpected objects and ownership, never replaces/deletes root `5:`,
+treats an identical managed policy as a no-op, and updates only owned service
+class rates. Mutations are read back; failures restore and verify the prior
+baseline or prior rates, and explicit restoration accepts only the recognized
+managed subtree. Offline mocked tests cover command generation, all profiles,
+inspection, apply, rollback, and restore. An earlier actual-kernel probe
+covered only the pre-existing four-leaf controller; it is not validation of
+the five-leaf implementation. The five-leaf implementation remains
+unvalidated on a live kernel, disposable veth, or Mininet interface. Controller
+locking cannot coordinate arbitrary external `tc` commands.
+
+Example structure (these commands are illustrative only):
 
 ```text
-tc qdisc replace dev s1-eth5 parent 5:1 handle 1: htb default <approved-minor>
+tc qdisc replace dev s1-eth5 parent 5:1 handle 1: htb default 15
 tc class add dev s1-eth5 parent 1: classid 1:1 htb rate 10mbit ceil 10mbit
-tc class add dev s1-eth5 parent 1:1 classid 1:11 htb rate <approved-rate> ceil <approved-ceil>
-tc qdisc add dev s1-eth5 parent 1:11 handle 111: netem limit 1000 delay 10ms
-tc filter add dev s1-eth5 protocol ip parent 1: prio <approved-priority> u32 match ip protocol 17 0xff match ip dport 5201 0xffff flowid 1:11
+tc class add dev s1-eth5 parent 1:1 classid 1:11 htb rate 2.7mbit ceil 2.7mbit
+tc class add dev s1-eth5 parent 1:1 classid 1:12 htb rate 2.7mbit ceil 2.7mbit
+tc class add dev s1-eth5 parent 1:1 classid 1:13 htb rate 2.25mbit ceil 2.25mbit
+tc class add dev s1-eth5 parent 1:1 classid 1:14 htb rate 1.35mbit ceil 1.35mbit
+tc class add dev s1-eth5 parent 1:1 classid 1:15 htb rate 1mbit ceil 1mbit
+tc qdisc add dev s1-eth5 parent 1:15 handle 150: netem limit 1000 delay 10ms
+tc filter add dev s1-eth5 protocol ip parent 1: prio 10 u32 match ip protocol 17 0xff match ip dport 5201 0xffff flowid 1:11
 ```
 
 **The example commands are NOT EXECUTED.** The controller should be used for
@@ -127,7 +134,7 @@ JSONL records and writes a new JSON report without applying traffic control.
 For example, after creating a fresh output path:
 
 ```text
-python -m integration.experiment_runner --input telemetry/datasets/congestion.jsonl --output telemetry/datasets/comparison.json --mode both --model ai/prediction/model.joblib --flow-policy-classes "{\"5201\":\"gaming\",\"5202\":\"video\",\"5203\":\"web\",\"5204\":\"bulk\"}" --filter-priorities "{\"5201\":10,\"5202\":20,\"5203\":30,\"5204\":40}" --default-port 5204
+python -m integration.experiment_runner --input telemetry/datasets/congestion.jsonl --output telemetry/datasets/comparison.json --mode both --model ai/prediction/model.joblib --flow-policy-classes "{\"5201\":\"gaming\",\"5202\":\"video\",\"5203\":\"web\",\"5204\":\"bulk\"}" --filter-priorities "{\"5201\":10,\"5202\":20,\"5203\":30,\"5204\":40}"
 ```
 
 Replace the example model path with an existing compatible trained artifact.

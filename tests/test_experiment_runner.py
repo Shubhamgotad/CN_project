@@ -67,7 +67,6 @@ def qos_config():
             5201: "gaming", 5202: "video", 5203: "web", 5204: "bulk"
         },
         filter_priorities={5201: 10, 5202: 20, 5203: 30, 5204: 40},
-        default_port=5204,
         dry_run=True,
     )
 
@@ -107,7 +106,10 @@ def test_adaptive_runner_uses_existing_prediction_and_allocation_path(
         "utilization", "throughput_mbps", "latency_ms", "jitter_ms",
         "packet_loss_pct", "active_flows",
     }
-    assert sum(adaptive["flow_allocations_mbps"].values()) == pytest.approx(10)
+    assert sum(adaptive["flow_allocations_mbps"].values()) == pytest.approx(9)
+    assert adaptive["unmatched_leaf"] == {
+        "classid": "1:15", "rate_mbps": 1.0, "ceil_mbps": 1.0,
+    }
     assert result["measured"]["throughput_mbps"] == 3.0
     assert result["measured"]["queue_size"] is None
     assert result["measured"]["queue_drops"] is None
@@ -268,9 +270,11 @@ def test_runner_never_invokes_live_apply_or_network_subprocess(
 
     monkeypatch.setattr(experiment_runner, "subprocess", None, raising=False)
     monkeypatch.setattr(tc_controller, "apply_tc_policy", forbidden)
+    monkeypatch.setattr(tc_controller, "apply_managed_htb_policy", forbidden)
+    monkeypatch.setattr(tc_controller, "restore_managed_htb_hierarchy", forbidden)
     monkeypatch.setattr(tc_controller, "restore_original_hierarchy", forbidden)
     monkeypatch.setattr(tc_controller, "apply_tc_commands", forbidden)
-    monkeypatch.setattr(telemetry_qos, "apply_tc_policy", forbidden)
+    monkeypatch.setattr(telemetry_qos, "apply_managed_htb_policy", forbidden)
     monkeypatch.setattr(telemetry_qos, "apply_integration_commands", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
