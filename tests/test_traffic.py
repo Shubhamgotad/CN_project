@@ -94,16 +94,6 @@ def test_monitor_can_stop_without_waiting_for_real_interval(monkeypatch):
 
 
 def test_normal_stops_monitor_when_iperf_fails(monkeypatch):
-    class FakeProcess:
-        def poll(self):
-            return None
-
-        def terminate(self):
-            self.terminated = True
-
-        def wait(self, timeout=None):
-            return 1
-
     class FakeMonitor:
         stopped = False
 
@@ -118,9 +108,7 @@ def test_normal_stops_monitor_when_iperf_fails(monkeypatch):
                 "queue_drops": None,
             }
 
-    process = FakeProcess()
     monitor = FakeMonitor()
-    monkeypatch.setattr(traffic_generator, "run_on_host", lambda *args: process)
     monkeypatch.setattr(
         traffic_generator,
         "ScenarioMonitor",
@@ -128,15 +116,14 @@ def test_normal_stops_monitor_when_iperf_fails(monkeypatch):
     )
     monkeypatch.setattr(
         traffic_generator,
-        "wait_for_process",
-        lambda _: (_ for _ in ()).throw(RuntimeError("iperf failed")),
+        "_run_udp_flow",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("iperf failed")),
     )
 
     with pytest.raises(RuntimeError, match="iperf failed"):
         traffic_generator.normal()
 
     assert monitor.stopped
-    assert process.terminated
 
 
 def test_normal_stops_monitor_when_process_start_fails(monkeypatch):
@@ -156,7 +143,7 @@ def test_normal_stops_monitor_when_process_start_fails(monkeypatch):
     )
     monkeypatch.setattr(
         traffic_generator,
-        "run_on_host",
+        "_run_udp_flow",
         lambda *args: (_ for _ in ()).throw(RuntimeError("start failed")),
     )
 
@@ -192,6 +179,12 @@ def test_congestion_cleans_started_processes_when_flow_start_fails(monkeypatch):
 
     processes = []
     monitor = FakeMonitor()
+    listeners = []
+
+    def start_listener(port, callback):
+        listener = FakeProcess()
+        listeners.append((listener, port))
+        return listener
 
     def start_flow(*args):
         if len(processes) == 1:
@@ -201,6 +194,12 @@ def test_congestion_cleans_started_processes_when_flow_start_fails(monkeypatch):
         return process
 
     monkeypatch.setattr(traffic_generator, "ScenarioMonitor", lambda *a, **k: monitor)
+    monkeypatch.setattr(
+        traffic_generator, "start_receiver_listener", start_listener
+    )
+    monkeypatch.setattr(
+        traffic_generator, "stop_receiver_listener", lambda *args: None
+    )
     monkeypatch.setattr(traffic_generator, "run_on_host", start_flow)
 
     with pytest.raises(RuntimeError, match="second flow failed"):
@@ -209,6 +208,7 @@ def test_congestion_cleans_started_processes_when_flow_start_fails(monkeypatch):
     assert monitor.stopped
     assert len(processes) == 1
     assert processes[0].terminated
+    assert len(listeners) == 4
 
 
 def test_congestion_cleans_all_processes_when_wait_fails(monkeypatch):
@@ -237,7 +237,20 @@ def test_congestion_cleans_all_processes_when_wait_fails(monkeypatch):
 
     processes = []
     monitor = FakeMonitor()
+    listeners = []
+
+    def start_listener(port, callback):
+        listener = FakeProcess()
+        listeners.append((listener, port))
+        return listener
+
     monkeypatch.setattr(traffic_generator, "ScenarioMonitor", lambda *a, **k: monitor)
+    monkeypatch.setattr(
+        traffic_generator, "start_receiver_listener", start_listener
+    )
+    monkeypatch.setattr(
+        traffic_generator, "stop_receiver_listener", lambda *args: None
+    )
     monkeypatch.setattr(
         traffic_generator,
         "run_on_host",
@@ -246,7 +259,9 @@ def test_congestion_cleans_all_processes_when_wait_fails(monkeypatch):
     monkeypatch.setattr(
         traffic_generator,
         "wait_for_process",
-        lambda _: (_ for _ in ()).throw(RuntimeError("wait failed")),
+        lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(RuntimeError("wait failed")),
     )
 
     with pytest.raises(RuntimeError, match="wait failed"):
@@ -255,6 +270,7 @@ def test_congestion_cleans_all_processes_when_wait_fails(monkeypatch):
     assert monitor.stopped
     assert len(processes) == 4
     assert all(process.terminated for process in processes)
+    assert len(listeners) == 4
 
 
 @pytest.mark.parametrize(
@@ -294,16 +310,6 @@ def test_moderate_rejects_invalid_rate(rate_mbps):
 
 
 def test_moderate_rate_is_used_in_iperf_and_saved_telemetry(monkeypatch):
-    class FakeProcess:
-        def poll(self):
-            return None
-
-        def terminate(self):
-            self.terminated = True
-
-        def wait(self, timeout=None):
-            return 0
-
     class FakeMonitor:
         def start(self):
             return self
@@ -311,15 +317,12 @@ def test_moderate_rate_is_used_in_iperf_and_saved_telemetry(monkeypatch):
         def stop(self):
             return {"latency_ms": 20.0, "queue_size": 0, "queue_drops": 0}
 
-    process = FakeProcess()
-    commands = []
+    flow_args = []
     saved = []
     monkeypatch.setattr(
-        traffic_generator,
-        "run_on_host",
-        lambda host, command: commands.append((host, command)) or process,
+        traffic_generator, "_run_udp_flow",
+        lambda *args: flow_args.append(args) or "iperf",
     )
-    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda _: "iperf")
     monkeypatch.setattr(
         traffic_generator,
         "ScenarioMonitor",
@@ -333,9 +336,9 @@ def test_moderate_rate_is_used_in_iperf_and_saved_telemetry(monkeypatch):
 
     traffic_generator.moderate(8.5)
 
-    assert commands[0][1][commands[0][1].index("-b") + 1] == "8.5M"
+    assert flow_args[0][:4] == ("h1", 8.5, 5201, traffic_generator.DURATION)
+    assert flow_args[0][4].requested_mbps == 8.5
     assert saved[0]["requested_mbps"] == 8.5
-    assert process.terminated
 
 
 def test_moderate_saves_distinct_experiment_ids_and_appends(tmp_path, monkeypatch):
@@ -364,6 +367,26 @@ def test_moderate_saves_distinct_experiment_ids_and_appends(tmp_path, monkeypatc
         "trial-7.5",
     ]
     assert [record["requested_mbps"] for record in records] == [7.0, 7.5]
+    assert set(records[0]) == {
+        "timestamp",
+        "experiment_id",
+        "scenario",
+        "source",
+        "destination",
+        "traffic_type",
+        "requested_mbps",
+        "throughput_mbps",
+        "latency_ms",
+        "jitter_ms",
+        "packet_loss_percent",
+        "lost_packets",
+        "total_packets",
+        "bandwidth_mbps",
+        "utilization_percent",
+        "active_flows",
+        "queue_size",
+        "queue_drops",
+    }
 
 
 def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch):
@@ -391,9 +414,10 @@ def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch):
         traffic_generator, "ScenarioMonitor", lambda *args, **kwargs: FakeMonitor()
     )
     monkeypatch.setattr(
-        traffic_generator, "run_on_host", lambda *args, **kwargs: FakeProcess()
+        traffic_generator,
+        "_run_udp_flow",
+        lambda *args, **kwargs: "iperf",
     )
-    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda _: "iperf")
     monkeypatch.setattr(
         traffic_generator,
         "save_telemetry",

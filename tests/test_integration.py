@@ -11,6 +11,7 @@ from integration.telemetry_qos import (
     build_qos_integration,
     read_person1_jsonl,
 )
+from qos.tc_controller import FLOW_PORTS
 
 
 def person1_telemetry(utilization=30.0, packet_loss=0.0):
@@ -63,6 +64,17 @@ def train_fixture_model(path):
         training_record(95, 150, 5, 9.5),
     ]
     train_random_forest(records, path, random_state=11)
+
+
+def approved_test_mapping():
+    # Synthetic bijection for offline tests only; it is not a service policy.
+    return {
+        "flow_policy_classes": {
+            5201: "gaming", 5202: "video", 5203: "web", 5204: "bulk"
+        },
+        "filter_priorities": {5201: 10, 5202: 20, 5203: 30, 5204: 40},
+        "default_port": 5204,
+    }
 
 
 def test_timestamp_mapping_and_timezone_handling():
@@ -122,9 +134,9 @@ def test_end_to_end_prediction_qos_and_dry_run(tmp_path):
     model_path = tmp_path / "model.joblib"
     train_fixture_model(model_path)
     config = QoSIntegrationConfig(
-        interface="configured-bottleneck",
+        interface="s1-eth5",
         total_bandwidth_mbps=10.0,
-        traffic_filters={"web": {"port": 5201, "protocol": "udp"}},
+        **approved_test_mapping(),
         neutral_flow_filters={
             "flow_h1": {"port": 5201, "protocol": "udp"},
             "flow_h2": {"port": 5202, "protocol": "udp"},
@@ -140,10 +152,22 @@ def test_end_to_end_prediction_qos_and_dry_run(tmp_path):
     )
     assert result["prediction"]["congestion"] in {"LOW", "MEDIUM", "HIGH"}
     assert sum(result["qos_decision"]["allocation_mbps"].values()) == pytest.approx(10)
-    assert any("dev configured-bottleneck" in command for command in result["tc_commands"])
+    assert any("dev s1-eth5" in command for command in result["tc_commands"])
     assert "flow_h4" in result["neutral_flow_filters"]
     with pytest.raises(RuntimeError, match="dry_run"):
         apply_integration_commands(result)
+
+
+def test_incomplete_flow_policy_mapping_fails_closed(tmp_path):
+    model_path = tmp_path / "model.joblib"
+    train_fixture_model(model_path)
+    config = QoSIntegrationConfig(
+        interface="s1-eth5", total_bandwidth_mbps=10.0
+    )
+    with pytest.raises(ValueError, match="flow-to-policy-class mapping"):
+        build_qos_integration(
+            person1_telemetry(), model_path=model_path, config=config
+        )
 
 
 def test_neutral_filters_are_not_translated_to_application_filters(tmp_path):
@@ -153,21 +177,27 @@ def test_neutral_filters_are_not_translated_to_application_filters(tmp_path):
         person1_telemetry(),
         model_path=model_path,
         config=QoSIntegrationConfig(
-            interface="configured0",
+            interface="s1-eth5",
             total_bandwidth_mbps=10,
+            **approved_test_mapping(),
             neutral_flow_filters={"flow_h1": {"port": 5201, "protocol": "udp"}},
         ),
     )
     assert result["neutral_flow_filters"]["flow_h1"]["port"] == 5201
-    assert not any("filter add" in command for command in result["tc_commands"])
+    filters = [command for command in result["tc_commands"] if "filter add" in command]
+    assert len(filters) == len(FLOW_PORTS)
+    assert all("match ip protocol 17" in command for command in filters)
 
 
-def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path):
+def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path, monkeypatch):
+    from integration import telemetry_qos
+
     model_path = tmp_path / "model.joblib"
     train_fixture_model(model_path)
     config = QoSIntegrationConfig(
-        interface="configured0",
+        interface="s1-eth5",
         total_bandwidth_mbps=10,
+        **approved_test_mapping(),
         dry_run=True,
     )
     result = build_qos_integration(
@@ -183,8 +213,16 @@ def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path):
     assert calls == []
 
     result["dry_run"] = False
+    apply_calls = []
+
+    def fake_apply(*args, **kwargs):
+        apply_calls.append((args, kwargs))
+        return ["mocked"]
+
+    monkeypatch.setattr(telemetry_qos, "apply_tc_policy", fake_apply)
     apply_integration_commands(result, runner=runner)
-    assert calls
+    assert not calls
+    assert apply_calls
 
 def test_combined_person1_dataset_through_ml_to_qos(tmp_path):
     """Exercise every combined telemetry record without executing tc commands."""
@@ -202,8 +240,9 @@ def test_combined_person1_dataset_through_ml_to_qos(tmp_path):
     assert records, "Combined telemetry dataset is empty"
 
     config = QoSIntegrationConfig(
-        interface="configured-bottleneck",
+        interface="s1-eth5",
         total_bandwidth_mbps=10.0,
+        **approved_test_mapping(),
         dry_run=True,
     )
 

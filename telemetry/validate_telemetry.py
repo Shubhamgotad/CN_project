@@ -39,6 +39,7 @@ OPTIONAL_INTERVAL_FIELDS = (
     "queue_measurement_timestamp",
     "latency_measurement_age_seconds",
     "queue_measurement_age_seconds",
+    "throughput_measurement_source",
 )
 
 STRING_FIELDS = (
@@ -48,6 +49,7 @@ STRING_FIELDS = (
     "source",
     "destination",
     "traffic_type",
+    "throughput_measurement_source",
 )
 
 NUMERIC_FIELDS = (
@@ -117,6 +119,15 @@ def _validate_record(record):
     ):
         if field in record and not isinstance(record[field], str):
             errors.append(f"{field} must be a string")
+
+    throughput_source = record.get("throughput_measurement_source")
+    if throughput_source is not None and throughput_source not in (
+        "client",
+        "receiver",
+    ):
+        errors.append(
+            "throughput_measurement_source must be client or receiver"
+        )
 
     for timestamp_field in (
         "timestamp",

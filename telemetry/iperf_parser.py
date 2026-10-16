@@ -165,6 +165,50 @@ def parse_iperf_interval_events(
     ]
 
 
+def parse_iperf_sender_interval_events(line, measurement_timestamp=None):
+    """Extract interval timing and throughput from client JSON-stream output."""
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError("iperf event is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("iperf event must be a JSON object")
+    if payload.get("event") != "interval":
+        raise ValueError("iperf event must use event=interval")
+
+    timestamp = measurement_timestamp or datetime.now(timezone.utc).isoformat()
+    events = []
+    for interval in _interval_payloads(payload):
+        if not isinstance(interval, dict):
+            raise ValueError("iperf interval must be an object")
+        summary = interval.get("sum") or interval.get("sum_sent")
+        if not isinstance(summary, dict):
+            streams = interval.get("streams")
+            if not isinstance(streams, list) or not streams:
+                raise ValueError("client interval is missing sum or streams data")
+            summary = streams[0]
+        required = ("start", "end", "bits_per_second")
+        if not all(field in summary for field in required):
+            raise ValueError("client interval is missing timing or throughput")
+        try:
+            start = float(summary["start"])
+            end = float(summary["end"])
+            throughput = float(summary["bits_per_second"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("client interval contains invalid metrics") from exc
+        if not all(math.isfinite(value) for value in (start, end, throughput)):
+            raise ValueError("client interval metrics must be finite")
+        if end <= start or throughput < 0:
+            raise ValueError("client interval timing or throughput is invalid")
+        events.append({
+            "start": start,
+            "end": end,
+            "throughput_mbps": throughput / 1_000_000,
+            "timestamp": timestamp,
+        })
+    return events
+
+
 def parse_iperf_interval(
     line,
     source,

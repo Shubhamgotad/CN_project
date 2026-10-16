@@ -9,7 +9,12 @@ from .policy import (
     build_qos_decision_from_prediction,
     get_policy,
 )
-from .tc_controller import apply_tc_commands, generate_tc_commands
+from .tc_controller import (
+    apply_tc_commands,
+    apply_tc_policy,
+    generate_tc_commands,
+    restore_original_hierarchy,
+)
 
 __all__ = [
     "CONGESTION_STATES",
@@ -17,8 +22,10 @@ __all__ = [
     "TRAFFIC_CLASSES",
     "allocate_bandwidth",
     "apply_tc_commands",
+    "apply_tc_policy",
     "build_qos_decision",
     "build_qos_decision_from_prediction",
     "generate_tc_commands",
     "get_policy",
+    "restore_original_hierarchy",
 ]

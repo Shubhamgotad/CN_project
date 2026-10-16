@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from telemetry.iperf_parser import (
     parse_iperf_interval_events,
     parse_iperf_output,
+    parse_iperf_sender_interval_events,
     write_interval_jsonl,
     write_jsonl,
 )
@@ -28,6 +29,9 @@ BOTTLENECK_INTERFACE = "s1-eth5"
 DATASET_DIR = Path(__file__).resolve().parents[1] / "telemetry" / "datasets"
 INTERVAL_DATASET_DIR = DATASET_DIR
 MONITOR_FRESHNESS_SECONDS = 2.0
+IPERF_SERVER_PORTS = range(5201, 5205)
+IPERF_LISTENER_START_TIMEOUT_SECONDS = 5.0
+MAX_INTERVAL_MATCH_TOLERANCE_SECONDS = 0.25
 
 
 def run_on_host(host, command):
@@ -126,12 +130,20 @@ def start_interval_reader(process, callback):
     return reader
 
 
-def wait_for_process(process):
+def wait_for_process(process, timeout=None):
     """Wait for a traffic process and return its iperf3 output."""
 
     reader = getattr(process, "_interval_reader", None)
     if reader is not None:
-        process.wait()
+        try:
+            if timeout is None:
+                process.wait()
+            else:
+                process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _stop_process(process)
+            reader.join()
+            raise TimeoutError("iperf traffic process timed out") from exc
         output = reader.join()
         process_error = None
         if process.returncode != 0:
@@ -153,7 +165,15 @@ def wait_for_process(process):
         print(output)
         return output
 
-    output, _ = process.communicate()
+    try:
+        if timeout is None:
+            output, _ = process.communicate()
+        else:
+            output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _stop_process(process)
+        process.communicate()
+        raise TimeoutError("iperf traffic process timed out") from exc
 
     if process.returncode != 0:
         print(output)
@@ -470,37 +490,383 @@ def save_telemetry(
     print(f"[TELEMETRY] {record}")
 
 
-def save_interval_telemetry(
-    line,
-    source,
-    scenario,
-    experiment_id,
-    requested_mbps,
-    active_flows,
-    monitor,
-):
-    """Parse and persist one genuine iperf interval observation.
+class IntervalTelemetryCollector:
+    """Pair client throughput with receiver-side UDP loss and jitter."""
 
-    Interval files are intentionally separate from the existing final
-    aggregate files, so current consumers continue to see only final records.
-    RTT and queue values are the latest monitor sample at interval-report
-    receipt time; the two measurements are therefore aligned approximately,
-    not guaranteed simultaneous.
-    """
-    filename = INTERVAL_DATASET_DIR / f"{scenario}_intervals.jsonl"
-    records = parse_iperf_interval_events(
-        line,
-        source=source,
-        experiment_id=experiment_id,
-        scenario=scenario,
-        requested_mbps=requested_mbps,
-        active_flows=active_flows,
-        bandwidth_mbps=10.0,
+    def __init__(
+        self,
+        source,
+        scenario,
+        port,
+        experiment_id,
+        requested_mbps,
+        active_flows,
+        monitor,
+        output_directory=None,
+    ):
+        self.source = source
+        self.scenario = scenario
+        self.port = port
+        self.experiment_id = experiment_id
+        self.requested_mbps = requested_mbps
+        self.active_flows = active_flows
+        self.monitor = monitor
+        self.output_directory = Path(output_directory) if output_directory else INTERVAL_DATASET_DIR
+        safe_experiment_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(experiment_id))
+        self.filename = (
+            self.output_directory
+            / f"{scenario}_{safe_experiment_id}_{source}_intervals.jsonl"
+        )
+        self._lock = threading.Lock()
+        self._client_intervals = {}
+        self._receiver_intervals = {}
+        self._receiver_measurements = {}
+        self._completed = set()
+        self._used_client_intervals = set()
+        self._used_receiver_intervals = set()
+
+    @staticmethod
+    def _key(interval):
+        return round(interval["start"], 6), round(interval["end"], 6)
+
+    def add_client_event(self, line):
+        for interval in parse_iperf_sender_interval_events(line):
+            interval["measurement"] = self.monitor.latest_measurement()
+            with self._lock:
+                key = self._key(interval)
+                if key in self._client_intervals:
+                    raise ValueError(
+                        f"duplicate client interval for source={self.source} "
+                        f"scenario={self.scenario} port={self.port} "
+                        f"interval={key[0]:g}-{key[1]:g}s"
+                    )
+                self._client_intervals[key] = interval
+                self._match_pending_intervals()
+
+    def add_receiver_event(self, line):
+        observed_monotonic = time.monotonic()
+        try:
+            records = parse_iperf_interval_events(
+                line,
+                source=self.source,
+                experiment_id=self.experiment_id,
+                scenario=self.scenario,
+                requested_mbps=self.requested_mbps,
+                active_flows=self.active_flows,
+                bandwidth_mbps=10.0,
+            )
+        except (TypeError, ValueError) as exc:
+            interval = self._event_interval_label(line)
+            raise ValueError(
+                "Invalid receiver-side UDP metrics for "
+                f"source={self.source} scenario={self.scenario} "
+                f"port={self.port} experiment_id={self.experiment_id} "
+                f"{interval}: {exc}"
+            ) from exc
+        measurement = self.monitor.latest_measurement()
+        with self._lock:
+            for record in records:
+                # Callback observation is recorded separately; it is not treated
+                # as the interval's absolute start/end clock boundary.
+                record["receiver_observation_monotonic_seconds"] = observed_monotonic
+                key = self._key({
+                    "start": record["interval_start_seconds"],
+                    "end": record["interval_end_seconds"],
+                })
+                if key in self._receiver_intervals:
+                    raise ValueError(
+                        f"duplicate receiver interval for source={self.source} "
+                        f"scenario={self.scenario} port={self.port} "
+                        f"interval={key[0]:g}-{key[1]:g}s"
+                    )
+                self._receiver_intervals[key] = record
+                self._receiver_measurements[key] = measurement
+                self._match_pending_intervals()
+
+    @staticmethod
+    def _event_interval_label(line):
+        try:
+            payload = json.loads(line)
+            data = payload["data"]
+            intervals = data.get("intervals")
+            if not isinstance(intervals, list):
+                intervals = [data]
+            interval = intervals[0]
+            summary = interval.get("sum")
+            if not isinstance(summary, dict):
+                streams = interval.get("streams")
+                summary = streams[0] if isinstance(streams, list) and streams else {}
+            start = float(summary["start"])
+            end = float(summary["end"])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return "interval=unknown"
+        return f"interval={start:g}-{end:g}s"
+
+    @staticmethod
+    def _intervals_match(client, receiver):
+        client_duration = client["end"] - client["start"]
+        receiver_duration = (
+            receiver["interval_end_seconds"]
+            - receiver["interval_start_seconds"]
+        )
+        tolerance = min(
+            MAX_INTERVAL_MATCH_TOLERANCE_SECONDS,
+            max(0.05, min(client_duration, receiver_duration) * 0.25),
+        )
+        return (
+            abs(client["start"] - receiver["interval_start_seconds"])
+            <= tolerance
+            and abs(client["end"] - receiver["interval_end_seconds"])
+            <= tolerance
+        )
+
+    def _match_pending_intervals(self):
+        for client_key, client in self._client_intervals.items():
+            if client_key in self._used_client_intervals:
+                continue
+            candidates = [
+                (receiver_key, receiver)
+                for receiver_key, receiver in self._receiver_intervals.items()
+                if receiver_key not in self._used_receiver_intervals
+                and self._intervals_match(client, receiver)
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"ambiguous receiver interval match for "
+                    f"source={self.source} scenario={self.scenario} "
+                    f"port={self.port} interval="
+                    f"{client['start']:g}-{client['end']:g}s"
+                )
+            if candidates:
+                receiver_key, receiver = candidates[0]
+                self._persist_pair(client_key, client, receiver_key, receiver)
+
+        for receiver_key, receiver in self._receiver_intervals.items():
+            if receiver_key in self._used_receiver_intervals:
+                continue
+            candidates = [
+                client
+                for client_key, client in self._client_intervals.items()
+                if client_key not in self._used_client_intervals
+                and self._intervals_match(client, receiver)
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"ambiguous client interval match for "
+                    f"source={self.source} scenario={self.scenario} "
+                    f"port={self.port} receiver interval="
+                    f"{receiver['interval_start_seconds']:g}-"
+                    f"{receiver['interval_end_seconds']:g}s"
+                )
+            if candidates:
+                client = candidates[0]
+                client_key = self._key(client)
+                self._persist_pair(
+                    client_key, client, receiver_key, receiver
+                )
+
+    def _persist_pair(self, client_key, client, receiver_key, receiver):
+        # Receiver JSON-stream data is authoritative for receiver metrics.
+        record = dict(receiver)
+        record["receiver_observation_timestamp"] = receiver["observation_timestamp"]
+        record["receiver_interval_start_seconds"] = receiver["interval_start_seconds"]
+        record["receiver_interval_end_seconds"] = receiver["interval_end_seconds"]
+        record["receiver_interval_duration_seconds"] = receiver["interval_duration_seconds"]
+        record["client_observation_timestamp"] = client["timestamp"]
+        record["sender_interval_start_seconds"] = client["start"]
+        record["sender_interval_end_seconds"] = client["end"]
+        record["sender_interval_duration_seconds"] = client["end"] - client["start"]
+        record["sender_throughput_mbps"] = client["throughput_mbps"]
+        record["sender_measurement_source"] = "iperf3_client_json_stream"
+        record["throughput_measurement_source"] = "iperf3_server_json_stream"
+        record["interval_id"] = (
+            f"{self.experiment_id}:{self.source}:receiver:"
+            f"{receiver['interval_start_seconds']:g}-"
+            f"{receiver['interval_end_seconds']:g}"
+        )
+        utilization = record["throughput_mbps"] / record["bandwidth_mbps"] * 100
+        if not math.isfinite(utilization) or not 0 <= utilization <= 100:
+            raise ValueError(
+                f"invalid receiver utilization for source={self.source} "
+                f"scenario={self.scenario} port={self.port} "
+                f"interval={receiver['interval_start_seconds']:g}-"
+                f"{receiver['interval_end_seconds']:g}s"
+            )
+        record["utilization_percent"] = round(utilization, 2)
+        record.update(client["measurement"])
+        write_interval_jsonl(record, self.filename)
+        self._completed.add((client_key, receiver_key))
+        self._used_client_intervals.add(client_key)
+        self._used_receiver_intervals.add(receiver_key)
+
+    def validate_complete(self):
+        with self._lock:
+            missing_receiver = (
+                self._client_intervals.keys() - self._used_client_intervals
+            )
+            if missing_receiver:
+                start, end = sorted(missing_receiver)[0]
+                raise RuntimeError(
+                    "Missing receiver-side UDP metrics for "
+                    f"source={self.source} scenario={self.scenario} "
+                    f"port={self.port} experiment_id={self.experiment_id} "
+                    f"interval={start:g}-{end:g}s"
+                )
+            missing_client = (
+                self._receiver_intervals.keys()
+                - self._used_receiver_intervals
+            )
+            if missing_client and self._client_intervals:
+                final_client_end = max(
+                    interval["end"]
+                    for interval in self._client_intervals.values()
+                )
+                trailing_intervals = [
+                    key for key in sorted(missing_client)
+                ]
+                is_contiguous_drain = (
+                    trailing_intervals
+                    and abs(trailing_intervals[0][0] - final_client_end) <= 0.05
+                    and all(
+                        abs(current[0] - previous[1]) <= 0.05
+                        for previous, current in zip(
+                            trailing_intervals, trailing_intervals[1:]
+                        )
+                    )
+                )
+                if is_contiguous_drain:
+                    for key in sorted(trailing_intervals):
+                        record = dict(self._receiver_intervals[key])
+                        record["throughput_measurement_source"] = "receiver"
+                        record.update(self._receiver_measurements[key])
+                        write_interval_jsonl(record, self.filename)
+                        self._used_receiver_intervals.add(key)
+                        print(
+                            "[TELEMETRY] Persisted receiver-only post-client "
+                            f"drain interval for source={self.source} "
+                            f"scenario={self.scenario} port={self.port} "
+                            f"experiment_id={self.experiment_id} "
+                            f"interval={key[0]:g}-{key[1]:g}s"
+                        )
+                    missing_client = set()
+            if missing_client:
+                start, end = sorted(missing_client)[0]
+                raise RuntimeError(
+                    "Missing client interval for receiver metrics for "
+                    f"source={self.source} scenario={self.scenario} "
+                    f"port={self.port} experiment_id={self.experiment_id} "
+                    f"interval={start:g}-{end:g}s"
+                )
+            if not self._completed:
+                raise RuntimeError(
+                    "No matched receiver-side UDP intervals for "
+                    f"source={self.source} scenario={self.scenario} "
+                    f"port={self.port} experiment_id={self.experiment_id}"
+                )
+
+
+def _iperf_port_is_listening(port):
+    """Check a server-host TCP port without starting another listener."""
+    probe = run_on_host(
+        "server",
+        ["ss", "-H", "-ltn", "sport", "=", f":{port}"],
     )
-    measurement = monitor.latest_measurement()
-    for record in records:
-        record.update(measurement)
-        write_interval_jsonl(record, filename)
+    output, _ = probe.communicate()
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"Could not check iperf listener port {port}: {output.strip()}"
+        )
+    return f":{port}" in output
+
+
+def start_receiver_listener(port, callback):
+    """Start and verify one receiver-side iperf JSON-stream listener."""
+    if port not in IPERF_SERVER_PORTS:
+        raise ValueError(f"unsupported iperf receiver port: {port}")
+    if _iperf_port_is_listening(port):
+        raise RuntimeError(
+            f"iperf receiver port {port} is already listening in Mininet "
+            "host server; stop the stale/external listener and retry"
+        )
+    process = None
+    try:
+        process = run_on_host(
+            "server",
+            ["iperf3", "-s", "-1", "-p", str(port), "--json-stream"],
+        )
+        start_interval_reader(process, callback)
+        deadline = time.monotonic() + IPERF_LISTENER_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"iperf receiver listener exited during startup on port "
+                    f"{port} (exit code {process.returncode})"
+                )
+            if _iperf_port_is_listening(port):
+                return process
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"iperf receiver listener did not become ready on port {port}"
+        )
+    except BaseException:
+        if process is not None:
+            _stop_process(process)
+            reader = getattr(process, "_interval_reader", None)
+            if reader is not None:
+                reader.join()
+        raise
+
+
+def stop_receiver_listener(process, port):
+    """Stop one managed listener and surface receiver collection failures."""
+    return_code = process.poll()
+    _stop_process(process)
+    reader = getattr(process, "_interval_reader", None)
+    output = reader.join() if reader is not None else ""
+    if reader is not None and reader.error is not None:
+        raise RuntimeError(
+            f"receiver interval collection failed on port {port}: "
+            f"{reader.error}"
+        ) from reader.error
+    if return_code is not None and return_code != 0:
+        raise subprocess.CalledProcessError(
+            return_code, process.args, output
+        )
+
+
+def _run_udp_flow(
+    source,
+    rate_mbps,
+    port,
+    duration,
+    collector,
+):
+    """Run one client against its owned receiver listener, cleaning both up."""
+    listener = None
+    client = None
+    try:
+        listener = start_receiver_listener(port, collector.add_receiver_event)
+        client = run_on_host(
+            source,
+            [
+                "iperf3", "-c", SERVER_IP, "-u",
+                "-b", f"{rate_mbps:g}M",
+                "-p", str(port),
+                "-t", str(duration),
+                "--json-stream",
+            ],
+        )
+        start_interval_reader(client, collector.add_client_event)
+        output = wait_for_process(client, timeout=duration + 30)
+    finally:
+        try:
+            if client is not None:
+                _stop_process(client)
+        finally:
+            if listener is not None:
+                stop_receiver_listener(listener, port)
+    collector.validate_complete()
+    return output
 
 
 def normal():
@@ -509,27 +875,14 @@ def normal():
     print("\n=== NORMAL SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
-    process = None
     monitor = ScenarioMonitor(["h1"]).start()
+    collector = IntervalTelemetryCollector(
+        "h1", "normal", 5201, experiment_id, 3, 1, monitor
+    )
     try:
-        process = run_on_host(
-            "h1",
-            [
-                "iperf3", "-c", SERVER_IP, "-u", "-b", "3M",
-                "-t", str(DURATION), "--json-stream",
-            ]
-        )
-        start_interval_reader(
-            process,
-            lambda line: save_interval_telemetry(
-                line, "h1", "normal", experiment_id, 3, 1, monitor
-            ),
-        )
-        output = wait_for_process(process)
+        output = _run_udp_flow("h1", 3, 5201, DURATION, collector)
     finally:
         summary = monitor.stop()
-        if process is not None:
-            _stop_process(process)
 
     save_telemetry(
         output,
@@ -562,11 +915,24 @@ def congestion():
         ("h4", 4, 5204),
     ]
 
-    processes = []
     monitor = ScenarioMonitor(["h1", "h2", "h3", "h4"]).start()
+    collectors = [
+        IntervalTelemetryCollector(
+            host, "congestion", port, experiment_id, rate, 4, monitor
+        )
+        for host, rate, port in flows
+    ]
+    listeners = []
+    processes = []
     flow_outputs = []
     try:
-        for host, rate, port in flows:
+        for collector, (host, rate, port) in zip(collectors, flows):
+            listener = start_receiver_listener(
+                port, collector.add_receiver_event
+            )
+            listeners.append((listener, port))
+
+        for collector, (host, rate, port) in zip(collectors, flows):
             process = run_on_host(
                 host,
                 [
@@ -580,21 +946,36 @@ def congestion():
                 ],
             )
             processes.append(process)
-            start_interval_reader(
-                process,
-                lambda line, host=host, rate=rate: save_interval_telemetry(
-                    line, host, "congestion", experiment_id, rate, 4, monitor
-                ),
-            )
+            start_interval_reader(process, collector.add_client_event)
 
         print("\n[TRAFFIC] All congestion flows started.")
         for process, flow in zip(processes, flows):
-            output = wait_for_process(process)
+            output = wait_for_process(process, timeout=DURATION + 30)
             flow_outputs.append((output, flow))
     finally:
-        summary = monitor.stop()
+        cleanup_errors = []
         for process in processes:
-            _stop_process(process)
+            try:
+                _stop_process(process)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        for listener, port in listeners:
+            try:
+                stop_receiver_listener(listener, port)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        try:
+            summary = monitor.stop()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RuntimeError(
+                "Failed to clean up congestion traffic processes or monitor: "
+                + "; ".join(str(error) for error in cleanup_errors)
+            ) from cleanup_errors[0]
+
+    for collector in collectors:
+        collector.validate_complete()
 
     records = [
         parse_iperf_output(
@@ -635,27 +1016,14 @@ def burst():
 
         print(f"\n[TRAFFIC] Starting burst {i + 1}/5")
 
-        process = None
         monitor = ScenarioMonitor(["h1"]).start()
+        collector = IntervalTelemetryCollector(
+            "h1", "burst", 5201, experiment_id, 8, 1, monitor
+        )
         try:
-            process = run_on_host(
-                "h1",
-                [
-                    "iperf3", "-c", SERVER_IP, "-u", "-b", "8M",
-                    "-t", "3", "--json-stream",
-                ]
-            )
-            start_interval_reader(
-                process,
-                lambda line: save_interval_telemetry(
-                    line, "h1", "burst", experiment_id, 8, 1, monitor
-                ),
-            )
-            output = wait_for_process(process)
+            output = _run_udp_flow("h1", 8, 5201, 3, collector)
         finally:
             summary = monitor.stop()
-            if process is not None:
-                _stop_process(process)
 
         save_telemetry(
             output,
@@ -688,32 +1056,17 @@ def moderate(rate_mbps: float = 6.0):
     experiment_id = str(uuid.uuid4())
     print(f"[EXPERIMENT] experiment_id={experiment_id}")
 
-    process = None
     monitor = ScenarioMonitor(["h1"]).start()
+    collector = IntervalTelemetryCollector(
+        "h1", "moderate", 5201, experiment_id, rate_mbps, 1, monitor
+    )
 
     try:
-        process = run_on_host(
-            "h1",
-            [
-                "iperf3",
-                "-c", SERVER_IP,
-                "-u",
-                "-b", f"{rate_mbps:g}M",
-                "-t", str(DURATION),
-                "--json-stream",
-            ],
+        output = _run_udp_flow(
+            "h1", rate_mbps, 5201, DURATION, collector
         )
-        start_interval_reader(
-            process,
-            lambda line: save_interval_telemetry(
-                line, "h1", "moderate", experiment_id, rate_mbps, 1, monitor
-            ),
-        )
-        output = wait_for_process(process)
     finally:
         summary = monitor.stop()
-        if process is not None:
-            _stop_process(process)
 
     save_telemetry(
         output,
