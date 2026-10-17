@@ -10,6 +10,7 @@ import argparse
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sys
 import uuid
@@ -60,14 +61,162 @@ WINDOW_FIELDS = (
     "interval_end_seconds",
     "interval_duration_seconds",
 )
+MAX_MEASUREMENT_AGE_SECONDS = 300
+MAX_FUTURE_SKEW_SECONDS = 30
+QUEUE_MEASUREMENT_FIELDS = ("queue_size", "queue_drops")
+
+
+class _NonStandardJSONNumber(str):
+    pass
 
 
 def _error(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "message": str(exc)}
 
 
-def _reject_nonstandard_json_number(value: str) -> None:
-    raise ValueError(f"non-standard JSON numeric constant {value!r}")
+def _reject_nonstandard_json_number(value: str) -> _NonStandardJSONNumber:
+    return _NonStandardJSONNumber(value)
+
+
+def _find_nonstandard_json_number(value: Any) -> str | None:
+    if isinstance(value, _NonStandardJSONNumber):
+        return str(value)
+    if isinstance(value, Mapping):
+        for child in value.values():
+            found = _find_nonstandard_json_number(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_nonstandard_json_number(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _report_value(value: Any) -> Any:
+    if isinstance(value, _NonStandardJSONNumber):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, Mapping):
+        return {key: _report_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_report_value(item) for item in value]
+    return value
+
+
+def _queue_quality(
+    record: Mapping[str, Any],
+    *,
+    strict: bool,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    fields: dict[str, dict[str, Any]] = {}
+    for field in QUEUE_MEASUREMENT_FIELDS:
+        if field not in record:
+            error = f"{field} is missing; include a measured nonnegative number"
+            fields[field] = {"status": "missing", "value": None}
+            errors.append(error)
+            continue
+        value = record[field]
+        if value is None:
+            fields[field] = {"status": "missing", "value": None}
+            errors.append(f"{field} is null; provide a measured nonnegative number")
+            continue
+        if isinstance(value, _NonStandardJSONNumber):
+            fields[field] = {"status": "invalid", "value": str(value)}
+            errors.append(
+                f"{field} must be finite; JSON NaN and infinities are not valid measurements"
+            )
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            fields[field] = {"status": "invalid", "value": _report_value(value)}
+            errors.append(f"{field} must be a nonnegative finite number, not {type(value).__name__}")
+            continue
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            fields[field] = {"status": "invalid", "value": str(value)}
+            errors.append(f"{field} must be finite; NaN and infinity are not valid measurements")
+            continue
+        if value < 0:
+            fields[field] = {"status": "invalid", "value": value}
+            errors.append(f"{field} cannot be negative")
+            continue
+        fields[field] = {"status": "valid", "value": value}
+
+    ready = not errors
+    if ready:
+        status = "ready"
+    elif strict:
+        status = "blocked"
+    elif any(item["status"] == "invalid" for item in fields.values()):
+        status = "not_enforced_invalid"
+    else:
+        status = "not_required_missing"
+    return {
+        "status": status,
+        "ready": ready,
+        "enforced": strict,
+        "fields": fields,
+        "errors": errors,
+    }
+
+
+def _freshness_status(
+    timestamp_value: Any,
+    *,
+    strict: bool,
+    now: datetime | None,
+) -> dict[str, Any]:
+    if not strict:
+        return {"status": "not_enforced", "enforced": False, "errors": []}
+    if not isinstance(timestamp_value, str):
+        error = "timestamp must be an ISO-8601 measurement time with a timezone offset"
+        return {"status": "invalid", "enforced": True, "errors": [error]}
+    try:
+        timestamp = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
+    except ValueError:
+        error = f"timestamp {timestamp_value!r} is malformed; use ISO-8601 with a timezone offset"
+        return {"status": "invalid", "enforced": True, "errors": [error]}
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        error = "timestamp must include a timezone offset; timezone-naive times cannot be freshness-checked"
+        return {"status": "invalid", "enforced": True, "errors": [error]}
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware when freshness enforcement is enabled")
+    age_seconds = (current.astimezone(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+    if age_seconds > MAX_MEASUREMENT_AGE_SECONDS:
+        error = (
+            f"measurement timestamp is stale by {age_seconds:.1f}s; "
+            f"maximum allowed age is {MAX_MEASUREMENT_AGE_SECONDS}s"
+        )
+        return {
+            "status": "stale",
+            "enforced": True,
+            "age_seconds": age_seconds,
+            "errors": [error],
+        }
+    if age_seconds < -MAX_FUTURE_SKEW_SECONDS:
+        error = (
+            f"measurement timestamp is {-age_seconds:.1f}s in the future; "
+            f"maximum allowed clock skew is {MAX_FUTURE_SKEW_SECONDS}s"
+        )
+        return {
+            "status": "future",
+            "enforced": True,
+            "age_seconds": age_seconds,
+            "errors": [error],
+        }
+    return {
+        "status": "fresh",
+        "enforced": True,
+        "age_seconds": age_seconds,
+        "errors": [],
+    }
 
 
 def _record_window(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -80,7 +229,7 @@ def _record_window(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def _baseline_result(prediction: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
-        "status": "completed",
+        "status": "planned",
         "policy": BASELINE_POLICY,
         "allocation": {
             "status": "not-applicable",
@@ -89,6 +238,11 @@ def _baseline_result(prediction: Mapping[str, Any] | None) -> dict[str, Any]:
         },
         "congestion_prediction": prediction,
         "prediction_used_for_policy": False,
+        "planning_only": True,
+        "experiment_executed": False,
+        "measurements_collected": False,
+        "live_qos_applied": False,
+        "tc_commands_executed": False,
     }
 
 
@@ -99,7 +253,7 @@ def _adaptive_result(
     decision = integration_result["qos_decision"]
     managed = integration_result["managed_htb_config"]
     return {
-        "status": "completed",
+        "status": "planned",
         "prediction": dict(integration_result["prediction"]),
         "input_features": dict(input_features),
         "policy_percentages": dict(decision["policy"]),
@@ -113,6 +267,9 @@ def _adaptive_result(
         "flow_allocations_mbps": dict(integration_result["flow_allocations_mbps"]),
         "filter_priorities": dict(managed["filter_priorities"]),
         "planning_only": True,
+        "experiment_executed": False,
+        "measurements_collected": False,
+        "live_qos_applied": False,
         "tc_commands_executed": False,
     }
 
@@ -124,13 +281,29 @@ def run_experiment(
     mode: str,
     model_path: str | Path | None = None,
     qos_config: QoSIntegrationConfig | None = None,
+    enforce_freshness: bool = False,
+    require_queue_measurements: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Read Person 1 JSONL, validate each record, and write a dry-run report.
+    """Create offline plans from Person 1 JSONL without applying QoS or measuring.
 
     In ``both`` mode baseline and adaptive outputs are paired within each
     telemetry record. The source contains aggregate samples, not a verified
     synchronized multi-flow interval window; no cross-record aggregation is
     inferred here.
+
+    Report status is ``planned`` only when all applicable plans were generated
+    without invalid or blocked records; ``incomplete`` means some plans exist
+    alongside errors or blocked records; ``planning_failed`` means usable
+    telemetry produced no plan; ``invalid_input`` means the input is empty or
+    every nonblank record failed telemetry validation. Historical replay is
+    permissive by default. Strict freshness uses a 300-second maximum age and
+    30-second future clock-skew allowance on the Person 1 ``timestamp``
+    freshness reference. The parser can set that field when it observes an
+    interval report; it is not a verified interval-start measurement time.
+    Strict queue quality requires both queue measurements to be present,
+    finite, numeric, and nonnegative. These checks never turn the runner into
+    a measurement or live-application tool.
     """
     if not isinstance(mode, str) or mode not in {"baseline", "adaptive", "both"}:
         raise ValueError("mode must be 'baseline', 'adaptive', or 'both'")
@@ -143,6 +316,14 @@ def run_experiment(
         if not qos_config.dry_run:
             raise ValueError("the experiment runner only accepts dry-run QoS configuration")
         qos_config.require_complete_policy_mapping()
+    if not isinstance(enforce_freshness, bool):
+        raise ValueError("enforce_freshness must be a boolean")
+    if not isinstance(require_queue_measurements, bool):
+        raise ValueError("require_queue_measurements must be a boolean")
+    if enforce_freshness and now is not None and (
+        now.tzinfo is None or now.utcoffset() is None
+    ):
+        raise ValueError("now must be timezone-aware when freshness enforcement is enabled")
 
     source = Path(input_path).expanduser().resolve(strict=True)
     destination = Path(output_path).expanduser().resolve()
@@ -159,52 +340,117 @@ def run_experiment(
 
     modes = ("baseline", "adaptive") if mode == "both" else (mode,)
     records: list[dict[str, Any]] = []
+    records_processed = 0
     valid_records = 0
     invalid_records = 0
     decision_errors = 0
+    baseline_plans = 0
+    adaptive_plans = 0
+    blocked_records = 0
 
     with source.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             if not line.strip():
                 continue
+            records_processed += 1
             raw: Any = None
+            queue_quality: dict[str, Any] = {
+                "status": "unavailable",
+                "ready": False,
+                "enforced": require_queue_measurements,
+                "fields": {},
+                "errors": [],
+            }
+            freshness: dict[str, Any] = {
+                "status": "not_enforced",
+                "enforced": False,
+                "errors": [],
+            }
             try:
                 raw = json.loads(
                     line, parse_constant=_reject_nonstandard_json_number
                 )
                 if not isinstance(raw, Mapping):
                     raise ValueError("telemetry JSONL record must be an object")
+                queue_quality = _queue_quality(
+                    raw, strict=require_queue_measurements
+                )
+                freshness = _freshness_status(
+                    raw.get("timestamp"),
+                    strict=enforce_freshness,
+                    now=now,
+                )
+                nonstandard = _find_nonstandard_json_number(raw)
+                queue_nonstandard = any(
+                    isinstance(raw.get(field), _NonStandardJSONNumber)
+                    for field in QUEUE_MEASUREMENT_FIELDS
+                )
+                if nonstandard is not None and not (
+                    require_queue_measurements and queue_nonstandard
+                ):
+                    raise ValueError(
+                        f"non-standard JSON numeric constant {nonstandard!r}"
+                    )
+                adaptation_input = dict(raw)
+                for field in QUEUE_MEASUREMENT_FIELDS:
+                    adaptation_input.setdefault(field, None)
                 adapted = adapt_person1_telemetry(
-                    raw,
+                    adaptation_input,
                     interface=qos_config.interface if qos_config else "s1-eth5",
                 )
             except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as exc:
                 invalid_records += 1
+                strict_block = (
+                    (require_queue_measurements and not queue_quality["ready"])
+                    or (enforce_freshness and freshness["status"] != "fresh")
+                )
+                if strict_block:
+                    blocked_records += 1
+                errors = [_error(exc)]
+                errors.extend(
+                    {"type": "QueueMeasurementQualityError", "message": message}
+                    for message in queue_quality["errors"]
+                    if require_queue_measurements
+                )
+                errors.extend(
+                    {"type": "TelemetryFreshnessError", "message": message}
+                    for message in freshness["errors"]
+                )
                 records.append({
                     "line": line_number,
                     "status": "invalid",
                     "experiment_id": raw.get("experiment_id") if isinstance(raw, Mapping) else None,
                     "window": _record_window(raw) if isinstance(raw, Mapping) else None,
                     "measured": {
-                        field: raw.get(field) if isinstance(raw, Mapping) else None
+                        field: _report_value(raw.get(field)) if isinstance(raw, Mapping) else None
                         for field in MEASURED_FIELDS
                     },
-                    "errors": [_error(exc)],
+                    "freshness": freshness,
+                    "queue_measurement_quality": queue_quality,
+                    "errors": errors,
                 })
                 continue
 
             valid_records += 1
+            strict_blocked = (
+                (require_queue_measurements and not queue_quality["ready"])
+                or (enforce_freshness and freshness["status"] != "fresh")
+            )
+            if strict_blocked:
+                blocked_records += 1
             input_features = dict(zip(
                 FEATURE_COLUMNS, extract_features(adapted.record)
             ))
-            measured = {field: raw.get(field) for field in MEASURED_FIELDS}
+            measured = {
+                field: _report_value(raw.get(field)) for field in MEASURED_FIELDS
+            }
             mode_results: dict[str, Any] = {}
             adaptive_integration: Mapping[str, Any] | None = None
             adaptive_failure: Exception | None = None
-            if include_adaptive:
+            if include_adaptive and not strict_blocked:
                 try:
                     adaptive_integration = build_qos_integration(
-                        raw,
+                        adaptation_input,
                         model_path=model_path,
                         config=qos_config,
                     )
@@ -213,38 +459,80 @@ def run_experiment(
                     decision_errors += 1
 
             if "baseline" in modes:
-                prediction = (
-                    adaptive_integration["prediction"]
-                    if adaptive_integration is not None
-                    else None
-                )
-                mode_results["baseline"] = _baseline_result(prediction)
+                if strict_blocked:
+                    mode_results["baseline"] = {
+                        "status": "blocked",
+                        "errors": queue_quality["errors"] + freshness["errors"],
+                        "planning_only": True,
+                        "experiment_executed": False,
+                        "measurements_collected": False,
+                        "live_qos_applied": False,
+                        "tc_commands_executed": False,
+                    }
+                else:
+                    prediction = (
+                        adaptive_integration["prediction"]
+                        if adaptive_integration is not None
+                        else None
+                    )
+                    mode_results["baseline"] = _baseline_result(prediction)
+                    baseline_plans += 1
             if "adaptive" in modes:
-                if adaptive_integration is None:
+                if strict_blocked:
                     mode_results["adaptive"] = {
-                        "status": "error",
+                        "status": "blocked",
+                        "errors": queue_quality["errors"] + freshness["errors"],
+                        "planning_only": True,
+                        "experiment_executed": False,
+                        "measurements_collected": False,
+                        "live_qos_applied": False,
+                        "tc_commands_executed": False,
+                    }
+                elif adaptive_integration is None:
+                    mode_results["adaptive"] = {
+                        "status": "planning_failed",
                         "error": _error(adaptive_failure or RuntimeError(
                             "adaptive decision did not produce a result"
                         )),
                         "planning_only": True,
+                        "experiment_executed": False,
+                        "measurements_collected": False,
+                        "live_qos_applied": False,
                         "tc_commands_executed": False,
                     }
                 else:
                     mode_results["adaptive"] = _adaptive_result(
                         adaptive_integration, input_features
                     )
+                    adaptive_plans += 1
+
+            plan_count = sum(
+                result.get("status") == "planned"
+                for result in mode_results.values()
+            )
+            expected_plan_count = len(modes)
+            record_status = (
+                "planned" if plan_count == expected_plan_count
+                else "incomplete" if plan_count
+                else "blocked" if strict_blocked
+                else "planning_failed"
+            )
 
             records.append({
                 "line": line_number,
-                "status": "valid",
+                "status": record_status,
                 "experiment_id": adapted.metadata.get("experiment_id"),
                 "scenario": adapted.metadata.get("scenario"),
                 "source": adapted.metadata.get("source"),
                 "destination": adapted.metadata.get("destination"),
                 "traffic_type": adapted.metadata.get("traffic_type"),
-                "request": {field: raw.get(field) for field in REQUEST_FIELDS},
+                "request": {
+                    field: _report_value(raw.get(field)) for field in REQUEST_FIELDS
+                },
                 "window": _record_window(raw),
                 "measured": measured,
+                "freshness": freshness,
+                "queue_measurement_quality": queue_quality,
                 "measurement_scope": {
                     "queue_size": "scenario-wide",
                     "queue_drops": "scenario-wide",
@@ -252,20 +540,67 @@ def run_experiment(
                 "modes": mode_results,
             })
 
+    if records_processed == 0:
+        report_status = "incomplete"
+    elif invalid_records == records_processed:
+        report_status = "invalid_input"
+    elif baseline_plans + adaptive_plans == 0:
+        report_status = "planning_failed"
+    else:
+        expected_baseline = valid_records - blocked_records if "baseline" in modes else 0
+        expected_adaptive = valid_records - blocked_records if "adaptive" in modes else 0
+        report_status = (
+            "planned"
+            if (
+                invalid_records == 0
+                and blocked_records == 0
+                and decision_errors == 0
+                and baseline_plans == expected_baseline
+                and adaptive_plans == expected_adaptive
+            )
+            else "incomplete"
+        )
+
     report = {
         "schema_version": 1,
         "run_id": str(uuid.uuid4()),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
+        "status": report_status,
+        "planning_only": True,
+        "experiment_executed": False,
+        "measurements_collected": False,
+        "live_qos_applied": False,
+        "tc_commands_executed": False,
+        "dry_run": True,
+        "freshness_policy": {
+            "enforced": enforce_freshness,
+            "timestamp_field": "timestamp",
+            "timestamp_semantics": (
+                "record freshness reference; parser-generated interval records "
+                "use report observation time, not interval start"
+            ),
+            "maximum_measurement_age_seconds": MAX_MEASUREMENT_AGE_SECONDS,
+            "maximum_future_clock_skew_seconds": MAX_FUTURE_SKEW_SECONDS,
+        },
+        "queue_measurement_policy": {
+            "strict": require_queue_measurements,
+            "permissive_missing_values_allowed": not require_queue_measurements,
+        },
         "input_source": str(source),
         "model_path": str(Path(model_path).expanduser().resolve()) if model_path else None,
         "counts": {
-            "records": valid_records + invalid_records,
+            "records": records_processed,
+            "records_processed": records_processed,
             "valid_records": valid_records,
             "invalid_records": invalid_records,
+            "invalid_telemetry_records": invalid_records,
+            "baseline_plans_generated": baseline_plans,
+            "adaptive_plans_generated": adaptive_plans,
+            "adaptive_decision_failures": decision_errors,
             "decision_errors": decision_errors,
+            "records_blocked_by_strict_quality_or_freshness": blocked_records,
         },
-        "dry_run": True,
         "results": records,
     }
     with destination.open("x", encoding="utf-8") as output:
@@ -302,6 +637,19 @@ def main(argv: list[str] | None = None) -> int:
         "--filter-priorities",
         help='JSON mapping, e.g. {"5201":10,"5202":20,"5203":30,"5204":40}',
     )
+    parser.add_argument(
+        "--strict-freshness",
+        action="store_true",
+        help=(
+            "require measurement timestamps within 300 seconds and no more "
+            "than 30 seconds in the future"
+        ),
+    )
+    parser.add_argument(
+        "--strict-queue-quality",
+        action="store_true",
+        help="require finite, nonnegative queue_size and queue_drops measurements",
+    )
     args = parser.parse_args(argv)
 
     qos_config = None
@@ -335,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             model_path=args.model,
             qos_config=qos_config,
+            enforce_freshness=args.strict_freshness,
+            require_queue_measurements=args.strict_queue_quality,
         )
     except (OSError, ValueError, TypeError, FileExistsError) as exc:
         print(f"experiment runner failed: {exc}", file=sys.stderr)
@@ -342,9 +692,10 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "run_id": report["run_id"],
         "output": str(args.output.resolve()),
+        "status": report["status"],
         **report["counts"],
     }))
-    return 0
+    return 0 if report["status"] == "planned" else 1
 
 
 if __name__ == "__main__":

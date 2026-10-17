@@ -138,6 +138,37 @@ python -m integration.experiment_runner --input telemetry/datasets/congestion.js
 ```
 
 Replace the example model path with an existing compatible trained artifact.
+Baseline-only mode does not require a model. Report-level status is `planned`
+only when all applicable plans succeed; `incomplete` means some plans coexist
+with invalid, blocked, or failed records; `planning_failed` means validated
+input produced no plan; and `invalid_input` means there were no nonblank rows
+or no row passed telemetry validation. The CLI returns zero only for
+`planned`, and nonzero otherwise, while retaining a JSON report and per-line
+diagnostics whenever the output path can be written. Counts separately report
+records processed, invalid telemetry records, baseline plans, adaptive plans,
+adaptive decision failures, and records blocked by strict quality/freshness.
+
+All runs are offline planning only: report fields explicitly state
+`planning_only=true` and `experiment_executed`,
+`measurements_collected`, `live_qos_applied`, and `tc_commands_executed` are
+false. Input measurements are reported as supplied telemetry; passing a
+validation policy does not mean the runner collected them.
+
+Historical replay is permissive by default. `--strict-freshness` opts into
+checking the Person 1 `timestamp` field as a record-freshness reference,
+requiring an ISO-8601 timezone-aware value no older than 300 seconds and no
+more than 30 seconds in the future. The telemetry schema maps `timestamp` to
+the record timestamp; the iperf interval parser sets it when the report is
+observed, so it is not a verified interval-start measurement time. Strict
+freshness is therefore a caller-approved freshness policy for that reference,
+not proof of sample-time freshness. The API accepts an aware `now` value for
+deterministic offline checks. This option only gates plans; it never enables
+live operations. Queue size and drop values are metadata, not model features.
+Permissive queue policy keeps absent or null measurements visible without
+fabricating values or blocking historical plans. `--strict-queue-quality`
+requires both to be present, numeric, finite, and nonnegative. A
+measurement-quality-ready record remains a plan input, not an executed or
+measured experiment.
 The four port/class assignments and priorities in this example are placeholders
 for explicit caller-approved settings, not approved service semantics. The
 baseline is the existing shared 10 Mbps HTB class with its 10 ms netem leaf;
