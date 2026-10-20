@@ -7,6 +7,7 @@ import pytest
 
 from ai.prediction import train_random_forest
 from integration import experiment_runner
+from integration import safe_outputs
 from integration import telemetry_qos
 from integration.telemetry_qos import QoSIntegrationConfig
 from qos import tc_controller
@@ -111,6 +112,14 @@ def test_adaptive_runner_uses_existing_prediction_and_allocation_path(
         "utilization", "throughput_mbps", "latency_ms", "jitter_ms",
         "packet_loss_pct", "active_flows",
     }
+    assert adaptive["input_features"] == {
+        "utilization": 30.0,
+        "throughput_mbps": 3.0,
+        "latency_ms": 20.26,
+        "jitter_ms": 0.014,
+        "packet_loss_pct": 0.0,
+        "active_flows": 1.0,
+    }
     assert sum(adaptive["flow_allocations_mbps"].values()) == pytest.approx(9)
     assert adaptive["unmatched_leaf"] == {
         "classid": "1:15", "rate_mbps": 1.0, "ceil_mbps": 1.0,
@@ -191,6 +200,122 @@ def test_invalid_json_and_invalid_record_are_reported_per_line(tmp_path):
     assert "latency_ms" in invalid["errors"][0]["message"]
     assert invalid["measured"]["latency_ms"] is None
     assert "non-standard JSON numeric constant" in nonstandard["errors"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "extra_fields"),
+    [
+        ("experiment_id", "1e400", {}),
+        ("source", "1e400", {}),
+        ("source", "1e400", {"throughput_mbps": -1}),
+        ("interval_start_seconds", "1e400", {}),
+    ],
+)
+def test_overflowing_json_float_is_reported_as_invalid(
+    tmp_path, field, value, extra_fields
+):
+    source = tmp_path / f"overflow-{field}.jsonl"
+    output = tmp_path / f"overflow-{field}.json"
+    record = {**telemetry_record(), **extra_fields}
+    serialized = json.dumps(record)
+    if field in record:
+        serialized = serialized.replace(
+            f'"{field}": {json.dumps(record[field])}',
+            f'"{field}": {value}',
+        )
+    else:
+        serialized = serialized[:-1] + f', "{field}": {value}' + "}"
+    source.write_text(serialized + "\n", encoding="utf-8")
+
+    report = experiment_runner.run_experiment(source, output, mode="baseline")
+
+    assert report["counts"]["records_processed"] == 1
+    assert report["counts"]["valid_records"] == 0
+    assert report["counts"]["invalid_records"] == 1
+    assert report["results"][0]["status"] == "invalid"
+    assert "not finite" in report["results"][0]["errors"][0]["message"]
+    assert json.loads(output.read_text(encoding="utf-8"))["counts"] == report["counts"]
+
+
+def test_invalid_row_normalizes_raw_metadata_and_window_values(tmp_path):
+    source = tmp_path / "invalid-metadata.jsonl"
+    output = tmp_path / "invalid-metadata.json"
+    record = telemetry_record()
+    record["experiment_id"] = ["bad", float("nan")]
+    record["source"] = {"nested": float("inf")}
+    record["interval_start_seconds"] = float("nan")
+    record["throughput_mbps"] = -1
+    source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = experiment_runner.run_experiment(source, output, mode="baseline")
+
+    assert report["counts"]["valid_records"] == 0
+    assert report["counts"]["invalid_records"] == 1
+    invalid = report["results"][0]
+    assert invalid["experiment_id"] == ["bad", "NaN"]
+    assert invalid["window"]["interval_start_seconds"] == "NaN"
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["results"][0]["experiment_id"] == ["bad", "NaN"]
+
+
+@pytest.mark.parametrize("field", ["queue_size", "queue_drops"])
+def test_overflowing_queue_float_uses_permissive_quality_policy(tmp_path, field):
+    source = tmp_path / f"overflow-{field}-permissive.jsonl"
+    output = tmp_path / f"overflow-{field}-permissive.json"
+    record = telemetry_record(queue_size=0, queue_drops=0)
+    record[field] = 1.0
+    serialized = json.dumps(record).replace(
+        f'"{field}": 1.0', f'"{field}": 1e400'
+    )
+    source.write_text(serialized + "\n", encoding="utf-8")
+
+    report = experiment_runner.run_experiment(source, output, mode="baseline")
+
+    assert report["counts"]["valid_records"] == 1
+    assert report["counts"]["invalid_records"] == 0
+    assert report["counts"]["baseline_plans_generated"] == 1
+    assert report["results"][0]["status"] == "planned"
+    quality = report["results"][0]["queue_measurement_quality"]
+    assert quality["status"] == "not_enforced_invalid"
+    assert quality["fields"][field] == {
+        "status": "invalid",
+        "value": "1e400",
+    }
+    assert json.loads(output.read_text(encoding="utf-8"))["counts"] == report["counts"]
+
+
+def test_overflowing_required_float_is_invalid_and_runner_continues(tmp_path):
+    source = tmp_path / "overflow-required-and-queue.jsonl"
+    output = tmp_path / "overflow-required-and-queue.json"
+    valid = telemetry_record(queue_size=0, queue_drops=0)
+    invalid = telemetry_record(experiment_id="overflow")
+    invalid["throughput_mbps"] = 3.0
+    invalid_line = json.dumps(invalid).replace(
+        '"experiment_id": "overflow"', '"experiment_id": 1e400'
+    )
+    queue_overflow = json.dumps(valid).replace(
+        '"queue_drops": 0', '"queue_drops": 1e400'
+    )
+    source.write_text(
+        json.dumps(valid) + "\n" + invalid_line + "\n" + queue_overflow + "\n",
+        encoding="utf-8",
+    )
+
+    report = experiment_runner.run_experiment(source, output, mode="baseline")
+
+    assert report["counts"]["records_processed"] == 3
+    assert report["counts"]["valid_records"] == 2
+    assert report["counts"]["invalid_records"] == 1
+    assert report["counts"]["baseline_plans_generated"] == 2
+    assert [row["status"] for row in report["results"]] == [
+        "planned", "invalid", "planned",
+    ]
+    assert "not finite" in report["results"][1]["errors"][0]["message"]
+    assert report["results"][2]["queue_measurement_quality"]["status"] == (
+        "not_enforced_invalid"
+    )
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["counts"] == report["counts"]
 
 
 def test_empty_input_writes_empty_report(tmp_path):
@@ -540,6 +665,49 @@ def test_output_path_must_not_overwrite_input_or_existing_output(tmp_path):
         experiment_runner.run_experiment(
             source, tmp_path / "missing-dir" / "result.json", mode="baseline"
         )
+
+
+def test_runner_rejects_project_output_and_symlink_aliases(tmp_path, monkeypatch):
+    source = tmp_path / "input.jsonl"
+    write_jsonl(source, [telemetry_record()])
+    protected_root = tmp_path / "project"
+    protected_root.mkdir()
+    monkeypatch.setattr(safe_outputs, "PROJECT_ROOT", protected_root)
+
+    with pytest.raises(ValueError, match="outside protected"):
+        experiment_runner.run_experiment(
+            source, protected_root / "report.json", mode="baseline"
+        )
+    assert not (protected_root / "report.json").exists()
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("preserve", encoding="utf-8")
+    alias = tmp_path / "alias.json"
+    try:
+        alias.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlinks are unavailable")
+    with pytest.raises(ValueError, match="must not contain symlinks"):
+        experiment_runner.run_experiment(source, alias, mode="baseline")
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
+
+def test_runner_exclusive_creation_rejects_concurrent_output_creation(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "input.jsonl"
+    write_jsonl(source, [telemetry_record()])
+    output = tmp_path / "report.json"
+    original_open = safe_outputs.open_exclusive_text
+
+    def concurrent_create(path, *, newline=None):
+        output.write_text("created concurrently", encoding="utf-8")
+        return original_open(path, newline=newline)
+
+    monkeypatch.setattr(experiment_runner, "open_exclusive_text", concurrent_create)
+    with pytest.raises(FileExistsError):
+        experiment_runner.run_experiment(source, output, mode="baseline")
+    assert output.read_text(encoding="utf-8") == "created concurrently"
 
 
 @pytest.mark.parametrize(

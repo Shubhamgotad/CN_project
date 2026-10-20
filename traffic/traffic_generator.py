@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -28,14 +29,180 @@ DURATION = 20
 BOTTLENECK_INTERFACE = "s1-eth5"
 DATASET_DIR = Path(__file__).resolve().parents[1] / "telemetry" / "datasets"
 INTERVAL_DATASET_DIR = DATASET_DIR
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 MONITOR_FRESHNESS_SECONDS = 2.0
 IPERF_SERVER_PORTS = range(5201, 5205)
 IPERF_LISTENER_START_TIMEOUT_SECONDS = 5.0
 MAX_INTERVAL_MATCH_TOLERANCE_SECONDS = 0.25
+MININET_HOSTS = frozenset({"h1", "h2", "h3", "h4", "server"})
+MININET_HOST_INTERFACES = {
+    host: f"{host}-eth0" for host in MININET_HOSTS
+}
+_RUN_OUTPUT_DIRECTORIES = set()
 
 
-def run_on_host(host, command):
-    """Run a command inside a Mininet host namespace."""
+def _read_process_start_time(pid):
+    stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields_after_name = stat_fields[stat_fields.rfind(")") + 2 :].split()
+    try:
+        return fields_after_name[19]
+    except IndexError as exc:
+        raise RuntimeError(f"cannot verify process start time for PID {pid}") from exc
+
+
+def _is_mininet_host_shell(host, pid, cmdline_reader, executable_reader):
+    try:
+        arguments = cmdline_reader(pid).split(b"\0")
+        if arguments and arguments[-1] == b"":
+            arguments.pop()
+        executable = executable_reader(pid)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot verify Mininet namespace process {pid}"
+        ) from exc
+    expected_marker = f"mininet:{host}".encode()
+    return (
+        len(arguments) == 4
+        and Path(os.fsdecode(arguments[0])).name == "bash"
+        and arguments[1:3] == [b"--norc", b"-is"]
+        and arguments[3] == expected_marker
+        and Path(os.fsdecode(executable)).name == "bash"
+    )
+
+
+def resolve_mininet_namespace_pid(
+    host,
+    candidate_pids,
+    *,
+    cmdline_reader=None,
+    executable_reader=None,
+    starttime_reader=None,
+):
+    """Resolve exactly one Mininet bash host shell and capture its start time."""
+    if host not in MININET_HOSTS:
+        raise ValueError(f"unsupported Mininet host: {host!r}")
+    read_cmdline = cmdline_reader or (
+        lambda pid: Path(f"/proc/{pid}/cmdline").read_bytes()
+    )
+    read_executable = executable_reader or (
+        lambda pid: os.readlink(f"/proc/{pid}/exe")
+    )
+    read_starttime = starttime_reader or _read_process_start_time
+    matching_pids = []
+    for candidate in candidate_pids:
+        if not candidate.isdecimal() or int(candidate) <= 0:
+            raise RuntimeError(f"invalid Mininet namespace PID: {candidate!r}")
+        if _is_mininet_host_shell(
+            host, candidate, read_cmdline, read_executable
+        ):
+            matching_pids.append((candidate, read_starttime(candidate)))
+    if len(matching_pids) != 1:
+        raise RuntimeError(
+            f"Expected exactly one Mininet namespace process for {host}; "
+            f"found {len(matching_pids)}. Verify the active Mininet topology "
+            "and remove ambiguity before retrying."
+        )
+    return matching_pids[0]
+
+
+def validate_host_interface_identity(host, interface, namespace_pid, *, runner=None):
+    """Confirm the named interface exists in the selected host namespace."""
+    if not isinstance(interface, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,15}", interface
+    ):
+        raise ValueError("interface must be a valid Linux interface name")
+    execute = runner or subprocess.run
+    result = execute(
+        [
+            "mnexec", "-a", namespace_pid,
+            "ip", "-j", "-details", "link", "show", "dev", interface,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"interface {interface} is not available in Mininet namespace "
+            f"{host} (pid {namespace_pid})"
+        )
+    try:
+        links = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"could not verify interface identity for {interface} in {host}"
+        ) from exc
+    if (
+        not isinstance(links, list)
+        or len(links) != 1
+        or not isinstance(links[0], dict)
+        or links[0].get("ifname") != interface
+    ):
+        raise RuntimeError(
+            f"interface identity mismatch: expected {interface} in namespace {host}"
+        )
+    return links[0]
+
+
+def _run_in_verified_namespace(
+    host,
+    command,
+    interface,
+    candidate_pids,
+    *,
+    cmdline_reader,
+    executable_reader,
+    starttime_reader,
+    interface_validator,
+    command_launcher,
+):
+    namespace_pid, initial_starttime = resolve_mininet_namespace_pid(
+        host,
+        candidate_pids,
+        cmdline_reader=cmdline_reader,
+        executable_reader=executable_reader,
+        starttime_reader=starttime_reader,
+    )
+    interface_validator(host, interface, namespace_pid)
+    try:
+        revalidated = resolve_mininet_namespace_pid(
+            host,
+            [namespace_pid],
+            cmdline_reader=cmdline_reader,
+            executable_reader=executable_reader,
+            starttime_reader=starttime_reader,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Mininet namespace process {namespace_pid} exited or changed "
+            "identity during validation"
+        ) from exc
+    if revalidated != (namespace_pid, initial_starttime):
+        raise RuntimeError(
+            f"Mininet namespace process {namespace_pid} exited or changed "
+            "identity during validation"
+        )
+    return command_launcher(
+        ["mnexec", "-a", namespace_pid, *command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def run_on_host(host, command, *, interface):
+    """Run a command after exact host-shell and interface validation.
+
+    The PID is revalidated immediately before ``mnexec``. Without a pidfd-aware
+    launcher/setns execution model, a small PID exit/reuse race remains between
+    that last check and the subprocess creation.
+    """
+    if host not in MININET_HOSTS:
+        raise ValueError(f"unsupported Mininet host: {host!r}")
+    if interface != MININET_HOST_INTERFACES[host]:
+        raise ValueError(
+            f"interface {interface!r} does not belong to Mininet host {host}"
+        )
     result = subprocess.run(
         ["pgrep", "-f", f"mininet:{host}"],
         check=False,
@@ -45,24 +212,88 @@ def run_on_host(host, command):
 
     if result.returncode == 1:
         raise RuntimeError(
-            f"Could not find Mininet namespace for {host}. "
-            "Make sure Mininet is running."
+            f"Expected exactly one Mininet namespace process for {host}; "
+            "found 0. Make sure the intended Mininet topology is running."
         )
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, result.args, result.stdout, result.stderr
         )
 
-    namespace_pid = result.stdout.splitlines()[0]
-
     print(f"[TRAFFIC] {host}: {' '.join(command)}")
+    return _run_in_verified_namespace(
+        host,
+        command,
+        interface,
+        result.stdout.splitlines(),
+        cmdline_reader=lambda pid: Path(f"/proc/{pid}/cmdline").read_bytes(),
+        executable_reader=lambda pid: os.readlink(f"/proc/{pid}/exe"),
+        starttime_reader=_read_process_start_time,
+        interface_validator=validate_host_interface_identity,
+        command_launcher=subprocess.Popen,
+    )
 
-    return subprocess.Popen(
-    ["mnexec", "-a", namespace_pid, *command],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-)
+
+def _prepare_output_directory(output_directory):
+    if output_directory is None:
+        raise ValueError(
+            "an explicit isolated output_directory is required; "
+            "the project dataset directory is not a safe default"
+        )
+    requested = Path(output_directory).expanduser()
+    if not requested.is_absolute():
+        requested = Path.cwd() / requested
+    for component in (requested, *requested.parents):
+        if component.is_symlink():
+            raise ValueError("output directory path must not contain symlinks")
+    destination = requested.resolve()
+    project_root = PROJECT_DIR.resolve()
+    try:
+        destination.relative_to(project_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "output_directory must be outside the project worktree to protect "
+            "datasets, models, and preserved evidence"
+        )
+    try:
+        destination.mkdir()
+    except FileExistsError as exc:
+        raise ValueError(
+            "output_directory must be a new, empty per-run directory"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "output_directory parent must already exist"
+        ) from exc
+    _RUN_OUTPUT_DIRECTORIES.add(os.fspath(destination))
+    return destination
+
+
+def _reuse_output_directory(output_directory):
+    destination = Path(output_directory).expanduser().absolute()
+    if (
+        os.fspath(destination) not in _RUN_OUTPUT_DIRECTORIES
+        or not destination.is_dir()
+        or destination.is_symlink()
+    ):
+        raise ValueError(
+            "output_directory must be created by this run before use"
+        )
+    for component in (destination, *destination.parents):
+        if component.is_symlink():
+            raise ValueError("output directory path must not contain symlinks")
+    return destination
+
+
+def _isolated_output_file(directory, filename):
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise ValueError("output filename must not contain path components")
+    output = directory / filename
+    if output.is_symlink() or output.resolve().parent != directory.resolve():
+        raise ValueError("output file must remain inside the isolated directory")
+    return output
 
 
 class _IperfIntervalReader:
@@ -209,6 +440,7 @@ def measure_latency(source, destination_ip="10.0.0.5", count=5):
             str(count),
             destination_ip,
         ],
+        interface=MININET_HOST_INTERFACES[source],
     )
 
     output, _ = result.communicate()
@@ -441,8 +673,10 @@ def save_telemetry(
     latency_ms=None,
     queue_size=None,
     queue_drops=None,
+    output_directory=None,
 ):
     """Parse iperf3 output and save a telemetry record."""
+    output_directory = _reuse_output_directory(output_directory)
 
     parsed_record = parse_iperf_output(
         output,
@@ -481,9 +715,9 @@ def save_telemetry(
         "queue_drops": queue_drops,
     }
 
-    filename = DATASET_DIR / f"{scenario}.jsonl"
+    filename = _isolated_output_file(output_directory, f"{scenario}.jsonl")
 
-    write_jsonl(record, filename)
+    write_jsonl(record, filename, secure_run=True)
 
     print(f"[TELEMETRY] Saved: {filename}")
     print(f"[EXPERIMENT] experiment_id={experiment_id}")
@@ -511,11 +745,11 @@ class IntervalTelemetryCollector:
         self.requested_mbps = requested_mbps
         self.active_flows = active_flows
         self.monitor = monitor
-        self.output_directory = Path(output_directory) if output_directory else INTERVAL_DATASET_DIR
+        self.output_directory = _reuse_output_directory(output_directory)
         safe_experiment_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(experiment_id))
-        self.filename = (
-            self.output_directory
-            / f"{scenario}_{safe_experiment_id}_{source}_intervals.jsonl"
+        self.filename = _isolated_output_file(
+            self.output_directory,
+            f"{scenario}_{safe_experiment_id}_{source}_intervals.jsonl",
         )
         self._lock = threading.Lock()
         self._client_intervals = {}
@@ -566,9 +800,9 @@ class IntervalTelemetryCollector:
         measurement = self.monitor.latest_measurement()
         with self._lock:
             for record in records:
-                # Callback observation is recorded separately; it is not treated
-                # as the interval's absolute start/end clock boundary.
+                # Callback observation is diagnostic, not an interval boundary.
                 record["receiver_observation_monotonic_seconds"] = observed_monotonic
+                record["receiver_observation_role"] = "diagnostic_only"
                 key = self._key({
                     "start": record["interval_start_seconds"],
                     "end": record["interval_end_seconds"],
@@ -694,7 +928,7 @@ class IntervalTelemetryCollector:
             )
         record["utilization_percent"] = round(utilization, 2)
         record.update(client["measurement"])
-        write_interval_jsonl(record, self.filename)
+        write_interval_jsonl(record, self.filename, secure_run=True)
         self._completed.add((client_key, receiver_key))
         self._used_client_intervals.add(client_key)
         self._used_receiver_intervals.add(receiver_key)
@@ -739,7 +973,9 @@ class IntervalTelemetryCollector:
                         record = dict(self._receiver_intervals[key])
                         record["throughput_measurement_source"] = "receiver"
                         record.update(self._receiver_measurements[key])
-                        write_interval_jsonl(record, self.filename)
+                        write_interval_jsonl(
+                            record, self.filename, secure_run=True
+                        )
                         self._used_receiver_intervals.add(key)
                         print(
                             "[TELEMETRY] Persisted receiver-only post-client "
@@ -770,6 +1006,7 @@ def _iperf_port_is_listening(port):
     probe = run_on_host(
         "server",
         ["ss", "-H", "-ltn", "sport", "=", f":{port}"],
+        interface=MININET_HOST_INTERFACES["server"],
     )
     output, _ = probe.communicate()
     if probe.returncode != 0:
@@ -793,6 +1030,7 @@ def start_receiver_listener(port, callback):
         process = run_on_host(
             "server",
             ["iperf3", "-s", "-1", "-p", str(port), "--json-stream"],
+            interface=MININET_HOST_INTERFACES["server"],
         )
         start_interval_reader(process, callback)
         deadline = time.monotonic() + IPERF_LISTENER_START_TIMEOUT_SECONDS
@@ -855,6 +1093,7 @@ def _run_udp_flow(
                 "-t", str(duration),
                 "--json-stream",
             ],
+            interface=MININET_HOST_INTERFACES[source],
         )
         start_interval_reader(client, collector.add_client_event)
         output = wait_for_process(client, timeout=duration + 30)
@@ -869,15 +1108,17 @@ def _run_udp_flow(
     return output
 
 
-def normal():
+def normal(output_directory=None):
     """One 3 Mbps UDP flow for 20 seconds."""
 
+    output_directory = _prepare_output_directory(output_directory)
     print("\n=== NORMAL SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
     monitor = ScenarioMonitor(["h1"]).start()
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, experiment_id, 3, 1, monitor
+        "h1", "normal", 5201, experiment_id, 3, 1, monitor,
+        output_directory=output_directory,
     )
     try:
         output = _run_udp_flow("h1", 3, 5201, DURATION, collector)
@@ -891,13 +1132,14 @@ def normal():
         experiment_id=experiment_id,
         requested_mbps=3,
         active_flows=1,
+        output_directory=output_directory,
         **summary,
     )
 
     print("\n[TRAFFIC] Normal scenario completed.")
 
 
-def congestion():
+def congestion(output_directory=None):
     """Four 4 Mbps UDP flows for 20 seconds through the bottleneck.
 
     A startup or collection failure aborts the scenario without writing
@@ -905,6 +1147,7 @@ def congestion():
     because the scenario result is intentionally all-or-nothing.
     """
 
+    output_directory = _prepare_output_directory(output_directory)
     print("\n=== CONGESTION SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
@@ -918,7 +1161,8 @@ def congestion():
     monitor = ScenarioMonitor(["h1", "h2", "h3", "h4"]).start()
     collectors = [
         IntervalTelemetryCollector(
-            host, "congestion", port, experiment_id, rate, 4, monitor
+            host, "congestion", port, experiment_id, rate, 4, monitor,
+            output_directory=output_directory,
         )
         for host, rate, port in flows
     ]
@@ -944,6 +1188,7 @@ def congestion():
                     "-t", str(DURATION),
                     "--json-stream",
                 ],
+                interface=MININET_HOST_INTERFACES[host],
             )
             processes.append(process)
             start_interval_reader(process, collector.add_client_event)
@@ -1001,14 +1246,16 @@ def congestion():
             requested_mbps=rate,
             active_flows=4,
             total_throughput_mbps=total_throughput_mbps,
+            output_directory=output_directory,
             **summary,
         )
 
     print("\n[TRAFFIC] Congestion scenario completed.")
 
-def burst():
+def burst(output_directory=None):
     """Five short UDP traffic bursts."""
 
+    output_directory = _prepare_output_directory(output_directory)
     print("\n=== BURST SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
@@ -1018,7 +1265,8 @@ def burst():
 
         monitor = ScenarioMonitor(["h1"]).start()
         collector = IntervalTelemetryCollector(
-            "h1", "burst", 5201, experiment_id, 8, 1, monitor
+            "h1", "burst", 5201, experiment_id, 8, 1, monitor,
+            output_directory=output_directory,
         )
         try:
             output = _run_udp_flow("h1", 8, 5201, 3, collector)
@@ -1032,6 +1280,7 @@ def burst():
             experiment_id=experiment_id,
             requested_mbps=8,
             active_flows=1,
+            output_directory=output_directory,
             **summary,
         )
 
@@ -1042,7 +1291,7 @@ def burst():
 
     print("\n[TRAFFIC] Burst scenario completed.")
 
-def moderate(rate_mbps: float = 6.0):
+def moderate(rate_mbps: float = 6.0, *, output_directory=None):
     """One configurable-rate UDP flow for 20 seconds."""
     if (
         isinstance(rate_mbps, bool)
@@ -1052,13 +1301,15 @@ def moderate(rate_mbps: float = 6.0):
     ):
         raise ValueError("moderate rate must be a positive finite number")
 
+    output_directory = _prepare_output_directory(output_directory)
     print("\n=== MODERATE SCENARIO ===")
     experiment_id = str(uuid.uuid4())
     print(f"[EXPERIMENT] experiment_id={experiment_id}")
 
     monitor = ScenarioMonitor(["h1"]).start()
     collector = IntervalTelemetryCollector(
-        "h1", "moderate", 5201, experiment_id, rate_mbps, 1, monitor
+        "h1", "moderate", 5201, experiment_id, rate_mbps, 1, monitor,
+        output_directory=output_directory,
     )
 
     try:
@@ -1075,6 +1326,7 @@ def moderate(rate_mbps: float = 6.0):
         experiment_id=experiment_id,
         requested_mbps=rate_mbps,
         active_flows=1,
+        output_directory=output_directory,
         **summary,
     )
 
@@ -1098,6 +1350,11 @@ def main():
         default=6.0,
         help="offered UDP rate for the moderate scenario (default: 6 Mbps)",
     )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="isolated evidence directory outside the project worktree",
+    )
 
     args = parser.parse_args()
     if args.scenario == "moderate" and (
@@ -1106,15 +1363,15 @@ def main():
         parser.error("--rate-mbps must be a positive finite number")
 
     if args.scenario == "normal":
-        normal()
+        normal(output_directory=args.output_dir)
 
     elif args.scenario == "congestion":
-        congestion()
+        congestion(output_directory=args.output_dir)
 
     elif args.scenario == "burst":
-        burst()
+        burst(output_directory=args.output_dir)
     elif args.scenario == "moderate":
-        moderate(args.rate_mbps)
+        moderate(args.rate_mbps, output_directory=args.output_dir)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from integration.telemetry_qos import (
     adapt_person1_telemetry,
     build_qos_integration,
 )
+from integration.safe_outputs import open_exclusive_text, validate_new_output_paths
 
 
 BASELINE_POLICY = {
@@ -70,12 +71,33 @@ class _NonStandardJSONNumber(str):
     pass
 
 
+class _OverflowingJSONFloat(str):
+    pass
+
+
 def _error(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "message": str(exc)}
 
 
 def _reject_nonstandard_json_number(value: str) -> _NonStandardJSONNumber:
     return _NonStandardJSONNumber(value)
+
+
+def _parse_finite_json_float(value: str) -> float | _OverflowingJSONFloat:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        return _OverflowingJSONFloat(value)
+    return parsed
+
+
+def _contains_overflowing_json_float(value: Any) -> bool:
+    if isinstance(value, _OverflowingJSONFloat):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_overflowing_json_float(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_overflowing_json_float(item) for item in value)
+    return False
 
 
 def _find_nonstandard_json_number(value: Any) -> str | None:
@@ -123,6 +145,10 @@ def _queue_quality(
         if value is None:
             fields[field] = {"status": "missing", "value": None}
             errors.append(f"{field} is null; provide a measured nonnegative number")
+            continue
+        if isinstance(value, _OverflowingJSONFloat):
+            fields[field] = {"status": "invalid", "value": str(value)}
+            errors.append(f"{field} must be finite; overflowing JSON numbers are invalid")
             continue
         if isinstance(value, _NonStandardJSONNumber):
             fields[field] = {"status": "invalid", "value": str(value)}
@@ -222,8 +248,8 @@ def _freshness_status(
 def _record_window(record: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "kind": "telemetry-record",
-        "timestamp": record.get("timestamp"),
-        **{field: record.get(field) for field in WINDOW_FIELDS},
+        "timestamp": _report_value(record.get("timestamp")),
+        **{field: _report_value(record.get(field)) for field in WINDOW_FIELDS},
     }
 
 
@@ -326,17 +352,12 @@ def run_experiment(
         raise ValueError("now must be timezone-aware when freshness enforcement is enabled")
 
     source = Path(input_path).expanduser().resolve(strict=True)
-    destination = Path(output_path).expanduser().resolve()
+    output_candidate = Path(output_path).expanduser().resolve()
     if not source.is_file():
         raise ValueError("input_path must be a JSONL file")
-    if source == destination:
+    if source == output_candidate:
         raise ValueError("output_path must not overwrite the input telemetry file")
-    if destination.exists():
-        raise FileExistsError(f"refusing to overwrite existing output: {destination}")
-    if not destination.parent.is_dir():
-        raise FileNotFoundError(
-            f"output directory does not exist: {destination.parent}"
-        )
+    destination, = validate_new_output_paths((output_path,))
 
     modes = ("baseline", "adaptive") if mode == "both" else (mode,)
     records: list[dict[str, Any]] = []
@@ -368,7 +389,9 @@ def run_experiment(
             }
             try:
                 raw = json.loads(
-                    line, parse_constant=_reject_nonstandard_json_number
+                    line,
+                    parse_float=_parse_finite_json_float,
+                    parse_constant=_reject_nonstandard_json_number,
                 )
                 if not isinstance(raw, Mapping):
                     raise ValueError("telemetry JSONL record must be an object")
@@ -385,6 +408,15 @@ def run_experiment(
                     isinstance(raw.get(field), _NonStandardJSONNumber)
                     for field in QUEUE_MEASUREMENT_FIELDS
                 )
+                non_queue_overflow = any(
+                    _contains_overflowing_json_float(value)
+                    for field, value in raw.items()
+                    if field not in QUEUE_MEASUREMENT_FIELDS
+                )
+                if non_queue_overflow:
+                    raise ValueError(
+                        "JSON floating-point value is not finite"
+                    )
                 if nonstandard is not None and not (
                     require_queue_measurements and queue_nonstandard
                 ):
@@ -419,7 +451,10 @@ def run_experiment(
                 records.append({
                     "line": line_number,
                     "status": "invalid",
-                    "experiment_id": raw.get("experiment_id") if isinstance(raw, Mapping) else None,
+                    "experiment_id": (
+                        _report_value(raw.get("experiment_id"))
+                        if isinstance(raw, Mapping) else None
+                    ),
                     "window": _record_window(raw) if isinstance(raw, Mapping) else None,
                     "measured": {
                         field: _report_value(raw.get(field)) if isinstance(raw, Mapping) else None
@@ -603,7 +638,7 @@ def run_experiment(
         },
         "results": records,
     }
-    with destination.open("x", encoding="utf-8") as output:
+    with open_exclusive_text(destination) as output:
         json.dump(report, output, indent=2, allow_nan=False)
         output.write("\n")
     return report

@@ -7,11 +7,16 @@ from pathlib import Path
 
 import pytest
 
+from traffic import traffic_generator
 from traffic.traffic_generator import (
     _IperfIntervalReader,
     _run_udp_flow,
     start_receiver_listener,
 )
+
+
+def _run_directory(tmp_path):
+    return traffic_generator._prepare_output_directory(tmp_path / "run")
 from telemetry.iperf_parser import (
     parse_iperf_interval,
     parse_iperf_interval_events,
@@ -111,18 +116,18 @@ def test_sender_interval_parser_accepts_udp_without_receiver_metrics():
 def test_collector_pairs_sender_throughput_with_receiver_metrics(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(
-        "traffic.traffic_generator.INTERVAL_DATASET_DIR", tmp_path
-    )
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, "exp-1", 3, 1, _FakeMonitor()
+        "h1", "normal", 5201, "exp-1", 3, 1, _FakeMonitor(),
+        output_directory=_run_directory(tmp_path),
     )
     collector.add_receiver_event(_interval(1.1, 2.1))
     collector.add_client_event(_client_interval(throughput=3_250_000))
     collector.validate_complete()
 
     record = json.loads(
-        (tmp_path / "normal_exp-1_h1_intervals.jsonl").read_text().strip()
+        (tmp_path / "run" / "normal_exp-1_h1_intervals.jsonl")
+        .read_text()
+        .strip()
     )
     assert record["experiment_id"] == "exp-1"
     assert record["source"] == "h1"
@@ -140,14 +145,18 @@ def test_collector_pairs_sender_throughput_with_receiver_metrics(
     assert record["packet_loss_percent"] == 2.0
     assert record["timestamp"] == record["observation_timestamp"]
     assert isinstance(record["receiver_observation_monotonic_seconds"], float)
+    assert record["receiver_observation_role"] == "diagnostic_only"
+    assert "absolute_start_seconds" not in record
+    assert "absolute_end_seconds" not in record
     assert record["latency_ms"] == 12.0
     assert record["queue_size"] == 3
     assert record["latency_measurement_timestamp"] == "latency-time"
 
 
 def test_collector_writes_to_explicit_fresh_run_directory(tmp_path):
-    run_directory = tmp_path / "unique-repetition"
-    run_directory.mkdir()
+    run_directory = traffic_generator._prepare_output_directory(
+        tmp_path / "unique-repetition"
+    )
     collector = IntervalTelemetryCollector(
         "h1", "congestion", 5201, "run-unique", 4, 4, _FakeMonitor(),
         output_directory=run_directory,
@@ -164,11 +173,9 @@ def test_collector_writes_to_explicit_fresh_run_directory(tmp_path):
 def test_collector_identifies_missing_receiver_interval_by_flow(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(
-        "traffic.traffic_generator.INTERVAL_DATASET_DIR", tmp_path
-    )
     collector = IntervalTelemetryCollector(
-        "h3", "congestion", 5203, "exp-3", 4, 4, _FakeMonitor()
+        "h3", "congestion", 5203, "exp-3", 4, 4, _FakeMonitor(),
+        output_directory=_run_directory(tmp_path),
     )
     collector.add_client_event(_client_interval(2.0, 3.0))
 
@@ -193,12 +200,10 @@ def test_collector_persists_receiver_tail_after_client_finishes(
             )
             return measurement
 
-    monkeypatch.setattr(
-        "traffic.traffic_generator.INTERVAL_DATASET_DIR", tmp_path
-    )
     monitor = ChangingMonitor()
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, "exp-tail", 3, 1, monitor
+        "h1", "normal", 5201, "exp-tail", 3, 1, monitor,
+        output_directory=_run_directory(tmp_path),
     )
     collector.add_client_event(_client_interval(19.0, 20.0))
     collector.add_receiver_event(_interval(19.0, 20.0))
@@ -208,7 +213,7 @@ def test_collector_persists_receiver_tail_after_client_finishes(
 
     records = [
         json.loads(line)
-        for line in (tmp_path / "normal_exp-tail_h1_intervals.jsonl")
+        for line in (tmp_path / "run" / "normal_exp-tail_h1_intervals.jsonl")
         .read_text()
         .splitlines()
     ]
@@ -228,11 +233,9 @@ def test_collector_persists_receiver_tail_after_client_finishes(
 def test_collector_rejects_unmatched_receiver_interval_inside_run(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(
-        "traffic.traffic_generator.INTERVAL_DATASET_DIR", tmp_path
-    )
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, "exp-gap", 3, 1, _FakeMonitor()
+        "h1", "normal", 5201, "exp-gap", 3, 1, _FakeMonitor(),
+        output_directory=_run_directory(tmp_path),
     )
     collector.add_client_event(_client_interval(1.0, 2.0))
     collector.add_receiver_event(_interval(1.0, 2.0))
@@ -243,12 +246,11 @@ def test_collector_rejects_unmatched_receiver_interval_inside_run(
 
 
 def test_collectors_do_not_cross_match_concurrent_flows(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "traffic.traffic_generator.INTERVAL_DATASET_DIR", tmp_path
-    )
+    run_directory = _run_directory(tmp_path)
     collectors = [
         IntervalTelemetryCollector(
-            host, "congestion", port, f"exp-{port}", 4, 4, _FakeMonitor()
+            host, "congestion", port, f"exp-{port}", 4, 4, _FakeMonitor(),
+            output_directory=run_directory,
         )
         for host, port in (("h1", 5201), ("h2", 5202))
     ]
@@ -261,7 +263,7 @@ def test_collectors_do_not_cross_match_concurrent_flows(tmp_path, monkeypatch):
 
     records = [
         json.loads(line)
-        for path in sorted(tmp_path.glob("congestion_*.jsonl"))
+        for path in sorted((tmp_path / "run").glob("congestion_*.jsonl"))
         for line in path.read_text().splitlines()
     ]
     assert {(row["source"], row["experiment_id"]) for row in records} == {
@@ -272,7 +274,7 @@ def test_collectors_do_not_cross_match_concurrent_flows(tmp_path, monkeypatch):
     assert all(row["sender_throughput_mbps"] == 1.5 for row in records)
 
 
-def test_receiver_parser_rejects_events_missing_udp_metrics():
+def test_receiver_parser_rejects_events_missing_udp_metrics(tmp_path):
     payload = json.loads(_interval())
     del payload["data"]["sum"]["jitter_ms"]
     with pytest.raises(
@@ -281,7 +283,8 @@ def test_receiver_parser_rejects_events_missing_udp_metrics():
         r" iperf interval is TCP or missing UDP jitter_ms",
     ):
         IntervalTelemetryCollector(
-            "h1", "normal", 5201, "exp-1", 3, 1, _FakeMonitor()
+            "h1", "normal", 5201, "exp-1", 3, 1, _FakeMonitor(),
+            output_directory=_run_directory(tmp_path),
         ).add_receiver_event(json.dumps(payload))
 
 
@@ -310,7 +313,7 @@ def test_receiver_listener_startup_timeout_terminates_started_process(
     calls = []
     monkeypatch.setattr(
         "traffic.traffic_generator.run_on_host",
-        lambda host, command: calls.append((host, command)) or process,
+        lambda host, command, **kwargs: calls.append((host, command)) or process,
     )
     monkeypatch.setattr(
         "traffic.traffic_generator._iperf_port_is_listening",
@@ -338,7 +341,7 @@ def test_receiver_listener_refuses_to_duplicate_an_existing_port(monkeypatch):
     )
     monkeypatch.setattr(
         "traffic.traffic_generator.run_on_host",
-        lambda *args: pytest.fail("must not launch a duplicate listener"),
+        lambda *args, **kwargs: pytest.fail("must not launch a duplicate listener"),
     )
 
     with pytest.raises(RuntimeError, match="already listening"):
@@ -385,7 +388,7 @@ def test_udp_flow_runtime_failure_stops_client_and_receiver(monkeypatch):
     )
     monkeypatch.setattr(
         "traffic.traffic_generator.run_on_host",
-        lambda *args: client,
+        lambda *args, **kwargs: client,
     )
     monkeypatch.setattr(
         "traffic.traffic_generator.wait_for_process",

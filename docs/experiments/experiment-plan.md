@@ -42,17 +42,27 @@ throughput/loss/jitter still comes from each client's completed iperf3 output.
 Run any scenario from the repository root:
 
 ```text
-python traffic/traffic_generator.py --scenario normal
-python traffic/traffic_generator.py --scenario moderate
-python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5
-python traffic/traffic_generator.py --scenario burst
-python traffic/traffic_generator.py --scenario congestion
+python traffic/traffic_generator.py --scenario normal --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5 --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario burst --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario congestion --output-dir /absolute/path/to/isolated-run
 ```
+
+The output directory is mandatory and must be outside the project worktree.
+The generator rejects the project dataset tree and its descendants; it does
+not create a campaign manifest or make a run safe on a shared host. Use a
+fresh, approved evidence directory for each isolated run.
 
 `normal` sends one 3 Mbps flow for 20 seconds; `moderate` sends one 6 Mbps
 flow for 20 seconds by default (or the supplied `--rate-mbps`); `burst` runs
 five 3-second 8 Mbps bursts; and `congestion` runs four simultaneous 4 Mbps
 flows from `h1`-`h4` for 20 seconds.
+
+The `congestion` value is a traffic-generator scenario, not a comparison
+condition. The comparison campaign has the four separately defined strata in
+`adaptive-qos-comparison-plan.md`: Baseline/BASELINE and QoS LOW, MEDIUM, and
+HIGH.
 
 ## Fixed network conditions
 
@@ -70,9 +80,9 @@ append mode at a path anchored to the project directory, so running from another
 working directory does not redirect output or replace prior records.
 
 ```text
-python traffic/traffic_generator.py --scenario moderate
-python traffic/traffic_generator.py --scenario moderate --rate-mbps 7
-python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5
+python traffic/traffic_generator.py --scenario moderate --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7 --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5 --output-dir /absolute/path/to/isolated-run
 ```
 
 The first command is an independent 6 Mbps baseline run; the existing recorded

@@ -70,54 +70,159 @@ authorized by this plan.
 ## Receiver telemetry
 
 Per-run, per-flow interval JSONL filenames include scenario, experiment ID, and
-host to avoid appending new records to a stale scenario file. The collector
-accepts a caller-owned output directory; the comparison runner must create each
-fresh repetition directory exclusively and pass it through. When a client
+host to avoid appending new records to a stale scenario file. The traffic
+generator now requires an explicit output directory outside the project
+worktree; the comparison runner must create each fresh repetition directory
+exclusively and pass it through. When a client
 interval is paired with a server `--json-stream` interval, saved primary
 throughput, packet loss, jitter, and interval boundaries are from the receiver.
 Sender throughput and sender-relative interval boundaries are retained under
 separate `sender_*` fields. Missing receiver intervals remain errors; sender
 values are not substituted.
 
+Directory creation uses exclusive `mkdir`; run-owned JSONL files use exclusive
+creation and no-follow flags where the platform provides them. Symlink and
+path checks reduce accidental redirection, but directory replacement between
+validation and file open is not eliminated portably. Use a trusted parent
+directory with exclusive ownership; do not treat the current helper as
+race-proof against a concurrent actor able to replace directories.
+Offline experiment JSON reports and analyzer JSON/CSV reports likewise require
+explicit output paths outside the project worktree and referenced evidence
+directories. Their output parents must already exist and must not be symlinks;
+files are created exclusively, so an existing or concurrently created target
+is never overwritten. Parent-directory replacement remains a platform-level
+race limitation.
+
 Pairing occurs within a flow using relative interval offsets and a match
 tolerance. The collector now records the monotonic time when a receiver event
 is observed, separately from its relative interval boundaries; observation
-time is not the interval boundary. `telemetry.receiver_windows` accepts an
-aggregate only when every receiver interval includes absolute start/end values
-on the same explicit `clock_id`, all expected flows are present, and the
-intervals continuously cover the exact shared window. Its synthetic tests
-validate that calculation and its rejection cases; they do not establish that
-the current collector or existing artifacts can produce such aligned absolute
-boundaries. Until a live collector supplies a defensible mapping from receiver
-interval boundaries onto one clock, report per-flow receiver metrics and an
-arithmetic summary separately.
+time is not the interval boundary. The receiver iperf3 JSON stream supplies
+test-relative `sum.start`/`sum.end` offsets, not absolute receiver-monotonic
+measurement boundaries. The collector does not emit actual boundaries,
+receiver clock identity, or receiver host/boot identity. `telemetry.receiver_windows`
+accepts an aggregate only when every receiver interval includes actual,
+uncertainty-qualified absolute boundaries from a receiver measurement source,
+consistent clock/host/boot identities, all expected flows, and continuous
+coverage of the guaranteed common window. Synthetic tests validate this
+contract only; they do not establish that the collector or existing artifacts
+can produce qualifying boundaries.
+
+Implementing a genuine boundary source requires instrumenting iperf3's
+receiver-side interval accounting or adding a separate receiver measurement
+producer that reports each measured interval's actual start and end in the
+receiver monotonic clock domain. It must provide versioned boundary provenance,
+clock/host/boot identities, edge uncertainty with independently verifiable
+supporting evidence, and keep callback observation timestamps distinct.
+Those semantics and the source's uncertainty must be independently validated.
+Until then, receiver-only aligned aggregates are unavailable; report per-flow
+receiver metrics and arithmetic summaries separately. Sender/receiver temporal
+comparison remains blocked until a sender-to-receiver clock mapping is
+independently validated. The project owner must approve the measurement-error
+budget before a maximum uncertainty can be selected; no threshold is implied
+by this contract. Campaign completeness, alignment, and live readiness remain
+separate outcomes.
+
+## Live orchestration safety gate
+
+There is no live comparison orchestrator in this worktree. The adaptive
+experiment runner remains planning-only; the integration apply entry point and
+managed controller are separate APIs and do not bind a prediction, trial
+manifest, namespace identity, evidence directory, traffic collection, and
+restoration into one guarded lifecycle. Do not add a shell/CLI shortcut around
+those APIs.
+
+Any future separately authorized orchestrator must fail closed unless it can:
+
+1. Capture and verify the original state on the exact interface and establish
+   exclusive ownership of that interface and topology.
+2. Validate the prediction and exact approved profile before applying.
+3. Apply only the recognized managed hierarchy and read back exact qdisc,
+   class, filter, and rate state before starting traffic.
+4. Write all trial evidence beneath a fresh, isolated output directory.
+5. Attempt only scoped restoration on every exit path, then compare readback
+   with the captured original state.
+6. Stop the campaign on ambiguous namespace/interface identity, unexpected
+   state, collection failure, rollback failure, or restoration mismatch.
+
+The traffic helper requires exactly one process with the expected Bash host
+shell argv (`bash --norc -is mininet:<host>`) and executable, checks the
+expected interface in that namespace, then rechecks process identity and
+start-time as the final validation immediately before launch. The interface
+check therefore precedes that final identity check; neither check and command
+execution are atomic, so the namespace process or interface can change in the
+remaining interval. The repository does not establish that
+all intended Mininet installations use this exact shell convention; verify it
+in the approved target environment. A different process able to use the same
+Bash executable and exact argv can still imitate this identity. Since
+`mnexec` accepts a numeric PID rather than a pidfd, a narrow exit/PID-reuse race
+remains between the final recheck and command launch. This does not bind the
+controller's `s1-eth5` root-namespace target to an approved namespace or prove
+exclusive ownership. The controller's lock cannot coordinate arbitrary
+external `tc` writers. These are remaining orchestration and
+environment-approval blockers, not reasons to relax preflight.
 
 ## Comparison protocol
 
-Run at least three independent repetitions per condition:
+The four-stratum matrix and `WILLIAMS_4` schedule below are the explicitly
+approved project contract; this approval is a project decision, not a claim
+that the earlier documentation had already established it. `congestion` remains
+a traffic-generator scenario, not a fifth comparison condition.
 
-| Condition | Flows | Offer per flow | Offered duration | Traffic control |
-|---|---|---:|---:|---|
-| Baseline | h1–h4 to server, UDP ports 5201–5204 | 4 Mbps | 5 seconds | Original root `5:`, class `5:1` at 10 Mbps, netem 10 ms |
-| QoS | Same hosts, ports, and loads | 4 Mbps | 5 seconds | Reviewed nested hierarchy; exact mapping and policy must be approved first |
+The comparison has exactly these four strata:
 
-Use a counterbalanced order across repetitions. For every repetition, make a
-fresh unique evidence directory and explicit four-file manifest; never glob
-historical datasets. Confirm listeners and no active clients without killing
-or restarting anything. Verify the baseline or approved nested tree, start
-receiver collectors and latency monitoring, then snapshot qdisc/class/filter
-and interface/server counters immediately before traffic. Launch each client
-once, with a predeclared launch-skew limit, and record monotonic and UTC start
-and finish times. Capture complete per-flow JSON plus client and server
-interval streams. Snapshot the same counters immediately after all flows and
-receiver drains complete; report counter deltas, not cumulative values.
+| Stratum | Condition | Profile | Flows | Offer per flow | Offered duration | Traffic control |
+|---|---|---|---|---|---:|---|
+| `baseline` | Baseline | `BASELINE` | h1–h4, UDP ports 5201–5204 | 4 Mbps | 20 seconds | Original root `5:`, class `5:1` at 10 Mbps, netem 10 ms |
+| `qos_low` | QoS | `LOW` | Same hosts and ports | 4 Mbps | 20 seconds | Reviewed nested hierarchy |
+| `qos_medium` | QoS | `MEDIUM` | Same hosts and ports | 4 Mbps | 20 seconds | Reviewed nested hierarchy |
+| `qos_high` | QoS | `HIGH` | Same hosts and ports | 4 Mbps | 20 seconds | Reviewed nested hierarchy |
+
+Campaign execution uses the versioned `WILLIAMS_4` schedule. The exact
+sequences are:
+
+| Sequence | Stratum order |
+|---|---|
+| A | `baseline`, `qos_low`, `qos_high`, `qos_medium` |
+| B | `qos_low`, `qos_medium`, `baseline`, `qos_high` |
+| C | `qos_medium`, `qos_high`, `qos_low`, `baseline` |
+| D | `qos_high`, `baseline`, `qos_medium`, `qos_low` |
+
+A complete cycle contains blocks A, B, C, and D exactly once. Each block
+contains all four strata exactly once in its prescribed order. In each cycle,
+each stratum occupies each of the four sequence positions once. At least three
+complete cycles are required: 16 trials per cycle and 48 trials minimum. Set
+`execution_order` to a unique contiguous sequence from 1 through 48 (or the
+larger campaign size), ordered by cycle, A/B/C/D, then position within each
+sequence. The campaign validator uses this explicit order and schedule
+metadata; it does not infer order from filenames, directory names, or JSON
+array ordering. A block is uniquely identified by its `(cycle, sequence_id)`
+pair and must occur exactly once in that cycle; a partial three-sequence
+subset is not a complete cycle.
+
+The approved project duration is 20 seconds per flow at 4 Mbps for each of
+four concurrent UDP flows. This project decision resolves conflicting
+durations in earlier experiment documentation; it is not inferred from those
+documents.
+
+For every trial, make a fresh unique evidence directory and explicit
+four-file per-trial manifest; never glob historical datasets. Confirm
+listeners and no active clients without killing or restarting anything. Verify
+the baseline or approved nested tree, start receiver collectors and latency
+monitoring, then snapshot qdisc/class/filter and interface/server counters
+immediately before traffic. Launch each client once, with a predeclared
+launch-skew limit, and record monotonic and UTC start and finish times. Capture
+complete per-flow JSON plus client and server interval streams. Snapshot the
+same counters immediately after all flows and receiver drains complete; report
+counter deltas, not cumulative values.
 
 Report per-flow receiver throughput, jitter, received/total/lost packets, loss
 percentage, latency with sample timestamp/age, and receiver window boundaries.
 Also report sender metrics separately. Include qdisc/class/filter configuration
 and counters before/after, interface TX/RX deltas, server RX/TX deltas, and both
-the common-window aggregate (only when alignment is verified) and arithmetic
-summary.
+the common-window aggregate only when the report marks measurement alignment
+eligible; contract-valid synthetic geometry or verified artifact integrity
+alone is insufficient. Otherwise, report only the explicitly unverified
+arithmetic summary.
 
 Reject a repetition if a listener or client fails, a flow/file/interval is
 missing or invalid, receiver intervals cannot be aligned, the required root,

@@ -94,6 +94,46 @@ def test_mapping_and_metadata_preservation():
     assert adapted.metadata["queue_size"] == 0
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("experiment_id", [], "experiment_id must be a non-empty string"),
+        ("experiment_id", "", "experiment_id must be a non-empty string"),
+        ("scenario", "  ", "scenario must be a non-empty string"),
+        ("source", None, "source must be a non-empty string"),
+        ("destination", {}, "destination must be a non-empty string"),
+        ("traffic_type", 7, "traffic_type must be a non-empty string"),
+        ("requested_mbps", True, "requested_mbps must be a finite non-negative number"),
+        ("requested_mbps", -1, "requested_mbps must be a finite non-negative number"),
+        ("requested_mbps", None, "requested_mbps must be a finite non-negative number"),
+        ("requested_mbps", float("inf"), "requested_mbps must be a finite non-negative number"),
+        ("requested_mbps", float("nan"), "requested_mbps must be a finite non-negative number"),
+        ("lost_packets", -1, "lost_packets must be a non-negative integer"),
+        ("lost_packets", 1.5, "lost_packets must be a non-negative integer"),
+        ("lost_packets", True, "lost_packets must be a non-negative integer"),
+        ("total_packets", -1, "total_packets must be a non-negative integer"),
+        ("total_packets", 1.5, "total_packets must be a non-negative integer"),
+        ("total_packets", True, "total_packets must be a non-negative integer"),
+    ],
+)
+def test_person1_metadata_schema_validation(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        adapt_person1_telemetry(
+            {**person1_telemetry(), field: value},
+            interface="configured0",
+        )
+
+
+def test_packet_counters_are_independently_validated():
+    adapted = adapt_person1_telemetry(
+        {**person1_telemetry(), "lost_packets": 429, "total_packets": 428},
+        interface="configured0",
+    )
+
+    assert adapted.metadata["lost_packets"] == 429
+    assert adapted.metadata["total_packets"] == 428
+
+
 def test_malformed_or_missing_telemetry_rejected():
     missing = person1_telemetry()
     del missing["latency_ms"]
