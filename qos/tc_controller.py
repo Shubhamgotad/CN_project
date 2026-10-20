@@ -118,6 +118,47 @@ class TCState:
 
 
 @dataclass(frozen=True)
+class IsolatedHTBTarget:
+    """Identity-pinned target for the opt-in disposable namespace probe only."""
+
+    namespace: str
+    interface: str
+    namespace_inode: int
+    ifindex: int
+    peer_namespace: str
+    peer_interface: str
+    peer_namespace_inode: int
+    peer_ifindex: int
+
+    def __post_init__(self) -> None:
+        match = (
+            re.fullmatch(r"qosna([0-9a-f]{8})", self.namespace)
+            if isinstance(self.namespace, str)
+            else None
+        )
+        if (
+            match is None
+            or not isinstance(self.peer_namespace, str)
+            or not isinstance(self.interface, str)
+            or not isinstance(self.peer_interface, str)
+            or self.peer_namespace != f"qosnb{match.group(1)}"
+            or self.interface != f"qosp{match.group(1)}"
+            or self.peer_interface != f"qosq{match.group(1)}"
+        ):
+            raise ValueError("isolated HTB targets must use one matched probe identity")
+        for label, value in (
+            ("namespace inode", self.namespace_inode),
+            ("interface index", self.ifindex),
+            ("peer namespace inode", self.peer_namespace_inode),
+            ("peer interface index", self.peer_ifindex),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"isolated target {label} must be a positive integer")
+        if self.namespace_inode == self.peer_namespace_inode or self.ifindex == self.peer_ifindex:
+            raise ValueError("isolated target endpoints must have distinct identities")
+
+
+@dataclass(frozen=True)
 class ManagedHTBConfig:
     """Validated five-leaf managed hierarchy configuration."""
 
@@ -128,11 +169,17 @@ class ManagedHTBConfig:
     unmatched_rate_mbps: float = 1.0
     unmatched_ceil_mbps: float = 1.0
     default_class_id: str = UNMATCHED_CLASS_ID
+    isolated_target: IsolatedHTBTarget | None = None
 
     def __post_init__(self) -> None:
         validate_interface(self.interface)
-        if self.interface != ROOT_INTERFACE:
+        if self.isolated_target is None and self.interface != ROOT_INTERFACE:
             raise ValueError(f"managed HTB supports only {ROOT_INTERFACE}")
+        if self.isolated_target is not None:
+            if not isinstance(self.isolated_target, IsolatedHTBTarget):
+                raise ValueError("isolated_target must be an identity-pinned IsolatedHTBTarget")
+            if self.interface != self.isolated_target.interface or self.interface == ROOT_INTERFACE:
+                raise ValueError("managed HTB interface does not match its isolated target")
         total = validate_total_bandwidth(self.total_bandwidth_mbps)
         if not math.isclose(total, BOTTLENECK_MBPS, rel_tol=0, abs_tol=1e-9):
             raise ValueError("managed HTB parent bandwidth must remain 10 Mbps")
@@ -328,7 +375,17 @@ def inspect_tc_state(interface: str, runner: Callable[..., Any] | None = None) -
     """Read the qdisc, class and filter state without changing it."""
     validate_interface(interface)
     execute = runner or subprocess.run
-    classes = _run(execute, ["tc", "-d", "class", "show", "dev", interface])
+    root_classes = _run(execute, ["tc", "-d", "class", "show", "dev", interface])
+    nested_classes = _run(
+        execute, ["tc", "-d", "class", "show", "dev", interface, "parent", "1:"]
+    )
+    class_lines = list(dict.fromkeys(
+        line.strip()
+        for output in (root_classes, nested_classes)
+        for line in output.splitlines()
+        if line.strip().startswith("class ")
+    ))
+    classes = "\n".join(class_lines) + ("\n" if class_lines else "")
     root_filters = _run(execute, ["tc", "-s", "filter", "show", "dev", interface])
     child_filters = _run(execute, ["tc", "-s", "filter", "show", "dev", interface, "parent", "1:"])
     return TCState(
@@ -336,6 +393,70 @@ def inspect_tc_state(interface: str, runner: Callable[..., Any] | None = None) -
         classes=classes,
         filters=root_filters + child_filters,
     )
+
+
+def _verify_isolated_htb_target(
+    target: IsolatedHTBTarget,
+    runner: Callable[..., Any],
+) -> None:
+    """Prove both namespace and veth identities before every scoped tc call."""
+    endpoint_specs = (
+        (target.namespace, target.interface, target.namespace_inode,
+         target.ifindex, target.peer_ifindex),
+        (target.peer_namespace, target.peer_interface,
+         target.peer_namespace_inode, target.peer_ifindex, target.ifindex),
+    )
+    for namespace, interface, expected_inode, expected_ifindex, peer_ifindex in endpoint_specs:
+        inode_text = _run(runner, [
+            "ip", "netns", "exec", namespace, "stat", "-Lc", "%i",
+            "/proc/self/ns/net",
+        ]).strip()
+        if inode_text != str(expected_inode):
+            raise TCPreconditionError("isolated target namespace identity changed")
+        links_text = _run(runner, [
+            "ip", "netns", "exec", namespace, "ip", "-j", "-details", "link", "show",
+        ])
+        try:
+            links = json.loads(links_text)
+        except (TypeError, ValueError) as exc:
+            raise TCPreconditionError("cannot verify isolated namespace interfaces") from exc
+        if not isinstance(links, list) or len(links) != 2:
+            raise TCPreconditionError("isolated namespace contains unexpected interfaces")
+        if any(not isinstance(item, dict) for item in links):
+            raise TCPreconditionError("isolated namespace interface data is malformed")
+        by_name = {item.get("ifname"): item for item in links}
+        endpoint = by_name.get(interface)
+        if (
+            set(by_name) != {"lo", interface}
+            or not isinstance(endpoint, dict)
+            or endpoint.get("ifindex") != expected_ifindex
+            or endpoint.get("link_index") != peer_ifindex
+            or endpoint.get("master")
+            or not isinstance(endpoint.get("linkinfo"), dict)
+            or endpoint["linkinfo"].get("info_kind") != "veth"
+        ):
+            raise TCPreconditionError(
+                "isolated target is not the expected unbridged veth pair"
+            )
+
+
+class _IsolatedHTBRunner:
+    """Route all controller tc commands into an identity-verified namespace."""
+
+    def __init__(self, target: IsolatedHTBTarget, runner: Callable[..., Any]):
+        self.target = target
+        self.runner = runner
+
+    def __call__(self, argv, *, capture_output, text, check):
+        if not argv or argv[0] != "tc":
+            raise TCPreconditionError("isolated controller runner accepts only tc commands")
+        _verify_isolated_htb_target(self.target, self.runner)
+        return self.runner(
+            ["ip", "netns", "exec", self.target.namespace, *argv],
+            capture_output=capture_output,
+            text=text,
+            check=check,
+        )
 
 
 def _verify_disposable_veth(interface: str, runner: Callable[..., Any]) -> None:
@@ -433,7 +554,7 @@ def _ceil_from_line(line: str) -> float | None:
 def _filter_signature_matches(
     text: str, priorities: Mapping[int, int], default_port: int
 ) -> bool:
-    lines = text.splitlines()
+    lines = _filter_structure_lines(text)
     if any(line.strip() and not line.lstrip().startswith("filter ") and
            not line.lstrip().startswith("match ") for line in lines):
         return False
@@ -472,13 +593,7 @@ def _filter_signature_matches(
         class_id = FLOW_CLASS_IDS[port]
         port_hex = f"{port:04x}"
         block = blocks[priority]
-        detail = re.fullmatch(
-            rf"filter protocol ip pref {priority} u32 chain 0 "
-            rf"fh [0-9a-fA-F]+: order \d+ \*flowid "
-            rf"{re.escape(class_id)}(?: not_in_hw)?",
-            block[0],
-        )
-        if detail is None:
+        if not _filter_detail_matches(block[0], priority, class_id):
             return False
         expected_matches = (
             f"match 00110000/00ff0000 at 8",
@@ -575,7 +690,7 @@ def _managed_structure_with_any_rates(
 
 
 def _managed_htb_filter_matches(text: str) -> bool:
-    lines = text.splitlines()
+    lines = _filter_structure_lines(text)
     if any(
         line.strip()
         and not line.lstrip().startswith(("filter ", "match "))
@@ -617,12 +732,7 @@ def _managed_htb_filter_matches(text: str) -> bool:
         class_id = SERVICE_CLASS_IDS[traffic_class]
         port_hex = f"{port:04x}"
         block = blocks[priority]
-        if re.fullmatch(
-            rf"filter protocol ip pref {priority} u32 chain 0 "
-            rf"fh [0-9a-fA-F]+: order \d+ \*flowid "
-            rf"{re.escape(class_id)}(?: not_in_hw)?",
-            block[0],
-        ) is None:
+        if not _filter_detail_matches(block[0], priority, class_id):
             return False
         if tuple(block[1:]) != (
             "match 00110000/00ff0000 at 8",
@@ -630,6 +740,43 @@ def _managed_htb_filter_matches(text: str) -> bool:
         ):
             return False
     return True
+
+
+def _filter_structure_lines(text: str) -> list[str]:
+    """Remove only syntactically valid tc packet counters before ownership checks."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.fullmatch(
+            r"Sent \d+ bytes \d+ pkt \(dropped \d+, overlimits \d+ requeues \d+\)",
+            stripped,
+        ):
+            continue
+        if re.fullmatch(
+            r"filter protocol ip pref \d+ u32 chain 0 fh [0-9a-fA-F]+: ht divisor 1",
+            stripped,
+        ):
+            continue
+        stripped = re.sub(r" \(success \d+ ?\)$", "", stripped)
+        lines.append(stripped)
+    return lines
+
+
+def _filter_detail_matches(line: str, priority: int, class_id: str) -> bool:
+    prefix = rf"filter protocol ip pref {priority} u32 chain 0 fh "
+    flow = rf" \*flowid {re.escape(class_id)}(?: not_in_hw)?"
+    legacy = re.fullmatch(
+        prefix + rf"[0-9a-fA-F]+: order \d+" + flow,
+        line,
+    )
+    modern = re.fullmatch(
+        prefix
+        + rf"([0-9a-fA-F]+)::[0-9a-fA-F]+ order \d+ key ht \1 bkt \d+"
+        + flow
+        + r"(?: \(rule hit \d+ success \d+\))?",
+        line,
+    )
+    return legacy is not None or modern is not None
 
 
 def _managed_htb_owned(state: TCState) -> bool:
@@ -648,7 +795,7 @@ def _managed_htb_owned(state: TCState) -> bool:
     ):
         return False
     if not any(
-        re.search(r"^qdisc htb 1: parent 5:1 .*default 0xf(?:\s|$)", line)
+        re.search(r"^qdisc htb 1: parent 5:1 .*default 0x15(?:\s|$)", line)
         for line in qdiscs
     ):
         return False
@@ -830,6 +977,27 @@ def restore_managed_htb_hierarchy(
         return True
 
 
+def restore_isolated_managed_htb_hierarchy(
+    target: IsolatedHTBTarget,
+    runner: Callable[..., Any] | None = None,
+) -> bool:
+    """Restore only a verified probe namespace's complete managed hierarchy."""
+    if not isinstance(target, IsolatedHTBTarget):
+        raise TCPreconditionError("isolated restore requires an identity-pinned target")
+    raw_runner = runner or subprocess.run
+    execute = _IsolatedHTBRunner(target, raw_runner)
+    with _interface_lock(target.interface):
+        state = inspect_tc_state(target.interface, execute)
+        if _baseline_matches(state):
+            return False
+        if not _managed_htb_owned(state):
+            raise TCPreconditionError(
+                "refusing isolated cleanup: hierarchy is not recognized as controller-owned"
+            )
+        _restore_baseline(target.interface, execute, state)
+        return True
+
+
 def apply_tc_policy(
     interface: str,
     total_bandwidth_mbps: float,
@@ -946,7 +1114,12 @@ def apply_managed_htb_policy(
     """Apply or update the validated five-leaf hierarchy with guarded rollback."""
     if not isinstance(config, ManagedHTBConfig):
         raise ValueError("config must be a validated ManagedHTBConfig")
-    execute = runner or subprocess.run
+    raw_runner = runner or subprocess.run
+    execute = (
+        _IsolatedHTBRunner(config.isolated_target, raw_runner)
+        if config.isolated_target is not None
+        else raw_runner
+    )
     commands = generate_managed_htb_commands(config)
     with _interface_lock(config.interface):
         before = inspect_tc_state(config.interface, execute)

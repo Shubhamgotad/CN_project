@@ -4,6 +4,11 @@ import {
   apiReportToRunnerReport,
   backendConnection,
   getBackendHealth,
+  getTelemetryHistory,
+  getActiveTrafficExecution,
+  getTrafficExecution,
+  startTrafficExecution,
+  stopTrafficExecution,
   getReport,
   getReports,
   parseEvidenceReport,
@@ -20,7 +25,7 @@ afterEach(() => {
   });
 });
 
-describe("read-only API client", () => {
+describe("dashboard API client", () => {
   it("requests the health endpoint from the configured API base URL", async () => {
     Object.defineProperty(backendConnection, "baseUrl", {
       configurable: true,
@@ -28,27 +33,83 @@ describe("read-only API client", () => {
     });
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       status: "ok",
-      service: "adaptive-qos-readonly-api",
+      service: "adaptive-qos-dashboard-api",
       api_version: "0.1.0",
-      live_network_operations: false,
+      live_network_operations: true,
     })));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getBackendHealth()).resolves.toMatchObject({
       status: "ok",
-      live_network_operations: false,
+      live_network_operations: true,
     });
     expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/api/health", {
       headers: { Accept: "application/json" },
     });
   });
 
-  it("reports unconfigured API access instead of fabricating fallback data", async () => {
+  it("requests historical telemetry through bounded host and scenario filters", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      status: "available",
+      message: "Recorded history, not live telemetry.",
+      source_kinds: ["completed_experiment_person1_jsonl"],
+      host_filter: "h2",
+      scenario_filter: "congestion",
+      limit: 50,
+      total_records: 1,
+      truncated: false,
+      rejected_records: 0,
+      records: [],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getTelemetryHistory({ host: "h2", scenario: "congestion", limit: 50 })).resolves.toMatchObject({
+      status: "available",
+      source_kinds: ["completed_experiment_person1_jsonl"],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/telemetry/history?host=h2&scenario=congestion&limit=50",
+      { headers: { Accept: "application/json" } },
+    );
+  });
+
+  it("uses only fixed execution endpoints and validates IDs", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "starting" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "running" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "stopped" })))
+      .mockResolvedValueOnce(new Response("null"));
+    vi.stubGlobal("fetch", fetchMock);
+    const id = "0123456789abcdef0123456789abcdef";
+    await startTrafficExecution("congestion", 5, 17);
+    await getTrafficExecution(id);
+    await stopTrafficExecution(id);
+    await expect(getActiveTrafficExecution()).resolves.toBeNull();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8000/api/experiments/start",
+      `http://127.0.0.1:8000/api/execution/${id}`,
+      `http://127.0.0.1:8000/api/experiments/${id}/stop`,
+      "http://127.0.0.1:8000/api/execution/active",
+    ]);
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST", body: JSON.stringify({ scenario: "congestion", rate_mbps: 5, duration_seconds: 17 }) });
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: "POST", body: "{}" });
+    expect(() => getTrafficExecution("../bad")).toThrow("Invalid experiment identifier");
+    expect(() => stopTrafficExecution("../bad")).toThrow("Invalid experiment identifier");
+  });
+
+  it("uses the local development API by default instead of fabricating fallback data", async () => {
     Object.defineProperty(backendConnection, "baseUrl", {
       configurable: true,
-      value: null,
+      value: "http://127.0.0.1:8000",
     });
-    await expect(getReports()).rejects.toThrow("VITE_BACKEND_URL");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      status: "unavailable", message: "Set ADAPTIVE_QOS_REPORT_DIR", reports: [],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(getReports()).resolves.toMatchObject({ status: "unavailable", reports: [] });
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/reports", {
+      headers: { Accept: "application/json" },
+    });
   });
 
   it("surfaces HTTP errors and rejects unsafe report identifiers", async () => {
@@ -65,6 +126,25 @@ describe("read-only API client", () => {
     expect(() => getReport("../private")).toThrow("Invalid report identifier");
     expect(fetchMock).not.toHaveBeenCalled();
     await expect(getReport("missing")).rejects.toThrow("Configured report was not found.");
+  });
+
+  it("shows FastAPI validation details for the exact Start request instead of a generic 422", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      detail: [{
+        type: "value_error",
+        loc: ["body", "rate_mbps"],
+        msg: "Value error, Rate must use 0.1 Mbps increments.",
+      }],
+    }), { status: 422 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(startTrafficExecution("normal", 5.05, 20)).rejects.toThrow(
+      "Backend rejected POST /api/experiments/start (422): body.rate_mbps: Value error, Rate must use 0.1 Mbps increments.",
+    );
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/experiments/start", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ scenario: "normal", rate_mbps: 5.05, duration_seconds: 20 }),
+    }));
   });
 
   it("keeps API evidence ineligible even when a returned report claims readiness", () => {

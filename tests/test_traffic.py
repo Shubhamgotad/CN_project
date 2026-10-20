@@ -54,6 +54,16 @@ def test_namespace_selection_requires_exactly_one_matching_process():
         )
 
 
+def test_namespace_selection_accepts_mininet_noediting_host_shell():
+    assert traffic_generator.resolve_mininet_namespace_pid(
+        "h1",
+        ["101"],
+        cmdline_reader=lambda _: b"/bin/bash\0--norc\0--noediting\0-is\0mininet:h1\0",
+        executable_reader=lambda _: b"/bin/bash",
+        starttime_reader=lambda _: "start-101",
+    ) == ("101", "start-101")
+
+
 def test_host_interface_identity_rejects_namespace_mismatch():
     class Result:
         returncode = 0
@@ -610,7 +620,7 @@ def test_moderate_rate_cli_keeps_default_and_accepts_sweep_value(
 
 @pytest.mark.parametrize("rate_mbps", [0, -1, float("inf"), float("nan")])
 def test_moderate_rejects_invalid_rate(rate_mbps):
-    with pytest.raises(ValueError, match="positive finite"):
+    with pytest.raises(ValueError, match="between 0.1 and 10"):
         traffic_generator.moderate(rate_mbps)
 
 

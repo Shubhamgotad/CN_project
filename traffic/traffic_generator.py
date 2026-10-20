@@ -61,11 +61,14 @@ def _is_mininet_host_shell(host, pid, cmdline_reader, executable_reader):
             f"cannot verify Mininet namespace process {pid}"
         ) from exc
     expected_marker = f"mininet:{host}".encode()
+    expected_arguments = (
+        [b"--norc", b"-is", expected_marker],
+        [b"--norc", b"--noediting", b"-is", expected_marker],
+    )
     return (
-        len(arguments) == 4
+        len(arguments) >= 4
         and Path(os.fsdecode(arguments[0])).name == "bash"
-        and arguments[1:3] == [b"--norc", b"-is"]
-        and arguments[3] == expected_marker
+        and arguments[1:] in expected_arguments
         and Path(os.fsdecode(executable)).name == "bash"
     )
 
@@ -1108,7 +1111,7 @@ def _run_udp_flow(
     return output
 
 
-def normal(output_directory=None):
+def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION):
     """One 3 Mbps UDP flow for 20 seconds."""
 
     output_directory = _prepare_output_directory(output_directory)
@@ -1117,11 +1120,11 @@ def normal(output_directory=None):
 
     monitor = ScenarioMonitor(["h1"]).start()
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, experiment_id, 3, 1, monitor,
+        "h1", "normal", 5201, experiment_id, rate_mbps, 1, monitor,
         output_directory=output_directory,
     )
     try:
-        output = _run_udp_flow("h1", 3, 5201, DURATION, collector)
+        output = _run_udp_flow("h1", rate_mbps, 5201, duration_seconds, collector)
     finally:
         summary = monitor.stop()
 
@@ -1130,7 +1133,7 @@ def normal(output_directory=None):
         source="h1",
         scenario="normal",
         experiment_id=experiment_id,
-        requested_mbps=3,
+        requested_mbps=rate_mbps,
         active_flows=1,
         output_directory=output_directory,
         **summary,
@@ -1139,7 +1142,7 @@ def normal(output_directory=None):
     print("\n[TRAFFIC] Normal scenario completed.")
 
 
-def congestion(output_directory=None):
+def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
     """Four 4 Mbps UDP flows for 20 seconds through the bottleneck.
 
     A startup or collection failure aborts the scenario without writing
@@ -1152,10 +1155,10 @@ def congestion(output_directory=None):
     experiment_id = str(uuid.uuid4())
 
     flows = [
-        ("h1", 4, 5201),
-        ("h2", 4, 5202),
-        ("h3", 4, 5203),
-        ("h4", 4, 5204),
+        ("h1", rate_mbps, 5201),
+        ("h2", rate_mbps, 5202),
+        ("h3", rate_mbps, 5203),
+        ("h4", rate_mbps, 5204),
     ]
 
     monitor = ScenarioMonitor(["h1", "h2", "h3", "h4"]).start()
@@ -1185,7 +1188,7 @@ def congestion(output_directory=None):
                     "-u",
                     "-b", f"{rate}M",
                     "-p", str(port),
-                    "-t", str(DURATION),
+                    "-t", str(duration_seconds),
                     "--json-stream",
                 ],
                 interface=MININET_HOST_INTERFACES[host],
@@ -1195,7 +1198,7 @@ def congestion(output_directory=None):
 
         print("\n[TRAFFIC] All congestion flows started.")
         for process, flow in zip(processes, flows):
-            output = wait_for_process(process, timeout=DURATION + 30)
+            output = wait_for_process(process, timeout=duration_seconds + 30)
             flow_outputs.append((output, flow))
     finally:
         cleanup_errors = []
@@ -1291,15 +1294,18 @@ def burst(output_directory=None):
 
     print("\n[TRAFFIC] Burst scenario completed.")
 
-def moderate(rate_mbps: float = 6.0, *, output_directory=None):
-    """One configurable-rate UDP flow for 20 seconds."""
+def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=DURATION):
+    """One configurable-rate UDP flow for the requested duration."""
     if (
         isinstance(rate_mbps, bool)
         or not isinstance(rate_mbps, (int, float))
         or not math.isfinite(rate_mbps)
-        or rate_mbps <= 0
+        or not 0.1 <= rate_mbps <= 10
+        or abs(rate_mbps * 10 - round(rate_mbps * 10)) > 1e-8
     ):
-        raise ValueError("moderate rate must be a positive finite number")
+        raise ValueError("moderate rate must be between 0.1 and 10 Mbps in 0.1 Mbps increments")
+    if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int) or not 1 <= duration_seconds <= 60:
+        raise ValueError("moderate duration must be a whole number between 1 and 60 seconds")
 
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== MODERATE SCENARIO ===")
@@ -1314,7 +1320,7 @@ def moderate(rate_mbps: float = 6.0, *, output_directory=None):
 
     try:
         output = _run_udp_flow(
-            "h1", rate_mbps, 5201, DURATION, collector
+            "h1", rate_mbps, 5201, duration_seconds, collector
         )
     finally:
         summary = monitor.stop()
@@ -1347,8 +1353,14 @@ def main():
     parser.add_argument(
         "--rate-mbps",
         type=float,
-        default=6.0,
-        help="offered UDP rate for the moderate scenario (default: 6 Mbps)",
+        default=None,
+        help="offered UDP rate per flow (bounded by the guarded runner)",
+    )
+    parser.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=None,
+        help="traffic duration (Burst is fixed to its 23-second schedule)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1357,21 +1369,38 @@ def main():
     )
 
     args = parser.parse_args()
-    if args.scenario == "moderate" and (
-        not math.isfinite(args.rate_mbps) or args.rate_mbps <= 0
-    ):
-        parser.error("--rate-mbps must be a positive finite number")
-
+    if args.scenario in {"normal", "moderate", "congestion"}:
+        default_rate = {"normal": 3.0, "moderate": 6.0, "congestion": 4.0}[args.scenario]
+        rate = default_rate if args.rate_mbps is None else args.rate_mbps
+        duration = DURATION if args.duration_seconds is None else args.duration_seconds
+        if not math.isfinite(rate) or not 0.1 <= rate <= 10 or abs(rate * 10 - round(rate * 10)) > 1e-8:
+            parser.error("--rate-mbps must be between 0.1 and 10 Mbps per flow in 0.1 Mbps increments")
+        if not 1 <= duration <= 60:
+            parser.error("--duration-seconds must be between 1 and 60")
     if args.scenario == "normal":
-        normal(output_directory=args.output_dir)
+        normal(
+            output_directory=args.output_dir,
+            rate_mbps=3.0 if args.rate_mbps is None else args.rate_mbps,
+            duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+        )
 
     elif args.scenario == "congestion":
-        congestion(output_directory=args.output_dir)
+        congestion(
+            output_directory=args.output_dir,
+            rate_mbps=4.0 if args.rate_mbps is None else args.rate_mbps,
+            duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+        )
 
     elif args.scenario == "burst":
+        if args.rate_mbps not in (None, 8.0) or args.duration_seconds not in (None, 23):
+            parser.error("Burst uses a fixed 8 Mbps flow schedule lasting 23 seconds")
         burst(output_directory=args.output_dir)
     elif args.scenario == "moderate":
-        moderate(args.rate_mbps, output_directory=args.output_dir)
+        moderate(
+            6.0 if args.rate_mbps is None else args.rate_mbps,
+            output_directory=args.output_dir,
+            duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+        )
 
 
 if __name__ == "__main__":

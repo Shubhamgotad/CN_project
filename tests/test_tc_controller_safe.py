@@ -208,7 +208,7 @@ class FixtureTC:
         return SimpleNamespace(returncode=0, stdout=output, stderr="")
 
 
-def test_inspect_tc_state_uses_one_full_class_listing_and_validates_fixture(
+def test_inspect_tc_state_merges_root_and_nested_class_listings_and_validates_fixture(
     representative_tc_output,
 ):
     runner = FixtureTC(representative_tc_output)
@@ -218,7 +218,10 @@ def test_inspect_tc_state_uses_one_full_class_listing_and_validates_fixture(
         argv for argv in runner.commands
         if argv[:3] == ["tc", "-d", "class"]
     ]
-    assert class_queries == [["tc", "-d", "class", "show", "dev", "s1-eth5"]]
+    assert class_queries == [
+        ["tc", "-d", "class", "show", "dev", "s1-eth5"],
+        ["tc", "-d", "class", "show", "dev", "s1-eth5", "parent", "1:"],
+    ]
     class_ids = [
         line.split()[2]
         for line in state.classes.splitlines()

@@ -10,6 +10,7 @@ from .policy import (
     get_policy,
 )
 from .tc_controller import (
+    IsolatedHTBTarget,
     ManagedHTBConfig,
     apply_managed_htb_policy,
     apply_tc_commands,
@@ -17,12 +18,14 @@ from .tc_controller import (
     generate_managed_htb_commands,
     generate_tc_commands,
     restore_managed_htb_hierarchy,
+    restore_isolated_managed_htb_hierarchy,
     restore_original_hierarchy,
 )
 
 __all__ = [
     "CONGESTION_STATES",
     "MANAGED_HTB_PROFILES",
+    "IsolatedHTBTarget",
     "ManagedHTBConfig",
     "POLICY_PERCENTAGES",
     "TRAFFIC_CLASSES",
@@ -37,5 +40,6 @@ __all__ = [
     "get_policy",
     "plan_managed_htb",
     "restore_managed_htb_hierarchy",
+    "restore_isolated_managed_htb_hierarchy",
     "restore_original_hierarchy",
 ]

@@ -108,7 +108,7 @@ export function AppShell() {
             <span className={`connection-dot ${apiStatus === "connected" ? "connection-dot--connected" : ""}`} />
             <span>
               {apiStatus === "connected"
-                ? "Read-only API connected"
+                ? "Dashboard API connected"
                 : apiStatus === "checking"
                   ? "Checking API"
                   : apiStatus === "unavailable"
@@ -122,7 +122,7 @@ export function AppShell() {
         </header>
         <div className="page-container"><Outlet /></div>
         <footer className="app-footer">
-          <span>Adaptive QoS · Read-only integration</span>
+          <span>Adaptive QoS · Guarded execution integration</span>
           <span>Prediction plans are not policy applications.</span>
         </footer>
       </main>

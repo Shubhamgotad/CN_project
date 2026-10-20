@@ -61,9 +61,10 @@ def runner_report() -> dict:
 
 
 @pytest.fixture(autouse=True)
-def clear_api_configuration(monkeypatch):
+def clear_api_configuration(monkeypatch, tmp_path):
     monkeypatch.delenv(api.REPORT_DIRECTORY_ENV, raising=False)
     monkeypatch.delenv(api.TELEMETRY_FILE_ENV, raising=False)
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", tmp_path / "isolated-experiment-runs")
 
 
 def test_health_and_topology_are_typed_configured_not_live_claims():
@@ -71,9 +72,9 @@ def test_health_and_topology_are_typed_configured_not_live_claims():
     assert health.status_code == 200
     assert health.json() == {
         "status": "ok",
-        "service": "adaptive-qos-readonly-api",
+        "service": "adaptive-qos-dashboard-api",
         "api_version": api.API_VERSION,
-        "live_network_operations": False,
+        "live_network_operations": True,
     }
 
     topology = client.get("/api/topology")
@@ -89,6 +90,19 @@ def test_health_and_topology_are_typed_configured_not_live_claims():
         "bandwidth_mbps": 10.0,
         "delay": "10ms",
     }
+
+
+def test_api_has_no_network_changing_http_operations():
+    for path in (
+        "/api/health",
+        "/api/topology",
+        "/api/telemetry/latest",
+        "/api/telemetry/history",
+        "/api/reports",
+        "/api/experiments/status",
+    ):
+        response = client.post(path)
+        assert response.status_code == 405
 
 
 def test_latest_telemetry_is_explicitly_unavailable_without_source():
@@ -133,6 +147,8 @@ def test_latest_telemetry_reads_only_explicit_validated_person1_file(tmp_path, m
     body = response.json()
     assert body["status"] == "available"
     assert body["source"] == "configured_person1_jsonl"
+    assert body["record"]["source"] == "h1"
+    assert 0 <= body["measurement_age_seconds"] <= api.MAX_TELEMETRY_AGE_SECONDS
     assert body["record"]["throughput_mbps"] == 2.9
     assert body["record"]["queue_size"] is None
 
@@ -144,12 +160,216 @@ def test_stale_and_malformed_telemetry_are_not_reported_as_current(tmp_path, mon
         encoding="utf-8",
     )
     monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(source))
-    assert client.get("/api/telemetry/latest").json()["status"] == "stale"
+    stale = client.get("/api/telemetry/latest").json()
+    assert stale["status"] == "stale"
+    assert stale["record"]["source"] == "h1"
+    assert stale["measurement_age_seconds"] > api.MAX_TELEMETRY_AGE_SECONDS
 
     source.write_text('{"timestamp":"not a telemetry row"}\n', encoding="utf-8")
     body = client.get("/api/telemetry/latest").json()
     assert body["status"] == "unavailable"
     assert body["record"] is None
+
+
+def write_completed_run(root: Path, run_id: str, scenario: str, rows: list[str], *, status="completed", exit_code=0, alive=False):
+    run_dir = root / run_id
+    output = run_dir / "output"
+    output.mkdir(parents=True)
+    (run_dir / "state.json").write_text(json.dumps({
+        "experiment_id": run_id,
+        "scenario": scenario,
+        "status": status,
+        "process_alive": alive,
+        "process_exit_code": exit_code,
+        "output_directory": "/ignored/WSL/path/output",
+    }), encoding="utf-8")
+    (output / f"{scenario}.jsonl").write_text("".join(rows), encoding="utf-8")
+    return run_dir
+
+
+def test_latest_telemetry_discovers_fresh_completed_run_output(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    record = person1_telemetry(timestamp)
+    record["experiment_id"] = "producer-generated-id"
+    record["throughput_mbps"] = 2.997
+    write_completed_run(run_root, "d535edb82d3d4e3aa6ab19ac919cb205", "normal", [json.dumps(record) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    response = client.get("/api/telemetry/latest")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert body["source"] == "completed_experiment_person1_jsonl"
+    assert body["record"]["throughput_mbps"] == 2.997
+    assert body["record"]["scenario"] == "normal"
+    assert 0 <= body["measurement_age_seconds"] <= api.MAX_TELEMETRY_AGE_SECONDS
+
+
+def test_telemetry_history_returns_chronological_filtered_records_with_provenance(tmp_path, monkeypatch):
+    source = tmp_path / "selected-person1.jsonl"
+    rows = []
+    for source_host, timestamp in [
+        ("h2", "2026-01-01T10:02:00Z"),
+        ("h1", "2026-01-01T10:01:00Z"),
+        ("h1", "2026-01-01T10:03:00Z"),
+    ]:
+        payload = person1_telemetry(timestamp)
+        payload["source"] = source_host
+        payload["experiment_id"] = f"experiment-{source_host}-{timestamp[-9:-1]}"
+        payload["scenario"] = "normal" if source_host == "h1" else "congestion"
+        rows.append(json.dumps(payload) + "\n")
+    source.write_text("".join(rows), encoding="utf-8")
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(source))
+
+    response = client.get("/api/telemetry/history?host=h1&scenario=normal")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert body["host_filter"] == "h1"
+    assert body["scenario_filter"] == "normal"
+    assert [record["timestamp"] for record in body["records"]] == [
+        "2026-01-01T10:01:00Z",
+        "2026-01-01T10:03:00Z",
+    ]
+    assert all(record["source"] == "h1" for record in body["records"])
+    assert all(record["provenance"] == "configured_person1_jsonl" for record in body["records"])
+    assert body["records"][0]["interface"] == "s1-eth5"
+    assert body["records"][0]["experiment_id"].startswith("experiment-h1")
+
+
+def test_telemetry_history_preserves_nullable_measurements_and_rejects_malformed_lines(tmp_path, monkeypatch):
+    source = tmp_path / "history.jsonl"
+    payload = person1_telemetry("2026-01-01T10:00:00Z")
+    payload.update(queue_size=None, queue_drops=None)
+    missing_fields = json.dumps({"timestamp": "2026-01-01T10:01:00Z"})
+    invalid_timestamp = person1_telemetry("2026-01-01T10:02:00")
+    source.write_text(
+        json.dumps(payload) + "\n{malformed json}\n" + missing_fields + "\n"
+        + json.dumps(invalid_timestamp) + "\n{\"timestamp\":\"partial",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(source))
+
+    response = client.get("/api/telemetry/history")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert len(body["records"]) == 1
+    assert body["records"][0]["queue_size"] is None
+    assert body["records"][0]["queue_drops"] is None
+    assert body["records"][0]["measurement_direction"] is None
+    assert body["rejected_records"] == 3
+
+
+def test_telemetry_history_discovers_only_successfully_completed_experiment_outputs(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    payload = person1_telemetry("2026-01-01T10:00:00Z")
+    payload.update(experiment_id="producer-id", source="h3", scenario="moderate")
+    write_completed_run(
+        run_root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "moderate",
+        [json.dumps(payload) + "\n"],
+    )
+    write_completed_run(
+        run_root,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "normal",
+        [json.dumps(person1_telemetry("2026-01-01T10:01:00Z")) + "\n"],
+        status="running",
+        alive=True,
+        exit_code=None,
+    )
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    response = client.get("/api/telemetry/history?host=h3&scenario=moderate")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert body["source_kinds"] == ["completed_experiment_person1_jsonl"]
+    assert body["records"][0]["provenance"] == "completed_experiment_person1_jsonl"
+    assert body["records"][0]["source"] == "h3"
+    assert body["records"][0]["scenario"] == "moderate"
+
+
+def test_telemetry_history_reports_empty_history_and_rejects_invalid_filters_and_paths(tmp_path, monkeypatch):
+    source = tmp_path / "empty.jsonl"
+    source.write_text("", encoding="utf-8")
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(source))
+
+    empty = client.get("/api/telemetry/history")
+    assert empty.status_code == 200
+    assert empty.json()["status"] == "unavailable"
+    assert empty.json()["records"] == []
+
+    assert client.get("/api/telemetry/history?host=h5").status_code == 422
+    assert client.get("/api/telemetry/history?scenario=unknown").status_code == 422
+    assert client.get("/api/telemetry/history?path=C%3A%5Csecret.jsonl").status_code == 422
+
+
+def test_telemetry_history_limit_is_bounded_and_keeps_latest_matching_rows(tmp_path, monkeypatch):
+    source = tmp_path / "history.jsonl"
+    rows = []
+    for minute in range(4):
+        payload = person1_telemetry(f"2026-01-01T10:0{minute}:00Z")
+        payload["experiment_id"] = f"experiment-{minute}"
+        rows.append(json.dumps(payload) + "\n")
+    source.write_text("".join(rows), encoding="utf-8")
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(source))
+
+    limited = client.get("/api/telemetry/history?limit=2")
+    assert limited.status_code == 200
+    body = limited.json()
+    assert body["limit"] == 2
+    assert body["total_records"] == 4
+    assert body["truncated"] is True
+    assert [record["timestamp"] for record in body["records"]] == [
+        "2026-01-01T10:02:00Z",
+        "2026-01-01T10:03:00Z",
+    ]
+    assert client.get(f"/api/telemetry/history?limit={api.MAX_TELEMETRY_HISTORY_RECORDS + 1}").status_code == 422
+
+
+def test_completed_run_stale_measurement_remains_stale(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    row = json.dumps(person1_telemetry("2020-01-01T00:00:00Z")) + "\n"
+    write_completed_run(run_root, "11111111111111111111111111111111", "normal", [row])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    body = client.get("/api/telemetry/latest").json()
+    assert body["status"] == "stale"
+    assert body["record"] is not None
+    assert body["measurement_age_seconds"] > api.MAX_TELEMETRY_AGE_SECONDS
+
+
+def test_missing_and_malformed_completed_run_output_is_unavailable(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    write_completed_run(run_root, "22222222222222222222222222222222", "normal", ["{broken json}\n"])
+    write_completed_run(run_root, "33333333333333333333333333333333", "normal", [], status="running", alive=True, exit_code=None)
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    body = client.get("/api/telemetry/latest").json()
+    assert body["status"] == "unavailable"
+    assert body["source"] == "none"
+    assert body["record"] is None
+
+
+def test_multiple_runs_choose_newest_valid_complete_measurement(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    older = json.dumps(person1_telemetry("2020-01-01T10:00:00Z")) + "\n"
+    newer_payload = person1_telemetry("2020-01-01T10:01:00Z")
+    newer_payload["throughput_mbps"] = 2.997
+    # A partial tail is ignored; the last complete valid row remains selectable.
+    write_completed_run(run_root, "44444444444444444444444444444444", "normal", [older])
+    write_completed_run(run_root, "55555555555555555555555555555555", "normal", [json.dumps(newer_payload) + "\n", "{partial"])
+    write_completed_run(run_root, "66666666666666666666666666666666", "normal", [json.dumps(person1_telemetry("2020-01-01T10:02:00Z")) + "\n"], status="failed")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    body = client.get("/api/telemetry/latest").json()
+    assert body["status"] == "stale"  # historical fixture timestamps are never made fresh
+    assert body["record"]["throughput_mbps"] == 2.997
+    assert body["record"]["timestamp"] == "2020-01-01T10:01:00Z"
 
 
 def test_telemetry_symlink_is_rejected(tmp_path, monkeypatch):

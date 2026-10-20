@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from qos.tc_controller import (
     SERVICE_CLASS_IDS,
     UNMATCHED_CLASS_ID,
     UNMATCHED_NETEM_HANDLE,
+    IsolatedHTBTarget,
     ManagedHTBConfig,
     TCApplyError,
     TCPreconditionError,
@@ -16,6 +18,7 @@ from qos.tc_controller import (
     generate_managed_htb_commands,
     inspect_tc_state,
     restore_managed_htb_hierarchy,
+    restore_isolated_managed_htb_hierarchy,
     restore_original_hierarchy,
 )
 
@@ -37,7 +40,7 @@ def managed_state(rates=None):
     rates = dict(rates or MANAGED_HTB_PROFILES["LOW"])
     qdiscs = [
         "qdisc htb 5: root refcnt 1 r2q 10 default 0x1 direct_packets_stat 0",
-        "qdisc htb 1: parent 5:1 r2q 10 default 0xf direct_packets_stat 0",
+        "qdisc htb 1: parent 5:1 r2q 10 default 0x15 direct_packets_stat 0",
     ]
     classes = [
         "class htb 5:1 root leaf 1: prio 0 rate 10Mbit ceil 10Mbit",
@@ -117,7 +120,7 @@ class MockManagedTC:
             self.state = {
                 "qdiscs": (
                     "qdisc htb 5: root refcnt 1 r2q 10 default 0x1 direct_packets_stat 0\n"
-                    "qdisc htb 1: parent 5:1 r2q 10 default 0xf direct_packets_stat 0\n"
+                    "qdisc htb 1: parent 5:1 r2q 10 default 0x15 direct_packets_stat 0\n"
                 ),
                 "classes": (
                     "class htb 5:1 root leaf 1: prio 0 rate 10Mbit ceil 10Mbit\n"
@@ -190,6 +193,59 @@ class MockManagedTC:
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
+class IsolatedMockRunner:
+    def __init__(self, *, namespace_inode=401, ifindex=11, peer_inode=402, peer_ifindex=12):
+        self.tc = MockManagedTC()
+        self.namespace_inode = namespace_inode
+        self.ifindex = ifindex
+        self.peer_inode = peer_inode
+        self.peer_ifindex = peer_ifindex
+        self.tc_commands = []
+
+    def __call__(self, argv, capture_output, text, check):
+        if argv[:4] == ["ip", "netns", "exec", "qosna12345678"]:
+            namespace, interface, inode, ifindex, peer_ifindex = (
+                "qosna12345678", "qosp12345678", self.namespace_inode,
+                self.ifindex, self.peer_ifindex,
+            )
+        elif argv[:4] == ["ip", "netns", "exec", "qosnb12345678"]:
+            namespace, interface, inode, ifindex, peer_ifindex = (
+                "qosnb12345678", "qosq12345678", self.peer_inode,
+                self.peer_ifindex, self.ifindex,
+            )
+        else:
+            return SimpleNamespace(returncode=2, stdout="", stderr="unexpected namespace")
+        command = argv[4:]
+        if command[:2] == ["stat", "-Lc"]:
+            return SimpleNamespace(returncode=0, stdout=f"{inode}\n", stderr="")
+        if command[:5] == ["ip", "-j", "-details", "link", "show"]:
+            rows = [
+                {"ifname": "lo", "ifindex": 1, "linkinfo": {"info_kind": "loopback"}},
+                {"ifname": interface, "ifindex": ifindex, "link_index": peer_ifindex,
+                 "linkinfo": {"info_kind": "veth"}},
+            ]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        if command and command[0] == "tc":
+            self.tc_commands.append(list(argv))
+            return self.tc(command, capture_output=capture_output, text=text, check=check)
+        return SimpleNamespace(returncode=2, stdout="", stderr="unexpected isolated command")
+
+
+def isolated_target(**changes):
+    values = {
+        "namespace": "qosna12345678",
+        "interface": "qosp12345678",
+        "namespace_inode": 401,
+        "ifindex": 11,
+        "peer_namespace": "qosnb12345678",
+        "peer_interface": "qosq12345678",
+        "peer_namespace_inode": 402,
+        "peer_ifindex": 12,
+    }
+    values.update(changes)
+    return IsolatedHTBTarget(**values)
+
+
 def test_planner_produces_all_three_exact_ten_mbps_profiles():
     unmatched = 1.0
     expected_totals = {"LOW": 10.0, "MEDIUM": 10.0, "HIGH": 10.0}
@@ -236,6 +292,22 @@ def test_generated_commands_have_five_leaves_and_default_unmatched_mapping():
     assert not any("filter add" in command and "flowid 1:15" in command for command in commands)
 
 
+def test_generated_udp_filter_commands_are_exact_and_ordered():
+    commands = generate_managed_htb_commands(plan_managed_htb("LOW"))
+    filters = [command for command in commands if "filter add" in command]
+
+    assert filters == [
+        "tc filter add dev s1-eth5 protocol ip parent 1: prio 10 u32 "
+        "match ip protocol 17 0xff match ip dport 5201 0xffff flowid 1:11",
+        "tc filter add dev s1-eth5 protocol ip parent 1: prio 20 u32 "
+        "match ip protocol 17 0xff match ip dport 5202 0xffff flowid 1:12",
+        "tc filter add dev s1-eth5 protocol ip parent 1: prio 30 u32 "
+        "match ip protocol 17 0xff match ip dport 5203 0xffff flowid 1:13",
+        "tc filter add dev s1-eth5 protocol ip parent 1: prio 40 u32 "
+        "match ip protocol 17 0xff match ip dport 5204 0xffff flowid 1:14",
+    ]
+
+
 @pytest.mark.parametrize("changes, message", [
     ({"service_allocations_mbps": {"gaming": 2, "video": 2, "web": 2, "bulk": 2}}, "total 10"),
     ({"service_allocations_mbps": {"gaming": -1, "video": 4, "web": 3, "bulk": 3}}, "positive"),
@@ -272,7 +344,7 @@ def test_apply_rejects_unexpected_managed_state(component):
             "  match 00000009/0000ffff at 20\n"
         )
     else:
-        state["qdiscs"] = state["qdiscs"].replace("default 0xf", "default 0xe")
+        state["qdiscs"] = state["qdiscs"].replace("default 0x15", "default 0x14")
     runner = MockManagedTC(state)
     with pytest.raises(TCPreconditionError):
         apply_managed_htb_policy(plan_managed_htb("LOW"), runner)
@@ -311,6 +383,98 @@ def test_apply_and_partial_failure_restore_original_hierarchy():
         apply_managed_htb_policy(plan_managed_htb("LOW"), failed)
     assert failed.state == baseline_state()
     assert any("handle 10:" in command for command in failed.mutations)
+
+
+def test_isolated_target_applies_only_inside_identity_verified_namespace():
+    target = isolated_target()
+    config = ManagedHTBConfig(
+        interface=target.interface,
+        total_bandwidth_mbps=10,
+        service_allocations_mbps=MANAGED_HTB_PROFILES["LOW"],
+        filter_priorities=MANAGED_FILTER_PRIORITIES,
+        isolated_target=target,
+    )
+    runner = IsolatedMockRunner()
+    assert len(apply_managed_htb_policy(config, runner)) == 16
+    assert runner.tc_commands
+    assert all(command[:4] == ["ip", "netns", "exec", "qosna12345678"] for command in runner.tc_commands)
+    assert not any("s1-eth5" in " ".join(command) for command in runner.tc_commands)
+    assert apply_managed_htb_policy(config, runner) == []
+    assert restore_isolated_managed_htb_hierarchy(target, runner)
+    assert runner.tc.state == baseline_state()
+
+
+def test_isolated_target_rejects_demo_and_unapproved_interfaces():
+    values = isolated_target().__dict__
+    with pytest.raises(ValueError, match="matched probe identity"):
+        IsolatedHTBTarget(**{**values, "interface": "s1-eth5"})
+    with pytest.raises(ValueError, match="matched probe identity"):
+        IsolatedHTBTarget(**{**values, "interface": "eth0"})
+    target = isolated_target()
+    with pytest.raises(ValueError, match="does not match its isolated target"):
+        ManagedHTBConfig(
+            interface="s1-eth5",
+            total_bandwidth_mbps=10,
+            service_allocations_mbps=MANAGED_HTB_PROFILES["LOW"],
+            filter_priorities=MANAGED_FILTER_PRIORITIES,
+            isolated_target=target,
+        )
+
+
+def test_isolated_target_identity_mismatch_fails_before_any_tc_command():
+    target = isolated_target()
+    config = ManagedHTBConfig(
+        interface=target.interface,
+        total_bandwidth_mbps=10,
+        service_allocations_mbps=MANAGED_HTB_PROFILES["LOW"],
+        filter_priorities=MANAGED_FILTER_PRIORITIES,
+        isolated_target=target,
+    )
+    runner = IsolatedMockRunner(namespace_inode=999)
+    with pytest.raises(TCPreconditionError, match="namespace identity changed"):
+        apply_managed_htb_policy(config, runner)
+    assert runner.tc_commands == []
+
+
+def test_managed_filter_ownership_ignores_only_valid_counter_lines():
+    from qos.tc_controller import TCState, _managed_htb_owned
+
+    state = managed_state()
+    state["filters"] = state["filters"].replace(
+        "  match 00001451/0000ffff at 20\n",
+        "  match 00001451/0000ffff at 20\n"
+        " Sent 768 bytes 8 pkt (dropped 0, overlimits 0 requeues 0)\n",
+        1,
+    )
+    assert _managed_htb_owned(TCState(**state))
+
+    state["filters"] = state["filters"].replace(
+        "Sent 768 bytes 8 pkt (dropped 0, overlimits 0 requeues 0)",
+        "Sent unknown counter values",
+    )
+    assert not _managed_htb_owned(TCState(**state))
+
+
+def test_managed_filter_ownership_accepts_linux_kernel_u32_readback():
+    from qos.tc_controller import TCState, _managed_htb_owned
+
+    state = managed_state()
+    rendered = []
+    for index, port in enumerate(FLOW_PORTS):
+        priority = MANAGED_FILTER_PRIORITIES[port]
+        class_id = tuple(SERVICE_CLASS_IDS.values())[index]
+        rendered.extend((
+            f"filter protocol ip pref {priority} u32 chain 0",
+            f"filter protocol ip pref {priority} u32 chain 0 fh {800 + index}: ht divisor 1",
+            f"filter protocol ip pref {priority} u32 chain 0 fh {800 + index}::800 "
+            f"order 2048 key ht {800 + index} bkt 0 *flowid {class_id} not_in_hw "
+            "(rule hit 8 success 8)",
+            "  match 00110000/00ff0000 at 8 (success 8 ) ",
+            f"  match 0000{port:04x}/0000ffff at 20 (success 8 ) ",
+            "  Sent 768 bytes 8 pkt (dropped 0, overlimits 0 requeues 0)",
+        ))
+    state["filters"] = "\n".join(rendered) + "\n"
+    assert _managed_htb_owned(TCState(**state))
 
 
 def test_apply_rollback_verifies_and_reports_failed_restoration():

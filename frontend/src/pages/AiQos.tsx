@@ -14,9 +14,10 @@ import {
   backendConnection,
   getReport,
   getReports,
+  getQosDryRunDecision,
   parseRunnerReport,
 } from "../api/client";
-import type { ApiReportSummary } from "../api/client";
+import type { ApiQosDryRunDecision, ApiReportSummary } from "../api/client";
 import { PROFILE_ALLOCATIONS } from "../data/demo";
 import type { CongestionClass, ImportedRunnerReport } from "../types";
 
@@ -36,6 +37,8 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
   const [apiReportMessage, setApiReportMessage] = useState("");
   const [apiError, setApiError] = useState("");
   const [loadingReport, setLoadingReport] = useState("");
+  const [dryRunDecision, setDryRunDecision] = useState<ApiQosDryRunDecision | null>(null);
+  const [decisionError, setDecisionError] = useState("");
   const record = report?.records[selectedRecord] ?? report?.records[0] ?? null;
 
   useEffect(() => {
@@ -51,6 +54,36 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
     });
     return () => {
       active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!backendConnection.baseUrl) return;
+    let active = true;
+    let pending = false;
+    const refreshDecision = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const response = await getQosDryRunDecision();
+        if (active) {
+          setDryRunDecision(response);
+          setDecisionError("");
+        }
+      } catch (reason) {
+        if (active) {
+          setDryRunDecision(null);
+          setDecisionError(reason instanceof Error ? reason.message : "Could not load the dry-run decision.");
+        }
+      } finally {
+        pending = false;
+      }
+    };
+    void refreshDecision();
+    const timer = window.setInterval(() => void refreshDecision(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -123,12 +156,67 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
         </section>
       )}
 
+      <section className="card qos-dry-run-card" aria-labelledby="qos-dry-run-title">
+        <div className="section-heading">
+          <div>
+            <h2 id="qos-dry-run-title">Dry Run — Not Applied</h2>
+            <p>Freshness-checked telemetry is classified by existing rules. This is separate from model predictions in imported offline reports, and no proposed profile is applied to the network.</p>
+          </div>
+          <span className={`status-pill ${dryRunDecision?.status === "ready" ? "status-pill--surface" : "status-pill--muted"}`}>
+            {dryRunDecision?.status === "ready"
+              ? `Telemetry ${dryRunDecision.telemetry_status} · ${dryRunDecision.measurement_age_seconds?.toFixed(1) ?? "?"}s old`
+              : decisionError ? "Decision API error" : `No decision · ${dryRunDecision?.telemetry_status ?? "loading"}`}
+          </span>
+        </div>
+        {decisionError ? (
+          <p className="inline-error" role="alert">{decisionError}</p>
+        ) : dryRunDecision?.status === "ready" && dryRunDecision.measurement && dryRunDecision.proposed_policy ? (
+          <>
+            <div className="qos-dry-run-summary">
+              <div><small>Rule-based classification</small><strong>{dryRunDecision.classification} · score {dryRunDecision.score}</strong><span>Threshold result, not a model prediction</span></div>
+              <div><small>Current dry-run profile</small><strong>{dryRunDecision.selected_profile ?? "None"}</strong><span>Proposed selection only; not the applied network profile</span></div>
+              <div><small>Candidate profile</small><strong>{dryRunDecision.candidate_profile ?? "None"}</strong><span>{dryRunDecision.candidate_profile ? "Awaiting stabilization" : "No profile change pending"}</span></div>
+              <div><small>Hysteresis samples</small><strong>{dryRunDecision.hysteresis_samples_observed} / {dryRunDecision.hysteresis_samples_required}</strong><span>Distinct qualifying telemetry records</span></div>
+              <div><small>Cooldown remaining</small><strong>{dryRunDecision.candidate_profile ? `${dryRunDecision.cooldown_remaining_seconds.toFixed(1)}s` : "Not pending"}</strong><span>{dryRunDecision.candidate_profile ? `Minimum ${dryRunDecision.cooldown_seconds.toFixed(0)}s since the current profile was selected` : "Applies while a candidate profile is pending"}</span></div>
+            </div>
+            <div className="qos-dry-run-measurement">
+              <strong>Validated measurement</strong>
+              <span>Record source: {dryRunDecision.telemetry_source}</span>
+              <span>{dryRunDecision.measurement.source} · {dryRunDecision.measurement.scenario} · {dryRunDecision.measurement.interface}</span>
+              <span>{new Date(dryRunDecision.measurement.timestamp).toLocaleString()} · {dryRunDecision.measurement.throughput_mbps.toFixed(3)} Mbps throughput · {dryRunDecision.measurement.utilization_percent.toFixed(2)}% utilization</span>
+              <span>{dryRunDecision.measurement.latency_ms.toFixed(3)} ms latency · {dryRunDecision.measurement.jitter_ms.toFixed(3)} ms jitter · {dryRunDecision.measurement.packet_loss_percent.toFixed(3)}% loss</span>
+            </div>
+            <div className="qos-dry-run-policy">
+              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>{dryRunDecision.proposed_policy.interface} · {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps root · dry-run only · not applied</span></div>
+              <div className="qos-dry-run-rates">
+                {Object.entries(dryRunDecision.proposed_policy.service_allocations_mbps).map(([service, rate]) => <span key={service}>{service}: {rate.toFixed(2)} Mbps</span>)}
+                <span>unmatched: {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(2)} Mbps</span>
+              </div>
+              <details><summary>Show proposed tc commands (not executed)</summary><pre>{dryRunDecision.tc_commands.join("\n")}</pre></details>
+            </div>
+            <div className="qos-dry-run-explanation"><strong>Why this profile</strong><ul>{dryRunDecision.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
+            <p className="qos-dry-run-note">{dryRunDecision.message} Existing network settings have not been read or verified.</p>
+          </>
+        ) : (
+          <div className="qos-dry-run-empty" role="status">
+            <strong>{dryRunDecision?.status === "stale" ? "Telemetry is stale" : "No safe QoS decision available"}</strong>
+            <span>{dryRunDecision?.message ?? "Waiting for a validated telemetry response."}</span>
+            <span>Stale, unavailable, or unsupported telemetry never produces a policy proposal.</span>
+          </div>
+        )}
+        {dryRunDecision && dryRunDecision.history.length > 0 && (
+          <details className="qos-dry-run-history"><summary>Decision history ({dryRunDecision.history.length})</summary>
+            <ul>{dryRunDecision.history.map((item, index) => <li key={`${item.measurement_timestamp}-${index}`}>{item.timestamp} · {item.classification} · selected {item.selected_profile} · {item.transition.replaceAll("_", " ")}</li>)}</ul>
+          </details>
+        )}
+      </section>
+
       <section className="card artifact-import">
         <div className="artifact-import__copy">
           <span className="section-icon"><FileJson2 size={19} /></span>
           <div>
             <h2>Import an offline prediction report</h2>
-            <p>The existing Python runner loads the saved model and plans QoS without applying tc. Import its JSON output here.</p>
+          <p>The existing Python runner loads the saved model and plans QoS without applying tc. Import its JSON output here. Model predictions below come only from a successfully imported report.</p>
           </div>
         </div>
         <label className="button button--secondary upload-button">

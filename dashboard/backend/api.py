@@ -1,8 +1,9 @@
-"""Read-only HTTP API for configured Adaptive QoS artifacts."""
+"""Adaptive QoS dashboard API with allowlisted, guarded traffic execution."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import ipaddress
 import json
 import math
 import os
@@ -11,11 +12,12 @@ import re
 import stat
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai.prediction.telemetry import adapt_person1_telemetry
+from dashboard.backend.decision_loop import decision_loop
 
 
 API_VERSION = "0.1.0"
@@ -23,9 +25,15 @@ MAX_REPORT_BYTES = 5 * 1024 * 1024
 MAX_TELEMETRY_BYTES = 5 * 1024 * 1024
 MAX_TELEMETRY_AGE_SECONDS = 300
 MAX_FUTURE_SKEW_SECONDS = 30
+MAX_TELEMETRY_HISTORY_RECORDS = 500
+MAX_TELEMETRY_HISTORY_RUNS = 100
+MAX_TELEMETRY_HISTORY_SCAN_RECORDS = 20_000
+MAX_TELEMETRY_HISTORY_BYTES = 25 * 1024 * 1024
+EXPERIMENT_RUN_ROOT = Path(__file__).resolve().parents[2].parent / ".adaptive-qos-runs"
 REPORT_DIRECTORY_ENV = "ADAPTIVE_QOS_REPORT_DIR"
 TELEMETRY_FILE_ENV = "ADAPTIVE_QOS_TELEMETRY_FILE"
 REPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+EXPERIMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class APIModel(BaseModel):
@@ -34,9 +42,45 @@ class APIModel(BaseModel):
 
 class HealthResponse(APIModel):
     status: Literal["ok"] = "ok"
-    service: str = "adaptive-qos-readonly-api"
+    service: str = "adaptive-qos-dashboard-api"
     api_version: str = API_VERSION
-    live_network_operations: Literal[False] = False
+    live_network_operations: Literal[True] = True
+
+
+class ExperimentStartRequest(APIModel):
+    scenario: Literal["normal", "moderate", "congestion", "burst"]
+    rate_mbps: float | None = Field(default=None, ge=0.1, le=10)
+    duration_seconds: int | None = Field(default=None, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def validate_scenario_parameters(self):
+        if self.rate_mbps is not None and abs(self.rate_mbps * 10 - round(self.rate_mbps * 10)) > 1e-8:
+            raise ValueError("Rate must use 0.1 Mbps increments.")
+        if self.scenario == "burst":
+            if self.rate_mbps not in (None, 8, 8.0) or self.duration_seconds not in (None, 23):
+                raise ValueError("Burst uses a fixed 8 Mbps flow schedule lasting 23 seconds (five 3-second bursts with 2-second gaps).")
+        return self
+
+
+class ExperimentResponse(APIModel):
+    experiment_id: str
+    scenario: Literal["normal", "moderate", "congestion", "burst"]
+    status: Literal["starting", "running", "stopping", "completed", "failed", "stopped"]
+    flows: list[str]
+    target_rate_mbps: float
+    duration_seconds: int
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    elapsed_seconds: float
+    process_alive: bool
+    can_stop: bool
+    process_exit_code: int | None = None
+    error: str | None = None
+
+
+class ExperimentStartResponse(ExperimentResponse):
+    pass
 
 
 class TopologyHost(APIModel):
@@ -76,15 +120,80 @@ class TelemetryRecordResponse(APIModel):
     queue_drops: int | None
     measurement_direction: str | None
     interface: str = "s1-eth5"
+    bandwidth_mbps: float | None = None
+    utilization_percent: float | None = None
+    active_flows: int | None = None
 
 
 class LatestTelemetryResponse(APIModel):
     status: Literal["available", "stale", "unavailable"]
-    source: Literal["configured_person1_jsonl", "none"]
+    source: Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl", "none"]
     measurement_age_seconds: float | None = None
     stale_after_seconds: int = MAX_TELEMETRY_AGE_SECONDS
     message: str
     record: TelemetryRecordResponse | None = None
+
+
+class TelemetryHistoryRecordResponse(APIModel):
+    timestamp: str
+    experiment_id: str
+    scenario: str
+    source: str
+    destination: str
+    traffic_type: str
+    requested_mbps: float
+    throughput_mbps: float
+    latency_ms: float | None
+    jitter_ms: float | None
+    packet_loss_percent: float | None
+    lost_packets: int
+    total_packets: int
+    bandwidth_mbps: float
+    utilization_percent: float
+    active_flows: int
+    queue_size: int | None
+    queue_drops: int | None
+    measurement_direction: str | None = None
+    interface: str = "s1-eth5"
+    provenance: Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl"]
+
+
+class TelemetryHistoryResponse(APIModel):
+    status: Literal["available", "unavailable"]
+    message: str
+    source_kinds: list[Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl"]]
+    host_filter: str | None = None
+    scenario_filter: str | None = None
+    limit: int
+    total_records: int
+    truncated: bool
+    rejected_records: int
+    records: list[TelemetryHistoryRecordResponse]
+
+
+class DryRunDecisionResponse(APIModel):
+    status: Literal["ready", "stale", "unavailable"]
+    dry_run: Literal[True] = True
+    applied: Literal[False] = False
+    telemetry_status: Literal["available", "stale", "unavailable"]
+    telemetry_source: Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl", "none"]
+    measurement_age_seconds: float | None = None
+    measurement: dict[str, Any] | None = None
+    classifier: Literal["existing_rule_based_thresholds"]
+    classification: Literal["LOW", "MEDIUM", "HIGH"] | None = None
+    score: int | None = None
+    selected_profile: Literal["LOW", "MEDIUM", "HIGH"] | None = None
+    candidate_profile: Literal["LOW", "MEDIUM", "HIGH"] | None = None
+    transition: str
+    hysteresis_samples_required: int
+    hysteresis_samples_observed: int
+    cooldown_seconds: float
+    cooldown_remaining_seconds: float
+    reasons: list[str]
+    proposed_policy: dict[str, Any] | None = None
+    tc_commands: list[str]
+    history: list[dict[str, Any]]
+    message: str
 
 
 class ReportSummary(APIModel):
@@ -293,6 +402,146 @@ def _read_configured_telemetry_text(path: Path) -> str:
                 os.close(descriptor)
     except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
         raise ValueError("configured telemetry is unavailable or unsafe") from exc
+
+
+def _telemetry_timestamp(payload: Any) -> datetime:
+    """Validate a Person-1 row and return its real measurement timestamp."""
+    adapt_person1_telemetry(payload, interface="s1-eth5")
+    value = payload["timestamp"]
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("telemetry timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _completed_experiment_telemetry(
+    *,
+    max_run_directories: int | None = None,
+    max_total_bytes: int | None = None,
+    max_records: int | None = None,
+    rejected_record_counter: list[int] | None = None,
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """Read valid records only from successful, completed guarded runs.
+
+    Paths are derived from this repository's fixed run root; output_directory
+    stored in WSL state is intentionally never treated as a Windows path.
+    """
+    root = EXPERIMENT_RUN_ROOT
+    if root.is_symlink() or not root.is_dir():
+        return []
+    try:
+        run_directories = list(root.iterdir())
+    except OSError:
+        return []
+
+    run_directories = [
+        path for path in run_directories
+        if EXPERIMENT_ID_PATTERN.fullmatch(path.name) and not path.is_symlink() and path.is_dir()
+    ]
+    if max_run_directories is not None and len(run_directories) > max_run_directories:
+        raise HTTPException(status_code=503, detail="Telemetry history exceeds the supported experiment-directory scan limit.")
+
+    candidates: list[tuple[datetime, dict[str, Any]]] = []
+    total_bytes = 0
+    for run_dir in run_directories:
+        state_path = run_dir / "state.json"
+        output_dir = run_dir / "output"
+        try:
+            if state_path.is_symlink() or not state_path.is_file():
+                continue
+            state_content = _read_configured_telemetry_text(state_path)
+            total_bytes += len(state_content.encode("utf-8"))
+            if max_total_bytes is not None and total_bytes > max_total_bytes:
+                raise HTTPException(status_code=503, detail="Telemetry history exceeds the supported read-size limit.")
+            state = json.loads(state_content)
+            if (
+                not isinstance(state, dict)
+                or state.get("experiment_id") != run_dir.name
+                or state.get("status") != "completed"
+                or state.get("process_alive") is not False
+                or state.get("process_exit_code") != 0
+                or state.get("scenario") not in {"normal", "moderate", "congestion", "burst"}
+                or output_dir.is_symlink()
+                or not output_dir.is_dir()
+            ):
+                continue
+            telemetry_path = output_dir / f"{state['scenario']}.jsonl"
+            if telemetry_path.is_symlink() or not telemetry_path.is_file():
+                continue
+            content = _read_configured_telemetry_text(telemetry_path)
+            total_bytes += len(content.encode("utf-8"))
+            if max_total_bytes is not None and total_bytes > max_total_bytes:
+                raise HTTPException(status_code=503, detail="Telemetry history exceeds the supported read-size limit.")
+        except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+        # A final unterminated line may be a concurrent/partial write. Completed
+        # producer files end each JSONL row with a newline; ignore that tail.
+        complete_content = content[: content.rfind("\n") + 1]
+        for line in complete_content.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line, parse_constant=_json_constant)
+                timestamp = _telemetry_timestamp(payload)
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                if rejected_record_counter is not None:
+                    rejected_record_counter[0] += 1
+                continue
+            candidates.append((timestamp, payload))
+            if max_records is not None and len(candidates) > max_records:
+                raise HTTPException(status_code=503, detail="Telemetry history exceeds the supported record-scan limit.")
+    return candidates
+
+
+def _complete_jsonl_records(content: str) -> tuple[list[tuple[datetime, dict[str, Any]]], int]:
+    """Validate complete JSONL lines and ignore an unterminated concurrent-write tail."""
+    complete_content = content[: content.rfind("\n") + 1]
+    rejected = 0
+    records: list[tuple[datetime, dict[str, Any]]] = []
+    future_limit = datetime.now(timezone.utc).timestamp() + MAX_FUTURE_SKEW_SECONDS
+    for line in complete_content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line, parse_constant=_json_constant)
+            timestamp = _telemetry_timestamp(payload)
+            if timestamp.timestamp() > future_limit:
+                raise ValueError("telemetry timestamp is too far in the future")
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            rejected += 1
+            continue
+        records.append((timestamp, payload))
+        if len(records) > MAX_TELEMETRY_HISTORY_SCAN_RECORDS:
+            raise HTTPException(status_code=503, detail="Telemetry history exceeds the supported record-scan limit.")
+    return records, rejected
+
+
+def _history_record(payload: dict[str, Any], provenance: str) -> TelemetryHistoryRecordResponse:
+    """Project a validated Person-1 row without deriving or filling measurements."""
+    return TelemetryHistoryRecordResponse(
+        timestamp=payload["timestamp"],
+        experiment_id=payload["experiment_id"],
+        scenario=payload["scenario"],
+        source=payload["source"],
+        destination=payload["destination"],
+        traffic_type=payload["traffic_type"],
+        requested_mbps=payload["requested_mbps"],
+        throughput_mbps=payload["throughput_mbps"],
+        latency_ms=payload["latency_ms"],
+        jitter_ms=payload["jitter_ms"],
+        packet_loss_percent=payload["packet_loss_percent"],
+        lost_packets=payload["lost_packets"],
+        total_packets=payload["total_packets"],
+        bandwidth_mbps=payload["bandwidth_mbps"],
+        utilization_percent=payload["utilization_percent"],
+        active_flows=payload["active_flows"],
+        queue_size=payload["queue_size"],
+        queue_drops=payload["queue_drops"],
+        measurement_direction=payload.get("measurement_direction"),
+        interface="s1-eth5",
+        provenance=provenance,
+    )
 
 
 def _configured_report_root() -> Path | None:
@@ -630,14 +879,118 @@ app.add_middleware(
         "http://localhost:5174",
     ],
     allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["Accept"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Accept", "Content-Type"],
 )
+
+
+_LOCAL_ORIGINS = {
+    "http://127.0.0.1:5173", "http://localhost:5173",
+    "http://127.0.0.1:5174", "http://localhost:5174",
+}
+_LOCAL_HOSTS = {"127.0.0.1:8000", "localhost:8000"}
+
+
+def _require_local_mutation(request: Request) -> None:
+    # Browser mutations require an exact local Vite Origin and a loopback API Host.
+    # This rejects cross-site browser requests and requests sent through a LAN host.
+    client_host = request.client.host if request.client else ""
+    try:
+        client_is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        client_is_loopback = False
+    if (
+        request.headers.get("origin") not in _LOCAL_ORIGINS
+        or request.headers.get("host", "").lower() not in _LOCAL_HOSTS
+        or not client_is_loopback
+    ):
+        raise HTTPException(status_code=403, detail="Traffic execution is restricted to the local dashboard origin.")
+
+
+def _public_experiment(state: dict[str, Any]) -> ExperimentResponse:
+    # Deliberately omit WSL PIDs, filesystem paths, command arguments, and logs.
+    try:
+        return ExperimentResponse(
+            experiment_id=state["experiment_id"], scenario=state["scenario"], status=state["status"],
+            flows=state["flows"], target_rate_mbps=state["target_rate_mbps"],
+            duration_seconds=state["duration_seconds"], created_at=state["created_at"],
+            started_at=state.get("started_at"), finished_at=state.get("finished_at"),
+            elapsed_seconds=max(0.0, float(state.get("elapsed_seconds", 0))),
+            process_alive=bool(state.get("process_alive")), can_stop=bool(state.get("can_stop")),
+            process_exit_code=state.get("process_exit_code"), error=state.get("error"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="The execution supervisor returned invalid state.") from exc
+
+
+def _execution_call(
+    action: str,
+    experiment_id: str | None = None,
+    scenario: str | None = None,
+    rate_mbps: float | None = None,
+    duration_seconds: int | None = None,
+) -> dict[str, Any]:
+    from dashboard.backend.execution_manager import (
+        ExecutionNotFound, ExecutionUnavailable, TopologyUnavailable, invoke_supervisor,
+    )
+
+    try:
+        if action == "start":
+            return invoke_supervisor(action, experiment_id, scenario, rate_mbps, duration_seconds)
+        return invoke_supervisor(action, experiment_id, scenario)
+    except TopologyUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ExecutionNotFound as exc:
+        raise HTTPException(status_code=404, detail="Experiment was not found.") from exc
+    except ExecutionUnavailable as exc:
+        status_code = 409 if "already active" in str(exc).lower() else 503
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse()
+
+
+@app.post("/api/experiments/start", response_model=ExperimentStartResponse)
+def start_traffic(request: Request, body: ExperimentStartRequest) -> ExperimentStartResponse:
+    _require_local_mutation(request)
+    from uuid import uuid4
+
+    defaults = {
+        "normal": (3.0, 20),
+        "moderate": (6.0, 20),
+        "congestion": (4.0, 20),
+        "burst": (8.0, 23),
+    }[body.scenario]
+    rate_mbps = defaults[0] if body.rate_mbps is None else body.rate_mbps
+    duration_seconds = defaults[1] if body.duration_seconds is None else body.duration_seconds
+    state = _execution_call(
+        "start", uuid4().hex, body.scenario, rate_mbps, duration_seconds
+    )
+    return ExperimentStartResponse(**_public_experiment(state).model_dump())
+
+
+@app.get("/api/execution/active", response_model=ExperimentResponse | None)
+def get_active_traffic_execution() -> ExperimentResponse | None:
+    state = _execution_call("active")
+    return _public_experiment(state) if state is not None else None
+
+
+@app.get("/api/execution/{experiment_id}", response_model=ExperimentResponse)
+def get_traffic_execution(experiment_id: str) -> ExperimentResponse:
+    if not re.fullmatch(r"[0-9a-f]{32}", experiment_id):
+        raise HTTPException(status_code=404, detail="Experiment was not found.")
+    state = _execution_call("status", experiment_id)
+    return _public_experiment(state)
+
+
+@app.post("/api/experiments/{experiment_id}/stop", response_model=ExperimentResponse)
+def stop_traffic(request: Request, experiment_id: str) -> ExperimentResponse:
+    _require_local_mutation(request)
+    if not re.fullmatch(r"[0-9a-f]{32}", experiment_id):
+        raise HTTPException(status_code=404, detail="Experiment was not found.")
+    return _public_experiment(_execution_call("stop", experiment_id))
 
 
 @app.get("/api/topology", response_model=TopologyResponse)
@@ -665,52 +1018,63 @@ def topology() -> TopologyResponse:
 @app.get("/api/telemetry/latest", response_model=LatestTelemetryResponse)
 def latest_telemetry() -> LatestTelemetryResponse:
     configured = os.environ.get(TELEMETRY_FILE_ENV)
-    if not configured or not configured.strip():
-        return LatestTelemetryResponse(
-            status="unavailable",
-            source="none",
-            message=(
-                "No telemetry file is configured. Set ADAPTIVE_QOS_TELEMETRY_FILE "
-                "to an explicitly selected Person-1 JSONL file."
-            ),
-        )
-    source_path = Path(configured).expanduser()
-    try:
-        content = _read_configured_telemetry_text(source_path)
-        record_data: dict[str, Any] | None = None
-        for line in content.splitlines():
-            if not line.strip():
-                continue
-            payload = json.loads(line, parse_constant=_json_constant)
-            adapt_person1_telemetry(payload, interface="s1-eth5")
-            record_data = payload
-        if record_data is None:
-            raise ValueError
-        parsed_time = datetime.fromisoformat(
-            record_data["timestamp"].replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
-    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return LatestTelemetryResponse(
-            status="unavailable",
-            source="configured_person1_jsonl",
-            message="The configured telemetry file is missing, unsafe, empty, or invalid.",
-        )
+    candidates: list[tuple[datetime, dict[str, Any], str]] = []
+    if configured and configured.strip():
+        try:
+            content = _read_configured_telemetry_text(Path(configured).expanduser())
+            record_data: dict[str, Any] | None = None
+            for line in content.splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line, parse_constant=_json_constant)
+                _telemetry_timestamp(payload)
+                record_data = payload
+            if record_data is None:
+                raise ValueError("configured telemetry has no complete rows")
+            candidates.append((
+                _telemetry_timestamp(record_data),
+                record_data,
+                "configured_person1_jsonl",
+            ))
+        except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+
+    candidates.extend(
+        (timestamp, payload, "completed_experiment_person1_jsonl")
+        for timestamp, payload in _completed_experiment_telemetry()
+    )
+    if not candidates:
+        if configured and configured.strip():
+            source = "configured_person1_jsonl"
+            message = "The configured telemetry file is missing, unsafe, empty, or invalid; no valid completed experiment measurement was found."
+        else:
+            source = "none"
+            message = (
+                "No telemetry file is configured and no valid measurement from a completed experiment was found. "
+                "Set ADAPTIVE_QOS_TELEMETRY_FILE to an explicitly selected Person-1 JSONL file."
+            )
+        return LatestTelemetryResponse(status="unavailable", source=source, message=message)
+
+    parsed_time, record_data, source = max(candidates, key=lambda candidate: candidate[0])
 
     now = datetime.now(timezone.utc)
     age = (now - parsed_time).total_seconds()
     if age > MAX_TELEMETRY_AGE_SECONDS:
         status: Literal["available", "stale", "unavailable"] = "stale"
-        message = "Latest configured measurement is stale."
+        message = "Latest validated measurement is stale."
     elif age < -MAX_FUTURE_SKEW_SECONDS:
         status = "unavailable"
-        message = "Configured measurement timestamp is too far in the future."
+        message = "Latest measurement timestamp is too far in the future."
     else:
         status = "available"
-        message = "Latest validated record from the explicitly configured Person-1 JSONL file."
+        if source == "configured_person1_jsonl":
+            message = "Latest validated record from the explicitly configured Person-1 JSONL file."
+        else:
+            message = "Latest validated record from a successfully completed guarded experiment output."
 
     return LatestTelemetryResponse(
         status=status,
-        source="configured_person1_jsonl",
+        source=source,
         measurement_age_seconds=age,
         message=message,
         record=TelemetryRecordResponse(
@@ -724,8 +1088,104 @@ def latest_telemetry() -> LatestTelemetryResponse:
             queue_size=record_data["queue_size"],
             queue_drops=record_data["queue_drops"],
             measurement_direction=record_data.get("measurement_direction"),
+            bandwidth_mbps=record_data.get("bandwidth_mbps"),
+            utilization_percent=record_data.get("utilization_percent"),
+            active_flows=record_data.get("active_flows"),
         ),
     )
+
+
+@app.get("/api/telemetry/history", response_model=TelemetryHistoryResponse)
+def telemetry_history(
+    request: Request,
+    host: Literal["h1", "h2", "h3", "h4"] | None = Query(default=None),
+    scenario: Literal["normal", "moderate", "congestion", "burst"] | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=MAX_TELEMETRY_HISTORY_RECORDS),
+) -> TelemetryHistoryResponse:
+    """Return bounded, validated recorded telemetry; this endpoint never reads request paths."""
+    unsupported_parameters = set(request.query_params) - {"host", "scenario", "limit"}
+    if unsupported_parameters:
+        raise HTTPException(status_code=422, detail="Telemetry history accepts only host, scenario, and limit filters.")
+
+    candidates: list[tuple[datetime, dict[str, Any], str]] = []
+    source_kinds: set[str] = set()
+    rejected_records = [0]
+    total_bytes = 0
+
+    configured = os.environ.get(TELEMETRY_FILE_ENV)
+    if configured and configured.strip():
+        source_kinds.add("configured_person1_jsonl")
+        try:
+            content = _read_configured_telemetry_text(Path(configured).expanduser())
+            total_bytes += len(content.encode("utf-8"))
+            rows, rejected = _complete_jsonl_records(content)
+            rejected_records[0] += rejected
+            candidates.extend((timestamp, payload, "configured_person1_jsonl") for timestamp, payload in rows)
+        except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+
+    completed_records = _completed_experiment_telemetry(
+        max_run_directories=MAX_TELEMETRY_HISTORY_RUNS,
+        max_total_bytes=max(0, MAX_TELEMETRY_HISTORY_BYTES - total_bytes),
+        max_records=MAX_TELEMETRY_HISTORY_SCAN_RECORDS,
+        rejected_record_counter=rejected_records,
+    )
+    future_limit = datetime.now(timezone.utc).timestamp() + MAX_FUTURE_SKEW_SECONDS
+    for timestamp, payload in completed_records:
+        source_kinds.add("completed_experiment_person1_jsonl")
+        if timestamp.timestamp() > future_limit:
+            rejected_records[0] += 1
+            continue
+        candidates.append((timestamp, payload, "completed_experiment_person1_jsonl"))
+
+    # A configured file may also be a completed-run output. Keep one copy and
+    # prefer the explicitly configured provenance, matching /latest behavior.
+    deduplicated: dict[tuple[str, str, str, str], tuple[datetime, dict[str, Any], str]] = {}
+    for item in candidates:
+        timestamp, payload, provenance = item
+        key = (payload["experiment_id"], payload["timestamp"], payload["source"], payload["scenario"])
+        current = deduplicated.get(key)
+        if current is None or provenance == "configured_person1_jsonl":
+            deduplicated[key] = (timestamp, payload, provenance)
+
+    filtered = [
+        item for item in deduplicated.values()
+        if (host is None or item[1]["source"] == host)
+        and (scenario is None or item[1]["scenario"] == scenario)
+    ]
+    filtered.sort(key=lambda item: item[0])
+    total_records = len(filtered)
+    truncated = total_records > limit
+    selected_records = filtered[-limit:]
+
+    if selected_records:
+        message = "Validated timestamped records from recorded JSONL sources; these are historical measurements, not live telemetry."
+        status: Literal["available", "unavailable"] = "available"
+    elif candidates:
+        message = "No recorded telemetry matches the requested host and scenario filters."
+        status = "unavailable"
+    else:
+        message = "No valid records were found in the configured or completed-experiment telemetry sources."
+        status = "unavailable"
+
+    return TelemetryHistoryResponse(
+        status=status,
+        message=message,
+        source_kinds=sorted(source_kinds),
+        host_filter=host,
+        scenario_filter=scenario,
+        limit=limit,
+        total_records=total_records,
+        truncated=truncated,
+        rejected_records=rejected_records[0],
+        records=[_history_record(payload, provenance) for _, payload, provenance in selected_records],
+    )
+
+
+@app.get("/api/qos/decision", response_model=DryRunDecisionResponse)
+def qos_dry_run_decision() -> DryRunDecisionResponse:
+    """Return a validated, rule-based QoS proposal; never apply it to the network."""
+    return DryRunDecisionResponse(**decision_loop.evaluate(latest_telemetry()))
 
 
 def _list_report_summaries(root: Path) -> list[ReportSummary]:

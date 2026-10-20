@@ -263,6 +263,14 @@ def test_command_runner_is_only_used_for_explicit_non_dry_run(tmp_path, monkeypa
     assert not calls
     assert apply_calls
 
+    result["tc_commands"] = [*result["tc_commands"]]
+    result["tc_commands"][0] = result["tc_commands"][0].replace(
+        "default 15", "default 11"
+    )
+    with pytest.raises(ValueError, match="do not match"):
+        apply_integration_commands(result, runner=runner)
+    assert len(apply_calls) == 1
+
 def test_combined_person1_dataset_through_ml_to_qos(tmp_path):
     """Exercise every combined telemetry record without executing tc commands."""
     model_path = tmp_path / "model.joblib"

@@ -9,8 +9,8 @@ import type {
 } from "../types";
 
 export const backendConnection = {
-  baseUrl: import.meta.env.VITE_BACKEND_URL?.trim().replace(/\/+$/, "") || null,
-  message: "Read-only API requests use VITE_BACKEND_URL when configured.",
+  baseUrl: import.meta.env.VITE_BACKEND_URL?.trim().replace(/\/+$/, "") || "http://127.0.0.1:8000",
+  message: "Dashboard API requests use VITE_BACKEND_URL or the local development API.",
 };
 
 type JsonObject = Record<string, unknown>;
@@ -19,7 +19,27 @@ export interface ApiHealth {
   status: "ok";
   service: string;
   api_version: string;
-  live_network_operations: false;
+  live_network_operations: true;
+}
+
+export type ExecutionScenario = "normal" | "moderate" | "congestion" | "burst";
+export type ExecutionStatus = "starting" | "running" | "stopping" | "completed" | "failed" | "stopped";
+
+export interface ApiExecution {
+  experiment_id: string;
+  scenario: ExecutionScenario;
+  status: ExecutionStatus;
+  flows: string[];
+  target_rate_mbps: number;
+  duration_seconds: number;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  elapsed_seconds: number;
+  process_alive: boolean;
+  can_stop: boolean;
+  process_exit_code: number | null;
+  error: string | null;
 }
 
 export interface ApiTopology {
@@ -45,7 +65,7 @@ export interface ApiTopology {
 
 export interface ApiTelemetry {
   status: "available" | "stale" | "unavailable";
-  source: "configured_person1_jsonl" | "none";
+  source: "configured_person1_jsonl" | "completed_experiment_person1_jsonl" | "none";
   measurement_age_seconds: number | null;
   stale_after_seconds: number;
   message: string;
@@ -61,7 +81,108 @@ export interface ApiTelemetry {
     queue_drops: number | null;
     measurement_direction: string | null;
     interface: string;
+    bandwidth_mbps?: number | null;
+    utilization_percent?: number | null;
+    active_flows?: number | null;
   } | null;
+}
+
+export type TelemetryHistorySource = "configured_person1_jsonl" | "completed_experiment_person1_jsonl";
+
+export interface ApiTelemetryHistoryRecord {
+  timestamp: string;
+  experiment_id: string;
+  scenario: string;
+  source: string;
+  destination: string;
+  traffic_type: string;
+  requested_mbps: number;
+  throughput_mbps: number;
+  latency_ms: number | null;
+  jitter_ms: number | null;
+  packet_loss_percent: number | null;
+  lost_packets: number;
+  total_packets: number;
+  bandwidth_mbps: number;
+  utilization_percent: number;
+  active_flows: number;
+  queue_size: number | null;
+  queue_drops: number | null;
+  measurement_direction: string | null;
+  interface: string;
+  provenance: TelemetryHistorySource;
+}
+
+export interface ApiTelemetryHistory {
+  status: "available" | "unavailable";
+  message: string;
+  source_kinds: TelemetryHistorySource[];
+  host_filter: string | null;
+  scenario_filter: string | null;
+  limit: number;
+  total_records: number;
+  truncated: boolean;
+  rejected_records: number;
+  records: ApiTelemetryHistoryRecord[];
+}
+
+export interface TelemetryHistoryFilters {
+  host?: "h1" | "h2" | "h3" | "h4";
+  scenario?: "normal" | "moderate" | "congestion" | "burst";
+  limit?: number;
+}
+
+export interface ApiQosDryRunDecision {
+  status: "ready" | "stale" | "unavailable";
+  dry_run: true;
+  applied: false;
+  telemetry_status: ApiTelemetry["status"];
+  telemetry_source: ApiTelemetry["source"];
+  measurement_age_seconds: number | null;
+  measurement: {
+    timestamp: string;
+    source: string;
+    scenario: string;
+    interface: string;
+    throughput_mbps: number;
+    bandwidth_mbps: number;
+    utilization_percent: number;
+    latency_ms: number;
+    jitter_ms: number;
+    packet_loss_percent: number;
+    active_flows: number;
+    queue_size: number | null;
+    queue_drops: number | null;
+  } | null;
+  classifier: "existing_rule_based_thresholds";
+  classification: CongestionClass | null;
+  score: number | null;
+  selected_profile: CongestionClass | null;
+  candidate_profile: CongestionClass | null;
+  transition: string;
+  hysteresis_samples_required: number;
+  hysteresis_samples_observed: number;
+  cooldown_seconds: number;
+  cooldown_remaining_seconds: number;
+  reasons: string[];
+  proposed_policy: {
+    interface: string;
+    total_bandwidth_mbps: number;
+    service_allocations_mbps: Record<string, number>;
+    unmatched_rate_mbps: number;
+    unmatched_ceil_mbps: number;
+    default_class_id: string;
+    filter_priorities: Record<string, number>;
+  } | null;
+  tc_commands: string[];
+  history: Array<{
+    timestamp: string;
+    measurement_timestamp: string;
+    classification: CongestionClass;
+    selected_profile: CongestionClass;
+    transition: string;
+  }>;
+  message: string;
 }
 
 export interface ApiReportSummary {
@@ -145,12 +266,13 @@ export interface ApiExperimentsStatus {
   message: string;
 }
 
-async function requestJson<T>(path: string): Promise<T> {
+async function requestJson<T>(path: string, options: RequestInit = {}, allowNull = false): Promise<T> {
   if (!backendConnection.baseUrl) {
     throw new Error("Backend API URL is not configured. Set VITE_BACKEND_URL to enable API requests.");
   }
   const response = await fetch(`${backendConnection.baseUrl.replace(/\/+$/, "")}${path}`, {
-    headers: { Accept: "application/json" },
+    ...options,
+    headers: { Accept: "application/json", ...(options.headers ?? {}) },
   });
   let payload: unknown;
   try {
@@ -162,10 +284,27 @@ async function requestJson<T>(path: string): Promise<T> {
     const detail = payload !== null && typeof payload === "object" && !Array.isArray(payload)
       ? (payload as JsonObject).detail
       : null;
+    const method = (options.method ?? "GET").toUpperCase();
+    let explanation: string | null = typeof detail === "string" ? detail : null;
+    if (!explanation && Array.isArray(detail)) {
+      const validationMessages = detail.slice(0, 4).flatMap((item) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
+        const validation = item as JsonObject;
+        if (typeof validation.msg !== "string") return [];
+        const location = Array.isArray(validation.loc)
+          ? validation.loc.filter((part): part is string | number => typeof part === "string" || typeof part === "number").join(".")
+          : "request";
+        return [`${location}: ${validation.msg}`];
+      });
+      if (validationMessages.length > 0) explanation = validationMessages.join("; ");
+    }
     throw new Error(
-      typeof detail === "string" ? detail : `Backend API request failed (${response.status}).`,
+      explanation
+        ? `Backend rejected ${method} ${path} (${response.status}): ${explanation}`
+        : `Backend API request failed for ${method} ${path} (${response.status}).`,
     );
   }
+  if (payload === null && allowNull) return payload as T;
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Backend API returned an unexpected response shape.");
   }
@@ -184,6 +323,19 @@ export function getLatestTelemetry(): Promise<ApiTelemetry> {
   return requestJson<ApiTelemetry>("/api/telemetry/latest");
 }
 
+export function getTelemetryHistory(filters: TelemetryHistoryFilters = {}): Promise<ApiTelemetryHistory> {
+  const params = new URLSearchParams();
+  if (filters.host) params.set("host", filters.host);
+  if (filters.scenario) params.set("scenario", filters.scenario);
+  if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+  const query = params.size ? `?${params.toString()}` : "";
+  return requestJson<ApiTelemetryHistory>(`/api/telemetry/history${query}`);
+}
+
+export function getQosDryRunDecision(): Promise<ApiQosDryRunDecision> {
+  return requestJson<ApiQosDryRunDecision>("/api/qos/decision");
+}
+
 export function getReports(): Promise<ApiReports> {
   return requestJson<ApiReports>("/api/reports");
 }
@@ -197,6 +349,36 @@ export function getReport(reportId: string): Promise<ApiReportDetail> {
 
 export function getExperimentsStatus(): Promise<ApiExperimentsStatus> {
   return requestJson<ApiExperimentsStatus>("/api/experiments/status");
+}
+
+export function startTrafficExecution(
+  scenario: ExecutionScenario,
+  rate_mbps: number,
+  duration_seconds: number,
+): Promise<ApiExecution> {
+  return requestJson<ApiExecution>("/api/experiments/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario, rate_mbps, duration_seconds }),
+  });
+}
+
+export function getTrafficExecution(experimentId: string): Promise<ApiExecution> {
+  if (!/^[0-9a-f]{32}$/.test(experimentId)) throw new Error("Invalid experiment identifier.");
+  return requestJson<ApiExecution>(`/api/execution/${encodeURIComponent(experimentId)}`);
+}
+
+export function getActiveTrafficExecution(): Promise<ApiExecution | null> {
+  return requestJson<ApiExecution | null>("/api/execution/active", {}, true);
+}
+
+export function stopTrafficExecution(experimentId: string): Promise<ApiExecution> {
+  if (!/^[0-9a-f]{32}$/.test(experimentId)) throw new Error("Invalid experiment identifier.");
+  return requestJson<ApiExecution>(`/api/experiments/${encodeURIComponent(experimentId)}/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
 }
 
 export function apiReportToEvidenceReport(detail: ApiReportDetail): ImportedEvidenceReport {

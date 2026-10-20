@@ -132,7 +132,30 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
 .api-telemetry__metrics, .api-report-status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .api-telemetry__metrics > span, .api-report-status > span { display: flex; justify-content: space-between; gap: 8px; padding: 8px 9px; border: 1px solid rgba(112, 75, 58, .16); border-radius: 8px; color: var(--color-secondary); background: rgba(214, 191, 169, .19); font-size: 9px; }
 .api-telemetry__metrics strong, .api-report-status strong { color: var(--color-primary); text-align: right; }
+.traffic-telemetry { display: grid; gap: 12px; padding: 16px 18px; }
+.traffic-telemetry__content { display: grid; gap: 12px; }
+.traffic-telemetry__meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px 12px; color: var(--color-secondary); font-size: 9px; overflow-wrap: anywhere; }
+.traffic-telemetry__meta strong { color: var(--color-primary); }
+.traffic-telemetry__metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.traffic-telemetry__metrics > span { display: flex; justify-content: space-between; gap: 8px; padding: 8px 9px; border: 1px solid rgba(112, 75, 58, .16); border-radius: 8px; color: var(--color-secondary); background: rgba(214, 191, 169, .19); font-size: 9px; }
+.traffic-telemetry__metrics strong { color: var(--color-primary); text-align: right; }
+.traffic-telemetry__refresh { margin: 0; color: var(--color-secondary); font-size: 8px; }
 .api-report-card { display: grid; gap: 13px; padding: 17px; }
+.qos-dry-run-card { display: grid; gap: 14px; padding: 18px; border-color: rgba(53, 35, 28, .28); }
+.qos-dry-run-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; }
+.qos-dry-run-summary > div, .qos-dry-run-measurement, .qos-dry-run-policy, .qos-dry-run-explanation, .qos-dry-run-empty { min-width: 0; padding: 12px; border: 1px solid rgba(53, 35, 28, .18); border-radius: 10px; background: rgba(214, 191, 169, .3); }
+.qos-dry-run-summary > div { display: grid; gap: 5px; }
+.qos-dry-run-summary small { color: var(--color-secondary); }
+.qos-dry-run-summary span { color: var(--color-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.qos-dry-run-measurement, .qos-dry-run-policy, .qos-dry-run-empty { display: grid; gap: 7px; }
+.qos-dry-run-measurement span, .qos-dry-run-policy span, .qos-dry-run-empty span, .qos-dry-run-note { color: var(--color-secondary); overflow-wrap: anywhere; }
+.qos-dry-run-policy > div:first-child { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.qos-dry-run-rates { display: flex; flex-wrap: wrap; gap: 7px 14px; }
+.qos-dry-run-policy details pre { max-width: 100%; overflow-x: auto; padding: 10px; border-radius: 8px; background: var(--color-background); color: var(--color-primary); font-size: 12px; }
+.qos-dry-run-explanation ul, .qos-dry-run-history ul { margin: 7px 0 0; padding-left: 20px; color: var(--color-secondary); }
+.qos-dry-run-note { margin: 0; font-size: 12px; }
+.qos-dry-run-history { color: var(--color-secondary); overflow-wrap: anywhere; }
+@media (max-width: 720px) { .qos-dry-run-summary { grid-template-columns: 1fr; } }
 .api-report-status { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .api-report-list { display: grid; gap: 7px; }
 .api-report-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; border: 1px solid rgba(112, 75, 58, .15); border-radius: 8px; background: rgba(214, 191, 169, .16); }
@@ -260,7 +283,16 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
 .button--secondary { border-color: var(--color-secondary); color: var(--color-primary); background: transparent; }
 .button--secondary:hover { background: rgba(214, 191, 169, .42); }
 .button--disabled, .button:disabled { border-color: rgba(112, 75, 58, .18); color: rgba(112, 75, 58, .6); background: rgba(214, 191, 169, .3); cursor: not-allowed; }
-.disabled-reason { margin: 8px 0 0; color: var(--color-secondary); font-size: 9px; }
+.execution-notice { display: flex; align-items: flex-start; gap: 9px; min-width: 0; margin-top: 9px; padding: 9px 11px; border: 1px solid rgba(112, 75, 58, .2); border-radius: 8px; color: var(--color-primary); background: rgba(214, 191, 169, .24); }
+.execution-notice > svg { flex: 0 0 auto; margin-top: 1px; color: var(--color-secondary); }
+.execution-notice > div { display: grid; min-width: 0; gap: 3px; }
+.execution-notice strong { font-size: 9px; }
+.execution-notice span { color: var(--color-secondary); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.execution-state { display: grid; gap: 4px; margin: 12px 0 4px; padding: 12px; border: 1px solid rgba(112, 75, 58, .22); border-radius: 9px; background: rgba(214, 191, 169, .2); color: var(--color-primary); overflow-wrap: anywhere; }
+.execution-state > strong { font-size: 13px; text-transform: capitalize; }
+.execution-state > span { color: var(--color-secondary); font-size: 11px; line-height: 1.45; }
+.execution-state .execution-state__error { color: #963e32; }
+.text-button { display: inline-flex; align-items: center; gap: 5px; width: fit-content; border: 0; padding: 2px 0; color: var(--color-primary); background: transparent; cursor: pointer; font: inherit; }
 .inline-error { display: flex; align-items: center; gap: 7px; margin-top: 12px; padding: 9px 10px; border: 1px solid var(--color-secondary); border-radius: 8px; color: var(--color-primary); background: rgba(214, 191, 169, .5); font-size: 10px; }
 .flow-status-list { display: grid; gap: 0; margin-top: 13px; }
 .flow-status-row { display: flex; align-items: center; gap: 9px; padding: 10px 0; border-bottom: 1px solid rgba(112, 75, 58, .14); }
@@ -369,6 +401,8 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
   .page-intro h1 { font-size: 28px; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .api-telemetry__metrics, .api-report-status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .traffic-telemetry__metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .traffic-telemetry__meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .api-report-row { align-items: flex-start; }
   .report-source-banner { align-items: flex-start; flex-direction: column; }
   .metric-card { min-height: 101px; padding: 11px; }
