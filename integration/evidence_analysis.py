@@ -249,7 +249,7 @@ def _resolve_evidence_path(
     manifest_dir: Path,
 ) -> tuple[Path | None, str | None]:
     # Treat backslashes as separators too, even when validation runs on POSIX.
-    candidate = Path(reference.replace("\\\\", "/"))
+    candidate = Path(reference.replace("\\", "/"))
     windows_candidate = PureWindowsPath(reference)
     if candidate.is_absolute() or windows_candidate.is_absolute() or windows_candidate.drive:
         return None, "evidence_path must be relative to the manifest directory"
