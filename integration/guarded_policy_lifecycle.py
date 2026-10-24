@@ -152,7 +152,7 @@ def run_guarded_policy_lifecycle(
     report["pre_state_sha256"] = _state_digest(before)
     report["apply_attempted"] = True
 
-    operation_error: Exception | None = None
+    operation_error: BaseException | None = None
     try:
         apply_managed_htb_policy(config, runner=runner)
         active = inspect_tc_state(config.interface, runner=runner)
@@ -173,7 +173,9 @@ def run_guarded_policy_lifecycle(
         )
         report["measurement"] = json.loads(serialized_measurement)
         report["measurement_collected"] = True
-    except Exception as exc:  # always attempt guarded restoration after apply starts
+    except BaseException as exc:
+        # Also preserve the restoration attempt on Ctrl+C/SystemExit. Do not
+        # let process-level interruptions skip the cleanup block below.
         operation_error = exc
 
     try:
@@ -183,7 +185,7 @@ def run_guarded_policy_lifecycle(
         report["restoration_verified"] = True
         report["restored_state_sha256"] = restored_digest
         report["restoration_action_taken"] = restored_now
-    except Exception as restore_error:
+    except BaseException as restore_error:
         report["status"] = "restoration_failed"
         report["restoration_verified"] = False
         details = (
@@ -200,6 +202,9 @@ def run_guarded_policy_lifecycle(
         ) from restore_error
 
     if operation_error is not None:
+        if isinstance(operation_error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            # Cleanup succeeded; preserve the original process-level signal.
+            raise operation_error
         report["status"] = "operation_failed_baseline_restored"
         raise LifecycleSafetyError(
             f"policy lifecycle operation failed; baseline restoration was verified "
