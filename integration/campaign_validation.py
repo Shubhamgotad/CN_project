@@ -74,7 +74,7 @@ def _resolve_path(root: Path, value: Any, label: str) -> tuple[Path | None, str 
     if not isinstance(value, str) or not value.strip():
         return None, f"{label} must be a non-empty relative path"
     # Treat backslashes as separators too, even when validation runs on POSIX.
-    candidate = Path(value.replace("\\\\", "/"))
+    candidate = Path(value.replace("\\", "/"))
     windows_path = PureWindowsPath(value)
     if candidate.is_absolute() or windows_path.is_absolute() or windows_path.drive:
         return None, f"{label} must be relative to the campaign directory"
