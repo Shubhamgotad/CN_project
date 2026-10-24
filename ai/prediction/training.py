@@ -37,6 +37,7 @@ def train_random_forest(
     random_state: int = 42,
     thresholds: CongestionThresholds = DEFAULT_THRESHOLDS,
 ) -> dict[str, object]:
+    """Train with a row-level split, which is not experiment-group leakage-safe."""
     dataset = create_dataset(records, thresholds)
     features, labels = split_features_and_labels(dataset)
     class_count = labels.nunique()
@@ -79,6 +80,13 @@ def train_candidate_model(
     features, labels = split_features_and_labels(dataset)
     if features.isna().any().any():
         raise ValueError("candidate features cannot contain missing values")
+    raw_feature_values = features.to_numpy(dtype=object)
+    if any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        for value in raw_feature_values.flat
+    ):
+        raise ValueError("candidate features must be numeric")
     try:
         feature_values = features.to_numpy(dtype=float)
     except (TypeError, ValueError) as exc:
@@ -94,7 +102,12 @@ def train_candidate_model(
         )
     if isinstance(groups, (str, bytes)):
         raise ValueError("groups must contain one experiment ID per dataset row")
-    group_values = list(groups)
+    try:
+        group_values = list(groups)
+    except TypeError as exc:
+        raise ValueError(
+            "groups must contain one experiment ID per dataset row"
+        ) from exc
     if len(group_values) != len(dataset):
         raise ValueError("groups must contain one experiment ID per dataset row")
     if any(not isinstance(group, str) or not group.strip() for group in group_values):

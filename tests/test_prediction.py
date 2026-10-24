@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from ai.prediction import (
@@ -10,6 +12,7 @@ from ai.prediction import (
     train_random_forest,
     validate_telemetry,
 )
+from ai.prediction.features import FEATURE_COLUMNS
 
 
 def telemetry(utilization=20, latency=10, loss=0.0, flows=2, throughput=10):
@@ -24,6 +27,21 @@ def telemetry(utilization=20, latency=10, loss=0.0, flows=2, throughput=10):
         "packet_loss_pct": loss,
         "active_flows": flows,
     }
+
+
+def grouped_candidate_dataset():
+    records = []
+    groups = []
+    class_records = {
+        "LOW": telemetry(utilization=20, latency=20, loss=0),
+        "MEDIUM": telemetry(utilization=70, latency=50, loss=0),
+        "HIGH": telemetry(utilization=90, latency=20, loss=3),
+    }
+    for label, record in class_records.items():
+        for repetition in range(2):
+            records.append(record)
+            groups.append(f"{label.lower()}-experiment-{repetition}")
+    return create_dataset(records), groups
 
 
 def test_valid_telemetry_and_features():
@@ -120,19 +138,7 @@ def test_person1_dataset_preserves_experiment_group_outside_features():
 
 
 def test_candidate_evaluation_splits_experiments_and_reports_all_classes(tmp_path):
-    records = []
-    groups = []
-    class_records = {
-        "LOW": telemetry(utilization=20, latency=20, loss=0),
-        "MEDIUM": telemetry(utilization=70, latency=50, loss=0),
-        "HIGH": telemetry(utilization=90, latency=20, loss=3),
-    }
-    for label, record in class_records.items():
-        for repetition in range(2):
-            records.append(record)
-            groups.append(f"{label.lower()}-experiment-{repetition}")
-
-    dataset = create_dataset(records)
+    dataset, groups = grouped_candidate_dataset()
     result = train_candidate_model(dataset, groups, random_state=17)
     evaluation = result["evaluation"]
 
@@ -142,16 +148,121 @@ def test_candidate_evaluation_splits_experiments_and_reports_all_classes(tmp_pat
     assert evaluation["test_support"] == {
         "LOW": 1, "MEDIUM": 1, "HIGH": 1,
     }
-    assert set(evaluation["per_class"]) == {"LOW", "MEDIUM", "HIGH"}
+    assert list(evaluation["per_class"]) == ["LOW", "MEDIUM", "HIGH"]
     assert all(
         set(metrics) == {"precision", "recall", "f1", "support"}
         for metrics in evaluation["per_class"].values()
     )
     assert len(evaluation["confusion_matrix"]) == 3
+    assert all(len(row) == 3 for row in evaluation["confusion_matrix"])
     assert 0 <= evaluation["accuracy"] <= 1
     assert 0 <= evaluation["macro_f1"] <= 1
+    assert all(
+        math.isfinite(value)
+        for metrics in evaluation["per_class"].values()
+        for value in metrics.values()
+        if isinstance(value, float)
+    )
+    assert math.isfinite(evaluation["accuracy"])
+    assert math.isfinite(evaluation["macro_f1"])
     assert not evaluation["warnings"]
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (None, "cannot contain missing values"),
+        (float("nan"), "cannot contain missing values"),
+        (float("inf"), "must be finite"),
+        ("20.0", "must be numeric"),
+        (True, "must be numeric"),
+    ],
+)
+def test_candidate_evaluation_rejects_missing_non_numeric_and_non_finite_features(
+    value, message
+):
+    dataset, groups = grouped_candidate_dataset()
+    dataset = dataset.astype(object)
+    dataset.loc[0, "utilization"] = value
+
+    with pytest.raises(ValueError, match=message):
+        train_candidate_model(dataset, groups)
+
+
+def test_candidate_evaluation_rejects_missing_feature_column():
+    dataset, groups = grouped_candidate_dataset()
+
+    with pytest.raises(ValueError, match="missing columns: jitter_ms"):
+        train_candidate_model(dataset.drop(columns=["jitter_ms"]), groups)
+
+
+@pytest.mark.parametrize(
+    ("group_case", "message"),
+    [
+        ("missing", "groups must contain one experiment ID"),
+        ("string_collection", "groups must contain one experiment ID"),
+        ("mismatched", "groups must contain one experiment ID"),
+        ("blank", "experiment IDs must be non-empty strings"),
+        ("non_string", "experiment IDs must be non-empty strings"),
+        ("too_few", "at least two experiment groups"),
+    ],
+)
+def test_candidate_evaluation_rejects_invalid_group_identifiers(
+    group_case, message
+):
+    dataset, groups = grouped_candidate_dataset()
+    if group_case == "missing":
+        invalid_groups = None
+    elif group_case == "string_collection":
+        invalid_groups = "not-a-group-sequence"
+    elif group_case == "mismatched":
+        invalid_groups = groups[:-1]
+    elif group_case == "blank":
+        invalid_groups = [" ", *groups[1:]]
+    elif group_case == "non_string":
+        invalid_groups = [None, *groups[1:]]
+    else:
+        invalid_groups = ["same-experiment"] * len(groups)
+
+    with pytest.raises(ValueError, match=message):
+        train_candidate_model(dataset, invalid_groups)
+
+
+def test_candidate_evaluation_rejects_empty_dataset():
+    dataset = create_dataset([])
+
+    with pytest.raises(ValueError, match="at least two experiment groups"):
+        train_candidate_model(dataset, [])
+
+
+def test_candidate_evaluation_rejects_unsupported_labels():
+    dataset, groups = grouped_candidate_dataset()
+    dataset.loc[0, "congestion"] = "SEVERE"
+
+    with pytest.raises(ValueError, match="unsupported congestion labels: SEVERE"):
+        train_candidate_model(dataset, groups)
+
+
+def test_candidate_evaluation_keeps_canonical_feature_order():
+    dataset, groups = grouped_candidate_dataset()
+    reordered = dataset.loc[:, list(reversed(dataset.columns))]
+
+    result = train_candidate_model(reordered, groups, random_state=17)
+
+    assert tuple(result["model"].feature_names_in_) == FEATURE_COLUMNS
+
+
+def test_candidate_evaluation_is_reproducible_for_fixed_seed():
+    dataset, groups = grouped_candidate_dataset()
+
+    first = train_candidate_model(dataset, groups, random_state=23)
+    second = train_candidate_model(dataset, groups, random_state=23)
+
+    assert first["evaluation"] == second["evaluation"]
+    assert first["model"].predict(dataset.loc[:, FEATURE_COLUMNS]).tolist() == (
+        second["model"].predict(dataset.loc[:, FEATURE_COLUMNS]).tolist()
+    )
 
 
 def test_candidate_evaluation_warns_when_a_class_is_missing():
@@ -168,6 +279,11 @@ def test_candidate_evaluation_warns_when_a_class_is_missing():
 
     assert result["evaluation"]["test_support"]["MEDIUM"] == 0
     assert any("MEDIUM" in message for message in result["evaluation"]["warnings"])
+    assert list(result["evaluation"]["per_class"]) == ["LOW", "MEDIUM", "HIGH"]
+    assert result["evaluation"]["per_class"]["MEDIUM"]["support"] == 0
+    assert result["evaluation"]["per_class"]["MEDIUM"]["precision"] == 0
+    assert result["evaluation"]["per_class"]["MEDIUM"]["recall"] == 0
+    assert result["evaluation"]["per_class"]["MEDIUM"]["f1"] == 0
 
 
 def test_candidate_evaluation_rejects_non_finite_features():

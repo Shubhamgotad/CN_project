@@ -24,6 +24,7 @@ from telemetry.iperf_parser import (
     parse_iperf_sender_interval_events,
     write_interval_jsonl,
 )
+from telemetry.validate_telemetry import _validate_record, validate_file
 from traffic.traffic_generator import IntervalTelemetryCollector
 
 
@@ -67,6 +68,34 @@ def _client_interval(start=1.0, end=2.0, throughput=4_000_000):
             }
         },
     })
+
+
+def _validated_interval_record():
+    record = parse_iperf_interval(
+        _interval(),
+        source="h1",
+        experiment_id="exp-validation",
+        scenario="normal",
+        requested_mbps=3,
+        active_flows=1,
+        measurement_timestamp="2026-01-01T00:00:02+00:00",
+    )
+    record.update(latency_ms=12.0, queue_size=3, queue_drops=1)
+    return record
+
+
+def _matched_interval_record():
+    record = _validated_interval_record()
+    record.update(
+        throughput_measurement_source="iperf3_server_json_stream",
+        sender_measurement_source="iperf3_client_json_stream",
+        client_observation_timestamp="2026-01-01T00:00:01+00:00",
+        sender_interval_start_seconds=1.0,
+        sender_interval_end_seconds=2.0,
+        sender_interval_duration_seconds=1.0,
+        sender_throughput_mbps=3.0,
+    )
+    return record
 
 
 class _FakeMonitor:
@@ -196,7 +225,10 @@ def test_collector_persists_receiver_tail_after_client_finishes(
             self.calls += 1
             measurement = super().latest_measurement()
             measurement["latency_measurement_timestamp"] = (
-                f"sample-{self.calls}"
+                f"2026-01-01T00:00:0{self.calls}+00:00"
+            )
+            measurement["queue_measurement_timestamp"] = (
+                "2026-01-01T00:00:00+00:00"
             )
             return measurement
 
@@ -221,13 +253,138 @@ def test_collector_persists_receiver_tail_after_client_finishes(
     assert records[1]["interval_start_seconds"] == 20.0
     assert records[1]["interval_end_seconds"] == 20.03
     assert records[1]["throughput_measurement_source"] == "receiver"
+    assert not any(
+        field in records[1]
+        for field in (
+            "client_observation_timestamp",
+            "sender_interval_start_seconds",
+            "sender_interval_end_seconds",
+            "sender_interval_duration_seconds",
+            "sender_throughput_mbps",
+            "sender_measurement_source",
+        )
+    )
     assert records[1]["jitter_ms"] == 0.4
     assert records[1]["latency_ms"] == 12.0
-    assert records[0]["latency_measurement_timestamp"] == "sample-1"
-    assert records[1]["latency_measurement_timestamp"] == "sample-3"
+    assert records[0]["latency_measurement_timestamp"] == (
+        "2026-01-01T00:00:01+00:00"
+    )
+    assert records[1]["latency_measurement_timestamp"] == (
+        "2026-01-01T00:00:03+00:00"
+    )
+    validation = validate_file(
+        tmp_path / "run" / "normal_exp-tail_h1_intervals.jsonl"
+    )
+    assert validation["valid"] == 2
+    assert validation["invalid"] == 0
+
+    incomplete_match = dict(records[0])
+    del incomplete_match["sender_throughput_mbps"]
+    assert any(
+        "sender interval metadata must be complete" in error
+        for error in _validate_record(incomplete_match)
+    )
+
+    false_match = dict(
+        records[1],
+        sender_measurement_source="iperf3_client_json_stream",
+    )
+    assert any(
+        "receiver-only interval must not include sender interval metadata" in error
+        for error in _validate_record(false_match)
+    )
     assert "Persisted receiver-only post-client drain interval" in (
         capsys.readouterr().out
     )
+
+
+def test_legacy_interval_without_source_metadata_remains_unclassified():
+    legacy = _validated_interval_record()
+
+    assert _validate_record(legacy) == []
+    assert "throughput_measurement_source" not in legacy
+    assert "sender_measurement_source" not in legacy
+
+
+def test_sender_metadata_without_throughput_source_is_rejected():
+    record = _matched_interval_record()
+    del record["throughput_measurement_source"]
+
+    assert any(
+        "sender interval metadata requires a throughput measurement source" in error
+        for error in _validate_record(record)
+    )
+
+
+def test_mixed_interval_file_still_rejects_missing_required_fields(tmp_path):
+    matched = _matched_interval_record()
+    drain = _validated_interval_record()
+    drain["throughput_measurement_source"] = "receiver"
+    del drain["experiment_id"]
+    path = tmp_path / "mixed-intervals.jsonl"
+    path.write_text(
+        json.dumps(matched) + "\n" + json.dumps(drain) + "\n",
+        encoding="utf-8",
+    )
+
+    validation = validate_file(path)
+
+    assert validation["valid"] == 1
+    assert validation["invalid"] == 1
+    assert any("missing fields: experiment_id" in error for error in validation["errors"])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("throughput_measurement_source", "unknown_source", "source is unsupported"),
+        ("sender_measurement_source", "not-an-iperf-client", "sender_measurement_source is unsupported"),
+        ("throughput_measurement_source", "receiver", "receiver-only interval"),
+        ("throughput_measurement_source", "iperf3_client_json_stream", "conflicts with throughput"),
+    ],
+)
+def test_invalid_or_contradictory_measurement_sources_are_rejected(
+    field, value, message
+):
+    record = _matched_interval_record()
+    record[field] = value
+
+    assert any(message in error for error in _validate_record(record))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("interval_start_seconds", None, "requires iperf-relative interval_start_seconds"),
+        ("interval_end_seconds", None, "requires iperf-relative interval_end_seconds"),
+    ],
+)
+def test_matched_interval_requires_iperf_relative_boundaries(
+    field, value, message
+):
+    record = _matched_interval_record()
+    record.pop(field)
+
+    assert any(message in error for error in _validate_record(record))
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        (-1.0, 2.0, "interval_start_seconds must be non-negative"),
+        (2.0, 2.0, "interval_end_seconds must be after interval_start_seconds"),
+        (3.0, 2.0, "interval_end_seconds must be after interval_start_seconds"),
+        (1.0, float("inf"), "interval_end_seconds must be a finite number"),
+    ],
+)
+def test_matched_interval_requires_valid_ordered_relative_boundaries(
+    start, end, message
+):
+    record = _matched_interval_record()
+    record["interval_start_seconds"] = start
+    record["interval_end_seconds"] = end
+
+    assert any(message in error for error in _validate_record(record))
 
 
 def test_collector_rejects_unmatched_receiver_interval_inside_run(

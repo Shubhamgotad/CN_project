@@ -127,6 +127,27 @@ INTEGER_FIELDS = {
     "receiver_interval_schema_version",
 }
 
+THROUGHPUT_MEASUREMENT_SOURCES = {
+    "client",
+    "receiver",
+    "synthetic_receiver",
+    "iperf3_client_json_stream",
+    "iperf3_server_json_stream",
+}
+
+SENDER_MEASUREMENT_SOURCES = {
+    "iperf3_client_json_stream",
+}
+
+SENDER_INTERVAL_FIELDS = {
+    "client_observation_timestamp",
+    "sender_interval_start_seconds",
+    "sender_interval_end_seconds",
+    "sender_interval_duration_seconds",
+    "sender_throughput_mbps",
+    "sender_measurement_source",
+}
+
 
 def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -162,13 +183,59 @@ def _validate_record(record):
             errors.append(f"{field} must be a string")
 
     throughput_source = record.get("throughput_measurement_source")
-    if throughput_source is not None and throughput_source not in (
-        "client",
-        "receiver",
+    if (
+        throughput_source is not None
+        and throughput_source not in THROUGHPUT_MEASUREMENT_SOURCES
+    ):
+        errors.append("throughput_measurement_source is unsupported")
+    sender_source = record.get("sender_measurement_source")
+    if sender_source is not None and sender_source not in SENDER_MEASUREMENT_SOURCES:
+        errors.append("sender_measurement_source is unsupported")
+    sender_fields_present = SENDER_INTERVAL_FIELDS.intersection(record)
+    if sender_fields_present and sender_fields_present != SENDER_INTERVAL_FIELDS:
+        missing_sender_fields = sorted(SENDER_INTERVAL_FIELDS - sender_fields_present)
+        errors.append(
+            "sender interval metadata must be complete; missing: "
+            + ", ".join(missing_sender_fields)
+        )
+    if throughput_source == "receiver" and sender_fields_present:
+        errors.append(
+            "receiver-only interval must not include sender interval metadata"
+        )
+    if sender_fields_present and throughput_source is None:
+        errors.append(
+            "sender interval metadata requires a throughput measurement source"
+        )
+    if sender_fields_present and throughput_source not in (
+        None,
+        "iperf3_server_json_stream",
     ):
         errors.append(
-            "throughput_measurement_source must be client or receiver"
+            "sender interval metadata conflicts with throughput measurement source"
         )
+    if throughput_source == "iperf3_server_json_stream":
+        if sender_fields_present != SENDER_INTERVAL_FIELDS:
+            errors.append(
+                "matched iperf3 server interval must include "
+                "complete sender interval metadata"
+            )
+        for field in ("interval_start_seconds", "interval_end_seconds"):
+            if field not in record:
+                errors.append(
+                    "matched iperf3 server interval requires "
+                    "iperf-relative " + field
+                )
+        if (
+            _is_number(record.get("interval_start_seconds"))
+            and math.isfinite(record["interval_start_seconds"])
+            and _is_number(record.get("interval_end_seconds"))
+            and math.isfinite(record["interval_end_seconds"])
+            and record["interval_end_seconds"] <= record["interval_start_seconds"]
+        ):
+            errors.append(
+                "iperf-relative interval_end_seconds must be after "
+                "interval_start_seconds"
+            )
 
     for timestamp_field in (
         "timestamp",
@@ -327,7 +394,7 @@ def validate_file(path):
                 if isinstance(record, dict):
                     if isinstance(record.get("scenario"), str):
                         scenarios.add(record["scenario"])
-                    schema = set(record)
+                    schema = set(record) - set(OPTIONAL_INTERVAL_FIELDS)
                     if expected_schema is None:
                         expected_schema = schema
                     elif schema != expected_schema:
