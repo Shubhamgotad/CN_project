@@ -764,6 +764,7 @@ class IntervalTelemetryCollector:
         self._client_intervals = {}
         self._receiver_intervals = {}
         self._receiver_measurements = {}
+        self._receiver_boundary_identity = None
         self._completed = set()
         self._used_client_intervals = set()
         self._used_receiver_intervals = set()
@@ -809,6 +810,27 @@ class IntervalTelemetryCollector:
         measurement = self.monitor.latest_measurement()
         with self._lock:
             for record in records:
+                if "receiver_interval_schema_version" in record:
+                    boundary_identity = tuple(
+                        record[field]
+                        for field in (
+                            "clock_id",
+                            "host_id",
+                            "boot_id",
+                            "producer_name",
+                            "producer_version",
+                            "producer_build_identity",
+                            "producer_binary_sha256",
+                            "producer_process_instance_id",
+                        )
+                    )
+                    if self._receiver_boundary_identity is None:
+                        self._receiver_boundary_identity = boundary_identity
+                    elif boundary_identity != self._receiver_boundary_identity:
+                        raise ValueError(
+                            "receiver boundary clock, host, boot, producer, "
+                            "build, or process identity changed during the run"
+                        )
                 # Callback observation is diagnostic, not an interval boundary.
                 record["receiver_observation_monotonic_seconds"] = observed_monotonic
                 record["receiver_observation_role"] = "diagnostic_only"

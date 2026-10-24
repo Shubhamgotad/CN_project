@@ -110,6 +110,10 @@ class TCApplyError(RuntimeError):
     """An apply or rollback failed; inspect the attached error text and live state."""
 
 
+class TCVerificationError(TCApplyError):
+    """The requested managed hierarchy could not be confirmed by kernel readback."""
+
+
 @dataclass(frozen=True)
 class TCState:
     qdiscs: str
@@ -894,6 +898,46 @@ def _managed_htb_matches(state: TCState, config: ManagedHTBConfig) -> bool:
         ):
             return False
     return True
+
+
+def verify_managed_htb_policy(
+    config: ManagedHTBConfig,
+    runner: Callable[..., Any] | None = None,
+) -> TCState:
+    """Read back and verify the complete requested managed hierarchy."""
+    if not isinstance(config, ManagedHTBConfig):
+        raise ValueError("config must be a validated ManagedHTBConfig")
+    execute = runner or subprocess.run
+    with _interface_lock(config.interface):
+        try:
+            state = inspect_tc_state(config.interface, execute)
+        except (TCPreconditionError, OSError, subprocess.SubprocessError) as exc:
+            raise TCVerificationError(
+                "managed QoS policy readback could not be completed"
+            ) from exc
+        if not _managed_htb_matches(state, config):
+            raise TCVerificationError(
+                "managed QoS policy did not match the requested profile on readback"
+            )
+        return state
+
+
+def read_managed_htb_profile(
+    interface: str = ROOT_INTERFACE,
+    runner: Callable[..., Any] | None = None,
+) -> str | None:
+    """Return the recognized managed profile, or None if no profile matches."""
+    if interface != ROOT_INTERFACE:
+        raise TCPreconditionError(f"refusing inspection outside {ROOT_INTERFACE}")
+    from .allocator import MANAGED_HTB_PROFILES, plan_managed_htb
+
+    execute = runner or subprocess.run
+    with _interface_lock(interface):
+        state = inspect_tc_state(interface, execute)
+        for profile in MANAGED_HTB_PROFILES:
+            if _managed_htb_matches(state, plan_managed_htb(profile, interface=interface)):
+                return profile
+        return None
 
 
 def _mutate(runner: Callable[..., Any], command: str):

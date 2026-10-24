@@ -7,6 +7,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from telemetry.receiver_boundaries import receiver_boundary_fields
+
 
 _INTERVAL_WRITE_LOCK = threading.Lock()
 _RUN_JSONL_LOCK = threading.Lock()
@@ -367,7 +369,7 @@ def _parse_interval_payload(
     utilization = values["throughput_mbps"] / bandwidth_mbps * 100
     if not 0 <= utilization <= 100:
         raise ValueError("interval utilization must be between 0 and 100")
-    return {
+    record = {
         "timestamp": timestamp,
         "observation_timestamp": timestamp,
         "interval_start_seconds": start,
@@ -387,6 +389,10 @@ def _parse_interval_payload(
         "queue_size": None,
         "queue_drops": None,
     }
+    boundary = receiver_boundary_fields(interval.get("streams"))
+    if boundary is not None:
+        record.update(boundary)
+    return record
 
 
 def write_jsonl(record, filename, *, secure_run=False):

@@ -137,6 +137,8 @@ export interface ApiQosDryRunDecision {
   status: "ready" | "stale" | "unavailable";
   dry_run: true;
   applied: false;
+  execution_state: "dry_run";
+  application_enabled: boolean;
   telemetry_status: ApiTelemetry["status"];
   telemetry_source: ApiTelemetry["source"];
   measurement_age_seconds: number | null;
@@ -184,6 +186,35 @@ export interface ApiQosDryRunDecision {
     transition: string;
   }>;
   message: string;
+}
+
+export interface ApiQosApplicationStatus {
+  status: "verified" | "unrecognized" | "unavailable";
+  applied_profile: CongestionClass | null;
+  interface: "s1-eth5";
+  message: string;
+}
+
+export interface ApiQosApplyResult {
+  status: "applied_verified";
+  dry_run: false;
+  applied: true;
+  profile: CongestionClass;
+  interface: "s1-eth5";
+  measurement_timestamp: string;
+  verification: "kernel_readback_verified";
+  message: string;
+}
+
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: number,
+    readonly lifecycleState?: "failed" | "verification_failed",
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
 }
 
 export interface ApiReportSummary {
@@ -286,7 +317,15 @@ async function requestJson<T>(path: string, options: RequestInit = {}, allowNull
       ? (payload as JsonObject).detail
       : null;
     const method = (options.method ?? "GET").toUpperCase();
+    let lifecycleState: ApiRequestError["lifecycleState"];
     let explanation: string | null = typeof detail === "string" ? detail : null;
+    if (detail !== null && typeof detail === "object" && !Array.isArray(detail)) {
+      const errorDetail = detail as JsonObject;
+      if (typeof errorDetail.message === "string") explanation = errorDetail.message;
+      if (errorDetail.state === "failed" || errorDetail.state === "verification_failed") {
+        lifecycleState = errorDetail.state;
+      }
+    }
     if (!explanation && Array.isArray(detail)) {
       const validationMessages = detail.slice(0, 4).flatMap((item) => {
         if (item === null || typeof item !== "object" || Array.isArray(item)) return [];
@@ -299,10 +338,12 @@ async function requestJson<T>(path: string, options: RequestInit = {}, allowNull
       });
       if (validationMessages.length > 0) explanation = validationMessages.join("; ");
     }
-    throw new Error(
+    throw new ApiRequestError(
       explanation
         ? `Backend rejected ${method} ${path} (${response.status}): ${explanation}`
         : `Backend API request failed for ${method} ${path} (${response.status}).`,
+      response.status,
+      lifecycleState,
     );
   }
   if (payload === null && allowNull) return payload as T;
@@ -335,6 +376,25 @@ export function getTelemetryHistory(filters: TelemetryHistoryFilters = {}): Prom
 
 export function getQosDryRunDecision(): Promise<ApiQosDryRunDecision> {
   return requestJson<ApiQosDryRunDecision>("/api/qos/decision");
+}
+
+export function getQosApplicationStatus(): Promise<ApiQosApplicationStatus> {
+  return requestJson<ApiQosApplicationStatus>("/api/qos/status");
+}
+
+export function applyQosProfile(
+  profile: CongestionClass,
+  measurement_timestamp: string,
+): Promise<ApiQosApplyResult> {
+  return requestJson<ApiQosApplyResult>("/api/qos/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      profile,
+      measurement_timestamp,
+      authorization: "APPLY_QOS_PROFILE",
+    }),
+  });
 }
 
 export function getReports(): Promise<ApiReports> {

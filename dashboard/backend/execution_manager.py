@@ -1,4 +1,4 @@
-"""Windows-to-WSL adapter for the allowlisted Mininet traffic producer."""
+"""Windows-to-WSL adapter for allowlisted Mininet traffic and QoS operations."""
 
 from __future__ import annotations
 
@@ -25,6 +25,10 @@ class TopologyUnavailable(RuntimeError):
 
 
 class ExecutionNotFound(RuntimeError):
+    pass
+
+
+class QosVerificationFailed(ExecutionUnavailable):
     pass
 
 
@@ -67,6 +71,10 @@ def _run_wsl(arguments: list[str], *, timeout: float = 20) -> dict[str, Any] | N
             payload = None
         if isinstance(payload, dict) and isinstance(payload.get("error"), str):
             error = payload["error"]
+            if payload.get("error_kind") == "verification":
+                raise QosVerificationFailed(
+                    "QoS application completed without matching kernel readback."
+                )
             if payload.get("error_kind") == "topology":
                 raise TopologyUnavailable(error)
             if payload.get("error_kind") == "conflict" and "not found" in error.lower():
@@ -144,3 +152,27 @@ def invoke_supervisor(
     if action == "start" and source_host is not None:
         arguments.append(source_host)
     return _run_wsl(arguments, timeout=30 if action == "stop" else 15)
+
+
+def invoke_qos_profile(profile: str) -> dict[str, Any]:
+    if not isinstance(profile, str) or profile not in {"LOW", "MEDIUM", "HIGH"}:
+        raise ExecutionUnavailable("Unsupported QoS profile.")
+    if os.name != "nt":
+        raise ExecutionUnavailable("Guarded QoS application requires the Windows-hosted API and WSL.")
+    project_root = _wsl_project_root()
+    helper = f"{project_root.rstrip('/')}/dashboard/backend/wsl_experiment_supervisor.py"
+    result = _run_wsl(["python3", helper, "qos-apply", profile], timeout=30)
+    if result is None:
+        raise ExecutionUnavailable("The WSL QoS supervisor returned no application result.")
+    return result
+
+
+def inspect_qos_profile() -> dict[str, Any]:
+    if os.name != "nt":
+        raise ExecutionUnavailable("Guarded QoS inspection requires the Windows-hosted API and WSL.")
+    project_root = _wsl_project_root()
+    helper = f"{project_root.rstrip('/')}/dashboard/backend/wsl_experiment_supervisor.py"
+    result = _run_wsl(["python3", helper, "qos-status"], timeout=30)
+    if result is None:
+        raise ExecutionUnavailable("The WSL QoS supervisor returned no inspection result.")
+    return result

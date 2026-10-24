@@ -11,13 +11,20 @@ import {
 import { useEffect, useState } from "react";
 import {
   apiReportToRunnerReport,
+  applyQosProfile,
   backendConnection,
+  getQosApplicationStatus,
   getReport,
   getReports,
   getQosDryRunDecision,
   parseRunnerReport,
+  ApiRequestError,
 } from "../api/client";
-import type { ApiQosDryRunDecision, ApiReportSummary } from "../api/client";
+import type {
+  ApiQosApplicationStatus,
+  ApiQosDryRunDecision,
+  ApiReportSummary,
+} from "../api/client";
 import { PROFILE_ALLOCATIONS } from "../data/demo";
 import type { CongestionClass, ImportedRunnerReport } from "../types";
 
@@ -39,6 +46,12 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
   const [loadingReport, setLoadingReport] = useState("");
   const [dryRunDecision, setDryRunDecision] = useState<ApiQosDryRunDecision | null>(null);
   const [decisionError, setDecisionError] = useState("");
+  const [qosStatus, setQosStatus] = useState<ApiQosApplicationStatus | null>(null);
+  const [applicationState, setApplicationState] = useState<
+    "dry_run" | "pending_authorization" | "applying" | "applied_verified" | "failed" | "verification_failed"
+  >("dry_run");
+  const [authorizationChecked, setAuthorizationChecked] = useState(false);
+  const [applicationError, setApplicationError] = useState("");
   const record = report?.records[selectedRecord] ?? report?.records[0] ?? null;
 
   useEffect(() => {
@@ -51,6 +64,26 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       }
     }).catch((reason: unknown) => {
       if (active) setApiError(reason instanceof Error ? reason.message : "Could not list API reports.");
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!backendConnection.baseUrl) return;
+    let active = true;
+    getQosApplicationStatus().then((response) => {
+      if (active) setQosStatus(response);
+    }).catch((reason: unknown) => {
+      if (active) {
+        setQosStatus({
+          status: "unavailable",
+          applied_profile: null,
+          interface: "s1-eth5",
+          message: reason instanceof Error ? reason.message : "Could not read applied QoS state.",
+        });
+      }
     });
     return () => {
       active = false;
@@ -114,6 +147,75 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
     }
   }
 
+  function requestApplicationAuthorization() {
+    setApplicationError("");
+    setAuthorizationChecked(false);
+    setApplicationState("pending_authorization");
+  }
+
+  async function applySelectedProfile() {
+    if (
+      !dryRunDecision?.application_enabled
+      || !dryRunDecision.selected_profile
+      || !dryRunDecision.measurement
+      || !authorizationChecked
+    ) return;
+    setApplicationState("applying");
+    setApplicationError("");
+    try {
+      await applyQosProfile(
+        dryRunDecision.selected_profile,
+        dryRunDecision.measurement.timestamp,
+      );
+    } catch (reason) {
+      setApplicationState(
+        reason instanceof ApiRequestError && reason.lifecycleState === "verification_failed"
+          ? "verification_failed"
+          : "failed",
+      );
+      setApplicationError(reason instanceof Error ? reason.message : "QoS application failed.");
+      setAuthorizationChecked(false);
+      Promise.all([getQosDryRunDecision(), getQosApplicationStatus()])
+        .then(([decision, status]) => {
+          setDryRunDecision(decision);
+          setQosStatus(status);
+        })
+        .catch(() => {
+          setQosStatus({
+            status: "unavailable",
+            applied_profile: null,
+            interface: "s1-eth5",
+            message: "Applied QoS state could not be read after the failed operation.",
+          });
+        });
+      return;
+    }
+    setApplicationState("applied_verified");
+    setAuthorizationChecked(false);
+    try {
+      const [decision, status] = await Promise.all([
+        getQosDryRunDecision(),
+        getQosApplicationStatus(),
+      ]);
+      setDryRunDecision(decision);
+      setQosStatus(status);
+    } catch (reason) {
+      setApplicationError(
+        `Profile was applied and verified, but refreshing its displayed state failed: ${
+          reason instanceof Error ? reason.message : "backend refresh failed"
+        }`,
+      );
+      getQosApplicationStatus().then(setQosStatus).catch(() => {
+        setQosStatus({
+          status: "unavailable",
+          applied_profile: null,
+          interface: "s1-eth5",
+          message: "Applied QoS state could not be read after the failed operation.",
+        });
+      });
+    }
+  }
+
   return (
     <div className="page-stack">
       <section className="page-intro">
@@ -122,7 +224,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           <h1>AI & QoS</h1>
           <p>Inspect real offline runner output separately from policy execution status.</p>
         </div>
-        <span className="status-pill status-pill--muted"><ShieldCheck size={14} /> Planning only</span>
+        <span className="status-pill status-pill--muted"><ShieldCheck size={14} /> Planning · authorized application</span>
       </section>
 
       {backendConnection.baseUrl && (
@@ -159,8 +261,8 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       <section className="card qos-dry-run-card" aria-labelledby="qos-dry-run-title">
         <div className="section-heading">
           <div>
-            <h2 id="qos-dry-run-title">Dry Run — Not Applied</h2>
-            <p>Freshness-checked telemetry is classified by existing rules. This is separate from model predictions in imported offline reports, and no proposed profile is applied to the network.</p>
+            <h2 id="qos-dry-run-title">AI & QoS Decision</h2>
+            <p>Fresh telemetry is classified by existing rules. Application remains opt-in and requires a separate, deliberate authorization; this is not an ML prediction.</p>
           </div>
           <span className={`status-pill ${dryRunDecision?.status === "ready" ? "status-pill--surface" : "status-pill--muted"}`}>
             {dryRunDecision?.status === "ready"
@@ -172,6 +274,28 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           <p className="inline-error" role="alert">{decisionError}</p>
         ) : dryRunDecision?.status === "ready" && dryRunDecision.measurement && dryRunDecision.proposed_policy ? (
           <>
+            <div className="qos-dry-run-summary">
+              <div>
+                <small>Currently applied profile</small>
+                <strong>{qosStatus?.status === "verified" && qosStatus.applied_profile
+                  ? qosStatus.applied_profile
+                  : qosStatus?.status === "verified"
+                    ? "No recognized managed profile"
+                    : qosStatus?.status === "unrecognized"
+                      ? "Unrecognized configuration"
+                      : "Unknown"}</strong>
+                <span>{qosStatus?.message ?? "Reading controller state."}</span>
+              </div>
+              <div>
+                <small>Application lifecycle</small>
+                <strong>{applicationState.replaceAll("_", " ")}</strong>
+                <span>{applicationState === "applied_verified"
+                  ? "Profile confirmed by WSL kernel readback."
+                  : applicationState === "verification_failed"
+                    ? "Application was not confirmed; current state may be uncertain."
+                    : "Proposal only until explicitly authorized."}</span>
+              </div>
+            </div>
             <div className="qos-dry-run-summary">
               <div><small>Rule-based classification</small><strong>{dryRunDecision.classification} · score {dryRunDecision.score}</strong><span>Threshold result, not a model prediction</span></div>
               <div><small>Current dry-run profile</small><strong>{dryRunDecision.selected_profile ?? "None"}</strong><span>Proposed selection only; not the applied network profile</span></div>
@@ -187,15 +311,67 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
               <span>{dryRunDecision.measurement.latency_ms.toFixed(3)} ms latency · {dryRunDecision.measurement.jitter_ms.toFixed(3)} ms jitter · {dryRunDecision.measurement.packet_loss_percent.toFixed(3)}% loss</span>
             </div>
             <div className="qos-dry-run-policy">
-              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>{dryRunDecision.proposed_policy.interface} · {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps root · dry-run only · not applied</span></div>
+              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>{dryRunDecision.proposed_policy.interface} · {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps root · currently proposed, not an applied-state claim</span></div>
               <div className="qos-dry-run-rates">
                 {Object.entries(dryRunDecision.proposed_policy.service_allocations_mbps).map(([service, rate]) => <span key={service}>{service}: {rate.toFixed(2)} Mbps</span>)}
                 <span>unmatched: {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(2)} Mbps</span>
               </div>
-              <details><summary>Show proposed tc commands (not executed)</summary><pre>{dryRunDecision.tc_commands.join("\n")}</pre></details>
+              <details><summary>Show proposed tc commands ({applicationState === "applied_verified" ? "controller applied and verified" : "not executed"})</summary><pre>{dryRunDecision.tc_commands.join("\n")}</pre></details>
             </div>
             <div className="qos-dry-run-explanation"><strong>Why this profile</strong><ul>{dryRunDecision.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
-            <p className="qos-dry-run-note">{dryRunDecision.message} Existing network settings have not been read or verified.</p>
+            {applicationError && <p className="inline-error" role="alert">{applicationError}</p>}
+            {applicationState === "pending_authorization" ? (
+              <div className="qos-apply-authorization">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={authorizationChecked}
+                    onChange={(event) => setAuthorizationChecked(event.target.checked)}
+                  />
+                  I authorize applying the {dryRunDecision.selected_profile} profile to {dryRunDecision.proposed_policy.interface}.
+                </label>
+                <button
+                  className="button button--primary"
+                  type="button"
+                  disabled={!authorizationChecked}
+                  onClick={() => void applySelectedProfile()}
+                >
+                  Confirm Apply QoS Profile
+                </button>
+                <button
+                  className="button button--secondary"
+                  type="button"
+                  onClick={() => {
+                    setApplicationState("dry_run");
+                    setAuthorizationChecked(false);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                className="button button--primary"
+                type="button"
+                disabled={
+                  !dryRunDecision.application_enabled
+                  || !qosStatus
+                  || qosStatus.status === "unavailable"
+                  || dryRunDecision.candidate_profile !== null
+                  || applicationState === "applying"
+                }
+                onClick={requestApplicationAuthorization}
+              >
+                {applicationState === "applying" ? "Applying…" : "Apply QoS Profile"}
+              </button>
+            )}
+            {!dryRunDecision.application_enabled && (
+              <p className="qos-dry-run-note">Application is disabled by default. Set ADAPTIVE_QOS_ENABLE_APPLICATION=1 only for a trusted local lab.</p>
+            )}
+            {dryRunDecision.candidate_profile && (
+              <p className="qos-dry-run-note">Application is disabled while the candidate profile awaits hysteresis and cooldown stabilization.</p>
+            )}
+            <p className="qos-dry-run-note">{dryRunDecision.message}</p>
           </>
         ) : (
           <div className="qos-dry-run-empty" role="status">

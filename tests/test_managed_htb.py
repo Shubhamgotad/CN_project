@@ -14,12 +14,15 @@ from qos.tc_controller import (
     ManagedHTBConfig,
     TCApplyError,
     TCPreconditionError,
+    TCVerificationError,
     apply_managed_htb_policy,
     generate_managed_htb_commands,
     inspect_tc_state,
+    read_managed_htb_profile,
     restore_managed_htb_hierarchy,
     restore_isolated_managed_htb_hierarchy,
     restore_original_hierarchy,
+    verify_managed_htb_policy,
 )
 
 
@@ -383,6 +386,19 @@ def test_apply_and_partial_failure_restore_original_hierarchy():
         apply_managed_htb_policy(plan_managed_htb("LOW"), failed)
     assert failed.state == baseline_state()
     assert any("handle 10:" in command for command in failed.mutations)
+
+
+def test_managed_htb_readback_identifies_and_verifies_profile():
+    runner = MockManagedTC()
+    config = plan_managed_htb("LOW")
+    apply_managed_htb_policy(config, runner)
+
+    state = verify_managed_htb_policy(config, runner)
+
+    assert state.classes == inspect_tc_state("s1-eth5", runner).classes
+    assert read_managed_htb_profile(runner=runner) == "LOW"
+    with pytest.raises(TCVerificationError, match="did not match"):
+        verify_managed_htb_policy(plan_managed_htb("HIGH"), runner)
 
 
 def test_isolated_target_applies_only_inside_identity_verified_namespace():

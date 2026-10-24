@@ -1,4 +1,4 @@
-"""WSL-side, allowlisted supervisor for the existing Mininet traffic producer."""
+"""WSL-side supervisor for allowlisted Mininet traffic and managed QoS operations."""
 
 from __future__ import annotations
 
@@ -35,6 +35,10 @@ MIN_RATE_MBPS = 0.1
 MAX_RATE_MBPS = 10.0
 MIN_DURATION_SECONDS = 1
 MAX_DURATION_SECONDS = 60
+
+
+class QosVerificationFailed(RuntimeError):
+    pass
 
 
 def _execution_parameters(scenario: str, rate_mbps=None, duration_seconds=None):
@@ -356,6 +360,43 @@ def verify_topology() -> dict[str, Any]:
     if classes.returncode != 0 or not aggregate_10mbit:
         raise RuntimeError("The configured s1-eth5 10 Mbps aggregate bottleneck is unavailable.")
     return {"hosts": sorted(hosts), "bridges": ["s1", "s2"], "bottleneck_interface": "s1-eth5"}
+
+
+def apply_qos_profile(profile: str) -> dict[str, Any]:
+    if not isinstance(profile, str) or profile not in {"LOW", "MEDIUM", "HIGH"}:
+        raise ValueError("Unsupported QoS profile.")
+    verify_topology()
+    from qos.allocator import plan_managed_htb
+    from qos.tc_controller import (
+        TCVerificationError,
+        apply_managed_htb_policy,
+        verify_managed_htb_policy,
+    )
+
+    config = plan_managed_htb(profile, interface="s1-eth5")
+    apply_managed_htb_policy(config)
+    try:
+        verify_managed_htb_policy(config)
+    except TCVerificationError as exc:
+        raise QosVerificationFailed(str(exc)) from exc
+    return {
+        "status": "applied_verified",
+        "profile": profile,
+        "interface": "s1-eth5",
+        "kernel_readback_verified": True,
+    }
+
+
+def inspect_qos_profile() -> dict[str, Any]:
+    verify_topology()
+    from qos.tc_controller import read_managed_htb_profile
+
+    profile = read_managed_htb_profile("s1-eth5")
+    return {
+        "status": "verified" if profile is not None else "unrecognized",
+        "profile": profile,
+        "interface": "s1-eth5",
+    }
 
 
 def _scenario_state(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None, source_host=None) -> dict[str, Any]:
@@ -800,6 +841,10 @@ def main(argv: list[str] | None = None) -> int:
         action = arguments[0]
         if action == "preflight" and len(arguments) == 1:
             result = {"status": "ready", "topology": verify_topology()}
+        elif action == "qos-apply" and len(arguments) == 2:
+            result = apply_qos_profile(arguments[1])
+        elif action == "qos-status" and len(arguments) == 1:
+            result = inspect_qos_profile()
         elif action == "start" and len(arguments) in {3, 5, 6}:
             rate = float(arguments[3]) if len(arguments) >= 5 else None
             duration = int(arguments[4]) if len(arguments) >= 5 else None
@@ -823,6 +868,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except FileNotFoundError as exc:
         print(json.dumps({"error_kind": "conflict", "error": str(exc)}, separators=(",", ":")))
+        return 2
+    except QosVerificationFailed as exc:
+        print(json.dumps({"error_kind": "verification", "error": str(exc)[:240]}, separators=(",", ":")))
         return 2
     except RuntimeError as exc:
         message = str(exc)
