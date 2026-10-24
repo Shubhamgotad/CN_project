@@ -55,6 +55,8 @@ export interface ImportedTrialFlow {
   latencyMs: MetricValue;
   jitterMs: MetricValue;
   packetLossPercent: MetricValue;
+  queueSize: MetricValue;
+  queueDrops: MetricValue;
 }
 
 export interface ImportedTrial {
@@ -65,12 +67,25 @@ export interface ImportedTrial {
   status: string;
   alignment: string;
   flows: ImportedTrialFlow[];
+  errors?: string[];
+  boundaryMetadataStatus?: string;
+  boundaryEvidenceIntegrityStatus?: string;
+  producerProvenanceStatus?: string;
+  clockMappingStatus?: string;
 }
 
 export interface ImportedEvidenceReport {
   kind: "evidence-analysis" | "campaign-validation";
   reportStatus: string;
+  campaignStatus?: string | null;
+  completeCycleCount?: number | null;
+  minimumCompleteCycles?: number | null;
+  boundaryMetadataStatus?: string;
+  boundaryEvidenceIntegrityStatus?: string;
+  producerProvenanceStatus?: string;
+  clockMappingStatus?: string;
   comparisonReady: boolean;
   alignmentStatus: string;
   trials: ImportedTrial[];
+  errors?: string[];
 }

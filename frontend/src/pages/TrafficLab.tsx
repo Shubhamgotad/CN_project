@@ -42,6 +42,7 @@ export function TrafficLab() {
   const [execution, setExecution] = useState<ApiExecution | null>(null);
   const [executionError, setExecutionError] = useState("");
   const [executionLoading, setExecutionLoading] = useState(true);
+  const [executionApiAvailable, setExecutionApiAvailable] = useState(false);
   const [requestPending, setRequestPending] = useState<"start" | "stop" | null>(null);
 
   useEffect(() => {
@@ -79,9 +80,15 @@ export function TrafficLab() {
   useEffect(() => {
     let active = true;
     getActiveTrafficExecution().then((result) => {
-      if (active) setExecution(result);
+      if (active) {
+        setExecution(result);
+        setExecutionApiAvailable(true);
+      }
     }).catch((reason: unknown) => {
-      if (active) setExecutionError(reason instanceof Error ? reason.message : "Could not check traffic execution state.");
+      if (active) {
+        setExecutionApiAvailable(false);
+        setExecutionError(reason instanceof Error ? reason.message : "Could not check traffic execution state.");
+      }
     }).finally(() => {
       if (active) setExecutionLoading(false);
     });
@@ -97,10 +104,14 @@ export function TrafficLab() {
         const current = await getTrafficExecution(execution.experiment_id);
         if (active) {
           setExecution(current);
+          setExecutionApiAvailable(true);
           setExecutionError("");
         }
       } catch (reason: unknown) {
-        if (active) setExecutionError(reason instanceof Error ? reason.message : "Could not refresh traffic execution state.");
+        if (active) {
+          setExecutionApiAvailable(false);
+          setExecutionError(reason instanceof Error ? reason.message : "Could not refresh traffic execution state.");
+        }
       } finally {
         if (active) timer = setTimeout(() => void poll(), EXECUTION_REFRESH_MS);
       }
@@ -110,7 +121,7 @@ export function TrafficLab() {
   }, [execution?.experiment_id, execution?.status, execution?.process_alive]);
 
   const scenarioDetails = SCENARIOS[scenario];
-  const apiConnected = telemetry !== null && !telemetryError;
+  const apiConnected = executionApiAvailable;
   const plannedFlows = useMemo(
     () => scenario === "congestion" && selectedFlow === "all"
       ? CLIENT_FLOWS
@@ -130,14 +141,16 @@ export function TrafficLab() {
           : "";
   const profileValid = validationReason === "";
   const activeExecution = Boolean(execution && (!TERMINAL_STATES.has(execution.status) || execution.process_alive));
-  const canStart = apiConnected && !executionLoading && !executionError && !requestPending && !activeExecution && profileValid;
+  const canStart = apiConnected && !executionLoading && !requestPending && !activeExecution && profileValid;
 
   async function refreshExecution() {
     setExecutionError("");
     setExecutionLoading(true);
     try {
       setExecution(await getActiveTrafficExecution());
+      setExecutionApiAvailable(true);
     } catch (reason: unknown) {
+      setExecutionApiAvailable(false);
       setExecutionError(reason instanceof Error ? reason.message : "Could not check traffic execution state.");
     } finally {
       setExecutionLoading(false);
@@ -160,13 +173,20 @@ export function TrafficLab() {
     try {
       const result = await startTrafficExecution(scenario as ExecutionScenario, rate, duration, selectedSourceHost);
       setExecution(result);
-    } catch (reason: unknown) {
-      setExecutionError(reason instanceof Error ? reason.message : "Traffic start request failed.");
+      setExecutionApiAvailable(true);
+    } catch (startReason: unknown) {
+      const startMessage = startReason instanceof Error ? startReason.message : "Traffic start request failed.";
+      setExecutionError(startMessage);
       try {
         const active = await getActiveTrafficExecution();
-        if (active) setExecution(active);
-      } catch {
-        // Keep the start error visible; the retry control can recover status later.
+        setExecution(active);
+        setExecutionApiAvailable(true);
+      } catch (statusReason: unknown) {
+        setExecutionApiAvailable(false);
+        const statusMessage = statusReason instanceof Error
+          ? statusReason.message
+          : "Could not refresh execution status after the failed start request.";
+        setExecutionError(`${startMessage} Status refresh failed: ${statusMessage}`);
       }
     } finally {
       setRequestPending(null);
@@ -209,22 +229,28 @@ export function TrafficLab() {
     setPreviewed(true);
   }
 
+  const progressPercent = execution
+    ? execution.status === "completed"
+      ? 100
+      : Math.min(100, Math.max(0, (execution.elapsed_seconds / execution.duration_seconds) * 100))
+    : 0;
+
   return (
     <div className="page-stack">
       <section className="page-intro">
         <div>
           <div className="eyebrow"><span className="eyebrow-mark" /> TRAFFIC CONFIGURATION</div>
           <h1>Traffic Lab</h1>
-          <p>Preview locally or launch a validated Normal, Moderate, or Congestion configuration, or the fixed Burst schedule, in the verified Mininet topology.</p>
+          <p>Preview locally or launch a validated Normal, Moderate, or Congestion configuration, or the fixed Burst schedule, in the expected Mininet topology. This is emulated traffic, not production or physical-network traffic.</p>
         </div>
-        <span className={`status-pill ${apiConnected ? "status-pill--surface" : "status-pill--muted"}`}><ShieldAlert size={14} /> {apiConnected ? "Guarded execution API connected" : "Execution API unavailable"}</span>
+        <span className={`status-pill ${executionLoading ? "status-pill--muted" : apiConnected ? "status-pill--surface" : "status-pill--muted"}`}><ShieldAlert size={14} /> {executionLoading ? "Checking execution API" : apiConnected ? "Execution API available" : "Execution API unavailable"}</span>
       </section>
 
       <div className="safety-callout card">
         <div className="callout-icon"><AlertCircle size={18} /></div>
         <div>
           <strong>Guarded traffic execution</strong>
-          <p>Start launches only an allowlisted scenario with validated parameters after a read-only topology check. Normal, Moderate, and Congestion accept bounded custom values; Burst keeps its fixed schedule. It does not change Mininet, OVS, routes, or traffic-control settings.</p>
+          <p>Start launches only an allowlisted scenario with validated parameters after the backend verifies the required Mininet namespaces, interfaces, and server address. The topology display is configured inventory, not proof that Mininet is currently connected. Traffic is Mininet-emulated; this does not represent production or physical-network traffic. The runner does not change Mininet, OVS, routes, or traffic-control settings.</p>
         </div>
       </div>
 
@@ -364,8 +390,18 @@ export function TrafficLab() {
             <strong>{execution.status[0].toUpperCase() + execution.status.slice(1)}</strong>
             <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps per flow · {execution.duration_seconds}s</span>
             <span>Elapsed {execution.elapsed_seconds.toFixed(1)}s{execution.process_exit_code !== null ? ` · Process exit ${execution.process_exit_code}` : ""}</span>
+            {!TERMINAL_STATES.has(execution.status) && (
+              <div className="execution-progress">
+                <label htmlFor="traffic-execution-progress">Process elapsed time</label>
+                <progress id="traffic-execution-progress" max={100} value={progressPercent} />
+                <small>{Math.min(execution.elapsed_seconds, execution.duration_seconds).toFixed(1)} / {execution.duration_seconds}s · reported by the execution API</small>
+              </div>
+            )}
             {execution.error && <span className="execution-state__error">{execution.error}</span>}
             {executionError && <span className="execution-state__error">Last status refresh failed. Showing the last confirmed process state.</span>}
+            {execution.status === "completed" && (
+              <span>Process completed. This API does not link measured telemetry to the execution, so no execution-specific metrics are inferred here.</span>
+            )}
           </div>}
           <div className="flow-status-list">
             {CLIENT_FLOWS.map((flow) => {

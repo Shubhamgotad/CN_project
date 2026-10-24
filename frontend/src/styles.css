@@ -157,6 +157,18 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
 .qos-dry-run-history { color: var(--color-secondary); overflow-wrap: anywhere; }
 @media (max-width: 720px) { .qos-dry-run-summary { grid-template-columns: 1fr; } }
 .api-report-status { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.evidence-errors { padding: 12px 15px; }
+.evidence-errors > strong { font-size: 10px; }
+.evidence-errors ul { margin: 7px 0 0; padding-left: 19px; color: var(--color-secondary); font-size: 9px; line-height: 1.5; }
+.dashboard-workflow { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 14px 16px; }
+.dashboard-workflow__execution { min-width: 0; }
+.dashboard-workflow__details { display: grid; gap: 4px; margin-top: 9px; color: var(--color-secondary); font-size: 9px; overflow-wrap: anywhere; }
+.dashboard-workflow__details strong { color: var(--color-primary); font-size: 10px; }
+.dashboard-workflow__links { display: flex; flex-wrap: wrap; gap: 7px; }
+.execution-progress { display: grid; grid-template-columns: auto minmax(90px, 1fr); align-items: center; gap: 5px 9px; }
+.execution-progress label { font-size: 9px; }
+.execution-progress progress { width: 100%; height: 8px; accent-color: var(--color-primary); }
+.execution-progress small { grid-column: 2; color: var(--color-secondary); font-size: 8px; }
 .api-report-list { display: grid; gap: 7px; }
 .api-report-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; border: 1px solid rgba(112, 75, 58, .15); border-radius: 8px; background: rgba(214, 191, 169, .16); }
 .api-report-row > span { display: grid; gap: 3px; min-width: 0; font-size: 10px; }
@@ -390,6 +402,7 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
   .topbar { justify-content: flex-start; }
   .topbar__status { margin-left: auto; }
   .traffic-layout { grid-template-columns: 1fr; }
+  .dashboard-workflow { grid-template-columns: 1fr; }
 }
 @media (max-width: 680px) {
   .topbar { height: 55px; gap: 9px; padding: 0 14px; }

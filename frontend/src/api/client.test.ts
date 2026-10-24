@@ -200,8 +200,59 @@ describe("dashboard API client", () => {
     });
     expect(normalized.comparisonReady).toBe(false);
     expect(normalized.alignmentStatus).toBe("ineligible");
+    expect(normalized.campaignStatus).toBe("complete");
+    expect(normalized.completeCycleCount).toBe(3);
+    expect(normalized.minimumCompleteCycles).toBe(3);
+    expect(normalized.boundaryEvidenceIntegrityStatus).toBe("verified");
+    expect(normalized.producerProvenanceStatus).toBe("not_independently_validated");
+    expect(normalized.clockMappingStatus).toBe("not_independently_validated");
     expect(normalized.trials[0].flows[0].throughputMbps).toBe(3.1);
     expect(normalized.trials[0].flows[0].latencyMs).toBeNull();
+    expect(normalized.trials[0].flows[0].queueSize).toBeNull();
+    expect(normalized.trials[0].flows[0].queueDrops).toBeNull();
+  });
+
+  it("requires report-level and every trial's explicit eligibility before enabling API comparisons", () => {
+    const eligibleDetail = {
+      report_id: "campaign-eligible",
+      report_type: "campaign-validation" as const,
+      created_at: null,
+      status: "complete",
+      planning_only: true,
+      campaign_status: "complete",
+      complete_cycle_count: 3,
+      minimum_complete_cycles: 3,
+      boundary_metadata_status: "schema_valid",
+      boundary_evidence_integrity_status: "verified",
+      producer_provenance_status: "validated",
+      clock_mapping_status: "validated",
+      alignment_eligibility: "eligible",
+      comparison_ready: true,
+      runner_records: [],
+      trials: [{
+        trial_id: "trial-1",
+        condition: "Baseline",
+        profile: "baseline",
+        repetition_id: "rep-1",
+        status: "complete",
+        alignment_status: "eligible",
+        boundary_metadata_status: "schema_valid",
+        boundary_evidence_integrity_status: "verified",
+        producer_provenance_status: "validated",
+        clock_mapping_status: "validated",
+        flows: [{
+          flow_id: "h1",
+          status: "complete",
+          metrics: { throughput_mbps: 3, latency_ms: null, jitter_ms: null, packet_loss_percent: null },
+        }],
+      }],
+    };
+
+    expect(apiReportToEvidenceReport(eligibleDetail).comparisonReady).toBe(true);
+    expect(apiReportToEvidenceReport({
+      ...eligibleDetail,
+      trials: eligibleDetail.trials.map((trial) => ({ ...trial, alignment_status: "ineligible" })),
+    }).comparisonReady).toBe(false);
   });
 
   it("maps a sanitized API runner record to the existing planning-only report view", () => {
@@ -320,6 +371,52 @@ describe("offline artifact client", () => {
     }));
     expect(report.comparisonReady).toBe(false);
     expect(report.trials[0].alignment).toBe("ineligible");
+  });
+
+  it("preserves offline campaign metadata, reported issues and queue metrics", () => {
+    const report = parseEvidenceReport(JSON.stringify({
+      offline_only: true,
+      status: "complete",
+      campaign_status: "complete",
+      complete_cycle_count: 2,
+      minimum_complete_cycles: 3,
+      boundary_metadata_status: "schema_valid",
+      boundary_evidence_integrity_status: "verified",
+      producer_provenance_status: "not_independently_validated",
+      clock_mapping_status: "not_independently_validated",
+      comparison_ready: false,
+      alignment_status: "ineligible",
+      manifest_errors: ["Manifest is missing an artifact."],
+      trials: [{
+        trial_id: "trial-1",
+        status: "failed",
+        alignment_status: "ineligible",
+        errors: ["No matching receiver interval."],
+        boundary_metadata_status: "schema_valid",
+        boundary_evidence_integrity_status: "verified",
+        producer_provenance_status: "not_independently_validated",
+        clock_mapping_status: "not_independently_validated",
+        flows: {
+          h1: {
+            status: "complete",
+            receiver: { metrics: { throughput_mbps: 2.9, queue_size: 4, queue_drops: 1 } },
+          },
+        },
+      }],
+    }));
+
+    expect(report.campaignStatus).toBe("complete");
+    expect(report.completeCycleCount).toBe(2);
+    expect(report.minimumCompleteCycles).toBe(3);
+    expect(report.boundaryEvidenceIntegrityStatus).toBe("verified");
+    expect(report.producerProvenanceStatus).toBe("not_independently_validated");
+    expect(report.clockMappingStatus).toBe("not_independently_validated");
+    expect(report.errors).toEqual(["Manifest is missing an artifact."]);
+    expect(report.trials[0].errors).toEqual(["No matching receiver interval."]);
+    expect(report.trials[0].boundaryMetadataStatus).toBe("schema_valid");
+    expect(report.trials[0].flows[0].queueSize).toBe(4);
+    expect(report.trials[0].flows[0].queueDrops).toBe(1);
+    expect(report.comparisonReady).toBe(false);
   });
 
   it("does not treat a completion flag as enough without explicit eligible alignment", () => {

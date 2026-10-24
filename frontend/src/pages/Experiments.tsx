@@ -8,8 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useMemo, useState } from "react";
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   apiReportToEvidenceReport,
   backendConnection,
@@ -118,6 +117,28 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
     trialStatus: trial.status,
     alignment: trial.alignment,
   }))) ?? [];
+  const trialErrors = report?.trials.flatMap((trial) => (trial.errors ?? []).map((issue) => ({
+    trialId: trial.trialId,
+    issue,
+  }))) ?? [];
+  const trialStatusSummary = useMemo(() => {
+    const statusCounts = new Map<string, number>();
+    report?.trials.forEach((trial) => {
+      const status = trial.status.trim() || "unknown";
+      statusCounts.set(status, (statusCounts.get(status) ?? 0) + 1);
+    });
+    return [...statusCounts.entries()].map(([status, count]) => `${count} ${status}`).join(" · ") || "No trials";
+  }, [report]);
+  const producerProvenanceStatus = report?.producerProvenanceStatus
+    ?? apiStatus?.producer_provenance_status
+    ?? "not reported";
+  const clockMappingStatus = report?.clockMappingStatus ?? apiStatus?.clock_mapping_status ?? "not reported";
+  const boundaryEvidenceStatus = report?.boundaryEvidenceIntegrityStatus
+    ?? apiStatus?.boundary_evidence_integrity_status
+    ?? "not reported";
+  const alignmentStatus = report?.alignmentStatus
+    ?? apiStatus?.measurement_alignment_eligibility
+    ?? "not reported";
 
   return (
     <div className="page-stack">
@@ -127,17 +148,21 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
           <h1>Experiments</h1>
           <p>Review baseline and QoS artifacts without overstating what the evidence validates.</p>
         </div>
-        <span className="status-pill status-pill--blocked"><LockKeyhole size={14} /> Comparison blocked</span>
+        <span className={`status-pill ${report?.comparisonReady ? "status-pill--surface" : "status-pill--blocked"}`}>
+          <LockKeyhole size={14} /> {report?.comparisonReady ? "Eligible per report" : "Comparison blocked"}
+        </span>
       </section>
 
       <section className="comparison-gate card">
         <span className="comparison-gate__icon"><AlertTriangle size={20} /></span>
         <div>
-          <strong>Receiver alignment is not independently validated</strong>
-          <p>The receiver-boundary producer and clock validation remain unresolved. Campaign structure or valid file hashes alone do not establish comparable measurement windows or prove QoS improvement.</p>
+          <strong>Alignment and comparison eligibility are separate from campaign completeness</strong>
+          <p>A structurally complete campaign or valid artifact hashes alone do not establish comparable measurement windows or prove QoS improvement. The statuses below are reported metadata; this browser does not independently verify source artifacts or measurement provenance.</p>
           <div className="gate-chips">
-            <span>Producer provenance: not validated</span>
-            <span>Clock mapping: not validated</span>
+            <span>Boundary evidence: {boundaryEvidenceStatus}</span>
+            <span>Producer provenance: {producerProvenanceStatus}</span>
+            <span>Clock mapping: {clockMappingStatus}</span>
+            <span>Alignment eligibility: {alignmentStatus}</span>
             <span>QoS improvement: not claimed</span>
           </div>
         </div>
@@ -156,9 +181,16 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
           {apiStatus && (
             <div className="api-report-status">
               <span>Campaign completeness <strong>{apiStatus.campaign_completeness}</strong></span>
+              <span>Complete cycles <strong>
+                {apiStatus.complete_cycle_count === null || apiStatus.minimum_complete_cycles === null
+                  ? "Unavailable"
+                  : `${apiStatus.complete_cycle_count} / ${apiStatus.minimum_complete_cycles} minimum`}
+              </strong></span>
+              <span>Boundary evidence <strong>{apiStatus.boundary_evidence_integrity_status}</strong></span>
               <span>Producer provenance <strong>{apiStatus.producer_provenance_status}</strong></span>
               <span>Clock mapping <strong>{apiStatus.clock_mapping_status}</strong></span>
               <span>Alignment eligibility <strong>{apiStatus.measurement_alignment_eligibility}</strong></span>
+              <span>Comparison eligibility <strong>{apiStatus.comparison_ready ? "Eligible" : "Blocked"}</strong></span>
             </div>
           )}
           {apiReports.length ? (
@@ -217,10 +249,41 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
           </div>
           <div className="results-summary-grid">
             <article className="card result-stat"><span>Report status</span><strong>{report.reportStatus}</strong><small>Offline analysis artifact</small></article>
+            <article className="card result-stat"><span>Campaign completeness</span><strong>{report.campaignStatus ?? "Not reported"}</strong><small>Independent of timestamp alignment</small></article>
+            <article className="card result-stat">
+              <span>Complete cycles</span>
+              <strong>
+                {report.completeCycleCount === null || report.completeCycleCount === undefined
+                  || report.minimumCompleteCycles === null || report.minimumCompleteCycles === undefined
+                  ? "Unavailable"
+                  : `${report.completeCycleCount} / ${report.minimumCompleteCycles} minimum`}
+              </strong>
+              <small>Reported by the evidence artifact</small>
+            </article>
             <article className="card result-stat"><span>Trials in report</span><strong>{report.trials.length}</strong><small>Imported trial records</small></article>
+            <article className="card result-stat"><span>Reported trial statuses</span><strong>{trialStatusSummary}</strong><small>Counts reflect status fields, not independent validation</small></article>
             <article className="card result-stat"><span>Measurement alignment</span><strong>{report.alignmentStatus}</strong><small>Eligibility is separately gated</small></article>
-            <article className="card result-stat"><span>Comparison readiness</span><strong>{report.comparisonReady ? "Eligible" : "Blocked"}</strong><small>No export unless eligible data exists</small></article>
+            <article className="card result-stat"><span>Boundary evidence</span><strong>{report.boundaryEvidenceIntegrityStatus ?? "Not reported"}</strong><small>Artifact integrity is not producer validation</small></article>
+            <article className="card result-stat"><span>Producer provenance</span><strong>{report.producerProvenanceStatus ?? "Not reported"}</strong><small>Independent validation status</small></article>
+            <article className="card result-stat"><span>Clock mapping</span><strong>{report.clockMappingStatus ?? "Not reported"}</strong><small>Independent validation status</small></article>
+            <article className="card result-stat"><span>Comparison eligibility</span><strong>{report.comparisonReady ? "Eligible per report" : "Blocked"}</strong><small>Requires explicit report eligibility and eligible trials</small></article>
           </div>
+          {report.errors && report.errors.length > 0 && (
+            <section className="card evidence-errors" aria-label="Reported evidence issues">
+              <strong>Reported manifest or evidence issues</strong>
+              <ul>{report.errors.map((issue, index) => <li key={`${issue}-${index}`}>{issue}</li>)}</ul>
+            </section>
+          )}
+          {trialErrors.length > 0 && (
+            <section className="card evidence-errors" aria-label="Reported trial issues">
+              <strong>Reported trial issues</strong>
+              <ul>{trialErrors.map(({ trialId, issue }, index) => <li key={`${trialId}-${issue}-${index}`}>{trialId}: {issue}</li>)}</ul>
+            </section>
+          )}
+          {report.trials.some((trial) => trial.status.toLowerCase() === "failed" || trial.status.toLowerCase() === "invalid")
+            && reportSource === "api" && (
+              <p className="api-data-card__message" role="note">The sanitized report API supplies trial statuses but omits per-trial failure reasons.</p>
+            )}
           {report.comparisonReady && summary.length > 0 ? (
             <section className="card chart-card results-chart">
               <div className="section-heading"><div><h2>Aligned throughput summary</h2><p>Mean reported receiver throughput by condition, from eligible imported trials.</p></div><span className="unit-label">Mbps</span></div>
@@ -251,7 +314,7 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
             {trialRows.length ? (
               <div className="table-scroll">
                 <table className="data-table">
-                  <thead><tr><th>Trial</th><th>Repetition</th><th>Condition / profile</th><th>Flow</th><th>Throughput</th><th>Latency</th><th>Jitter</th><th>Packet loss</th><th>Alignment</th></tr></thead>
+                  <thead><tr><th>Trial</th><th>Repetition</th><th>Condition / profile</th><th>Flow</th><th>Throughput</th><th>Latency / RTT</th><th>Jitter</th><th>Packet loss</th><th>Queue size</th><th>Queue drops</th><th>Alignment</th></tr></thead>
                   <tbody>
                     {trialRows.map((row, index) => (
                       <tr key={`${row.trialId}-${row.flowId}-${index}`}>
@@ -263,6 +326,8 @@ export function Experiments({ report, reportSource, onReport }: ExperimentsProps
                         <td>{formatMetric(row.latencyMs, "ms")}</td>
                         <td>{formatMetric(row.jitterMs, "ms")}</td>
                         <td>{formatMetric(row.packetLossPercent, "%")}</td>
+                        <td>{formatMetric(row.queueSize, "packets")}</td>
+                        <td>{formatMetric(row.queueDrops, "packets")}</td>
                         <td><span className={`status-pill ${row.alignment === "eligible" ? "status-pill--surface" : "status-pill--muted"}`}>{row.alignment}</span></td>
                       </tr>
                     ))}

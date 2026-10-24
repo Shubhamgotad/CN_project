@@ -8,8 +8,9 @@ import {
   Signal,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { backendConnection, getBackendHealth, getExperimentsStatus, getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
-import type { ApiExperimentsStatus, ApiHealth, ApiTelemetry, ApiTelemetryHistory, ApiTopology, TelemetryHistoryFilters } from "../api/client";
+import { Link } from "react-router-dom";
+import { backendConnection, getActiveTrafficExecution, getBackendHealth, getExperimentsStatus, getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
+import type { ApiExecution, ApiExperimentsStatus, ApiHealth, ApiTelemetry, ApiTelemetryHistory, ApiTopology, TelemetryHistoryFilters } from "../api/client";
 import { MetricCard } from "../components/MetricCard";
 import { Topology } from "../components/Topology";
 import { TrendChart } from "../components/TrendChart";
@@ -51,6 +52,9 @@ export function Dashboard() {
   const [healthError, setHealthError] = useState("");
   const [experiments, setExperiments] = useState<ApiExperimentsStatus | null>(null);
   const [experimentsError, setExperimentsError] = useState("");
+  const [activeExecution, setActiveExecution] = useState<ApiExecution | null>(null);
+  const [executionLoading, setExecutionLoading] = useState(true);
+  const [executionError, setExecutionError] = useState("");
   const flow = CLIENT_FLOWS.find((item) => item.id === selected) ?? CLIENT_FLOWS[0];
 
   useEffect(() => {
@@ -59,7 +63,9 @@ export function Dashboard() {
       setTopologyError("Backend API is not configured.");
       setTelemetryError("Backend API is not configured; measurements are unavailable.");
       setExperimentsError("Backend API is not configured.");
+      setExecutionError("Backend API is not configured.");
       setTelemetryLoading(false);
+      setExecutionLoading(false);
       return;
     }
     let active = true;
@@ -78,6 +84,10 @@ export function Dashboard() {
       (value) => active && setExperiments(value),
       (reason: unknown) => active && setExperimentsError(reason instanceof Error ? reason.message : "Report status request failed."),
     );
+    getActiveTrafficExecution().then(
+      (value) => active && setActiveExecution(value),
+      (reason: unknown) => active && setExecutionError(reason instanceof Error ? reason.message : "Execution status request failed."),
+    ).finally(() => active && setExecutionLoading(false));
 
     const refreshTelemetry = async () => {
       if (!active || telemetryRequestInFlight) return;
@@ -310,6 +320,40 @@ export function Dashboard() {
             )}
           </div>
         )}
+      </section>
+
+      <section className="dashboard-workflow card" aria-label="Current execution and workflow navigation">
+        <div className="dashboard-workflow__execution">
+          <div className="section-heading section-heading--compact">
+            <div>
+              <h3>Active traffic execution</h3>
+              <p>Current process status only; the API does not expose the latest completed execution here.</p>
+            </div>
+            <span className={`status-pill ${activeExecution ? "status-pill--surface" : "status-pill--muted"}`}>
+              {executionLoading ? "Checking" : executionError ? "Unavailable" : activeExecution?.status ?? "No active run"}
+            </span>
+          </div>
+          {executionError ? (
+            <p className="api-data-card__message" role="alert">{executionError}</p>
+          ) : activeExecution ? (
+            <div className="dashboard-workflow__details" role="status">
+              <strong>{activeExecution.scenario} · {activeExecution.status}</strong>
+              <span>Source {activeExecution.source_host ?? "unavailable"} · {activeExecution.flows.join(", ") || "flows unavailable"}</span>
+              <span>{activeExecution.target_rate_mbps} Mbps per flow · {activeExecution.duration_seconds}s · elapsed {activeExecution.elapsed_seconds.toFixed(1)}s</span>
+              {activeExecution.process_exit_code !== null && <span>Process exit code {activeExecution.process_exit_code}</span>}
+              {activeExecution.error && <span className="execution-state__error">{activeExecution.error}</span>}
+            </div>
+          ) : !executionLoading ? (
+            <p className="api-data-card__message" role="status">No active traffic execution is reported. Historical completed execution status is not available from the active-execution endpoint.</p>
+          ) : (
+            <p className="api-data-card__message" role="status">Loading current execution status…</p>
+          )}
+        </div>
+        <nav className="dashboard-workflow__links" aria-label="Adaptive QoS workflow">
+          <Link className="button button--secondary" to="/traffic-lab">Traffic Lab</Link>
+          <Link className="button button--secondary" to="/ai-qos">AI &amp; QoS</Link>
+          <Link className="button button--secondary" to="/experiments">Experiments</Link>
+        </nav>
       </section>
 
       <Topology selected={selected} onSelect={setSelected} />

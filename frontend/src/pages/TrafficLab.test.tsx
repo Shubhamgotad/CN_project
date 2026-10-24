@@ -114,6 +114,16 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(container.textContent).not.toContain("2.997 Mbps");
   });
 
+  it("keeps traffic controls independent from the telemetry source and labels Mininet emulation", async () => {
+    getLatestTelemetryMock.mockResolvedValue(telemetry("unavailable"));
+    await renderTrafficLab();
+
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.disabled).toBe(false);
+    expect(container.textContent).toContain("This is emulated traffic, not production or physical-network traffic.");
+    expect(container.textContent).toContain("configured inventory, not proof that Mininet is currently connected");
+    expect(container.textContent).not.toContain("verified Mininet topology");
+  });
+
   it("clears prior measurements and reports request failures", async () => {
     getLatestTelemetryMock.mockResolvedValueOnce(telemetry("available"));
     getLatestTelemetryMock.mockRejectedValueOnce(new Error("connection lost"));
@@ -387,6 +397,8 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     await renderTrafficLab();
     expect(container.textContent).toContain("Running");
     expect(container.textContent).toContain("Elapsed 3.2s");
+    expect(container.querySelector<HTMLProgressElement>("#traffic-execution-progress")?.value).toBeCloseTo(16);
+    expect(container.textContent).toContain("3.2 / 20s · reported by the execution API");
     const stopButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Stop");
     expect(stopButton?.disabled).toBe(false);
     await act(async () => stopButton?.click());
@@ -428,6 +440,14 @@ describe("Traffic Lab telemetry and execution boundary", () => {
       root = createRoot(container);
       rootUnmounted = false;
     }
+  });
+
+  it("does not present telemetry as execution-linked results after completion", async () => {
+    getActiveMock.mockResolvedValue(execution("completed", { process_alive: false, can_stop: false }));
+    await renderTrafficLab();
+
+    expect(container.textContent).toContain("Process completed.");
+    expect(container.textContent).toContain("does not link measured telemetry to the execution");
   });
 
   it("locks controls while start is pending, then exposes API failure and retry", async () => {

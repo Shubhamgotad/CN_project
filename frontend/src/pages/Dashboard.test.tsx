@@ -1,12 +1,14 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiTelemetry, ApiTelemetryHistory, ApiTelemetryHistoryRecord } from "../api/client";
-import { getBackendHealth, getExperimentsStatus, getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
+import { getActiveTrafficExecution, getBackendHealth, getExperimentsStatus, getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
 import { Dashboard } from "./Dashboard";
 
 vi.mock("../api/client", () => ({
   backendConnection: { baseUrl: "http://127.0.0.1:8000" },
+  getActiveTrafficExecution: vi.fn(),
   getBackendHealth: vi.fn(),
   getExperimentsStatus: vi.fn(),
   getLatestTelemetry: vi.fn(),
@@ -15,6 +17,7 @@ vi.mock("../api/client", () => ({
 }));
 
 const healthMock = vi.mocked(getBackendHealth);
+const activeExecutionMock = vi.mocked(getActiveTrafficExecution);
 const reportsMock = vi.mocked(getExperimentsStatus);
 const telemetryMock = vi.mocked(getLatestTelemetry);
 const historyMock = vi.mocked(getTelemetryHistory);
@@ -85,7 +88,7 @@ function history(records: ApiTelemetryHistoryRecord[] = [historyRecord()]): ApiT
 
 async function renderDashboard() {
   await act(async () => {
-    root.render(<Dashboard />);
+    root.render(<MemoryRouter><Dashboard /></MemoryRouter>);
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
@@ -99,6 +102,7 @@ beforeEach(() => {
   root = createRoot(container);
   unmounted = false;
   healthMock.mockReset().mockResolvedValue({ status: "ok", service: "dashboard", api_version: "0.1.0", live_network_operations: true });
+  activeExecutionMock.mockReset().mockResolvedValue(null);
   reportsMock.mockReset().mockResolvedValue({
     status: "unavailable", report_id: null, campaign_completeness: "unavailable", complete_cycle_count: null,
     minimum_complete_cycles: null, boundary_metadata_status: "unavailable", boundary_evidence_integrity_status: "unavailable",
@@ -141,8 +145,39 @@ describe("Dashboard recorded telemetry", () => {
     expect(container.textContent).toContain("Recorded telemetry history");
     expect(container.textContent).toContain("completed experiment JSONL · recorded data, not live");
     expect(container.textContent).toContain("live connectivity is not verified");
+    expect(container.textContent).toContain("No active traffic execution is reported.");
+    expect(container.textContent).toContain("Historical completed execution status is not available");
+    expect(container.querySelector('a[href="/traffic-lab"]')?.textContent).toContain("Traffic Lab");
+    expect(container.querySelector('a[href="/ai-qos"]')?.textContent).toContain("AI & QoS");
+    expect(container.querySelector('a[href="/experiments"]')?.textContent).toContain("Experiments");
     expect(container.querySelector('[aria-label="Latency / RTT · h1, validated recorded telemetry at 2026-10-20T10:11:12.123+00:00"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Synthetic sample");
+  });
+
+  it("shows only the active execution returned by the backend, including a failure", async () => {
+    activeExecutionMock.mockResolvedValue({
+      experiment_id: "0123456789abcdef0123456789abcdef",
+      scenario: "burst",
+      source_host: "h2",
+      status: "failed",
+      flows: ["h2"],
+      target_rate_mbps: 8,
+      duration_seconds: 23,
+      created_at: "2026-10-20T10:00:00Z",
+      started_at: "2026-10-20T10:00:00Z",
+      finished_at: "2026-10-20T10:00:04Z",
+      elapsed_seconds: 4,
+      process_alive: false,
+      can_stop: false,
+      process_exit_code: 2,
+      error: "Producer exited with code 2.",
+    });
+    await renderDashboard();
+
+    expect(container.textContent).toContain("burst · failed");
+    expect(container.textContent).toContain("Process exit code 2");
+    expect(container.textContent).toContain("Producer exited with code 2.");
+    expect(activeExecutionMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps selected-client values tied to the actual record source", async () => {

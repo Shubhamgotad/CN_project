@@ -387,27 +387,44 @@ export function apiReportToEvidenceReport(detail: ApiReportDetail): ImportedEvid
   if (detail.report_type === "experiment-runner") {
     throw new Error("Experiment-runner plans are not evidence reports.");
   }
+  const trials = detail.trials.map((trial) => ({
+    trialId: trial.trial_id,
+    condition: trial.condition,
+    profile: trial.profile,
+    repetitionId: trial.repetition_id,
+    status: trial.status,
+    alignment: trial.alignment_status,
+    boundaryMetadataStatus: trial.boundary_metadata_status,
+    boundaryEvidenceIntegrityStatus: trial.boundary_evidence_integrity_status,
+    producerProvenanceStatus: trial.producer_provenance_status,
+    clockMappingStatus: trial.clock_mapping_status,
+    flows: trial.flows.map((flow) => ({
+      flowId: flow.flow_id,
+      status: flow.status,
+      throughputMbps: finiteNumber(flow.metrics.throughput_mbps),
+      latencyMs: finiteNumber(flow.metrics.latency_ms),
+      jitterMs: finiteNumber(flow.metrics.jitter_ms),
+      packetLossPercent: finiteNumber(flow.metrics.packet_loss_percent),
+      queueSize: null,
+      queueDrops: null,
+    })),
+  }));
   return {
     kind: detail.report_type,
     reportStatus: detail.campaign_status ?? detail.status,
-    comparisonReady: false,
+    campaignStatus: detail.campaign_status,
+    completeCycleCount: detail.complete_cycle_count,
+    minimumCompleteCycles: detail.minimum_complete_cycles,
+    boundaryMetadataStatus: detail.boundary_metadata_status,
+    boundaryEvidenceIntegrityStatus: detail.boundary_evidence_integrity_status,
+    producerProvenanceStatus: detail.producer_provenance_status,
+    clockMappingStatus: detail.clock_mapping_status,
+    comparisonReady: detail.comparison_ready
+      && detail.alignment_eligibility === "eligible"
+      && trials.length > 0
+      && trials.every((trial) => trial.alignment === "eligible"),
     alignmentStatus: detail.alignment_eligibility,
-    trials: detail.trials.map((trial) => ({
-      trialId: trial.trial_id,
-      condition: trial.condition,
-      profile: trial.profile,
-      repetitionId: trial.repetition_id,
-      status: trial.status,
-      alignment: trial.alignment_status,
-      flows: trial.flows.map((flow) => ({
-        flowId: flow.flow_id,
-        status: flow.status,
-        throughputMbps: finiteNumber(flow.metrics.throughput_mbps),
-        latencyMs: finiteNumber(flow.metrics.latency_ms),
-        jitterMs: finiteNumber(flow.metrics.jitter_ms),
-        packetLossPercent: finiteNumber(flow.metrics.packet_loss_percent),
-      })),
-    })),
+    trials,
   };
 }
 
@@ -484,6 +501,12 @@ function className(value: unknown): CongestionClass | null {
 
 function optionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 function parsePlanRecord(value: unknown, index: number): ImportedPlanRecord {
@@ -572,6 +595,8 @@ function parseTrialFlow(flowId: string, value: unknown): ImportedTrialFlow {
     latencyMs: finiteNumber(metrics.latency_ms),
     jitterMs: finiteNumber(metrics.jitter_ms),
     packetLossPercent: finiteNumber(metrics.packet_loss_percent),
+    queueSize: finiteNumber(metrics.queue_size),
+    queueDrops: finiteNumber(metrics.queue_drops),
   };
 }
 
@@ -600,6 +625,11 @@ function parseTrial(value: unknown, index: number): ImportedTrial {
     status: optionalString(trial.status) ?? "unknown",
     alignment,
     flows,
+    errors: stringArray(trial.errors),
+    boundaryMetadataStatus: optionalString(trial.boundary_metadata_status) ?? undefined,
+    boundaryEvidenceIntegrityStatus: optionalString(trial.boundary_evidence_integrity_status) ?? undefined,
+    producerProvenanceStatus: optionalString(trial.producer_provenance_status) ?? undefined,
+    clockMappingStatus: optionalString(trial.clock_mapping_status) ?? undefined,
   };
 }
 
@@ -625,11 +655,24 @@ export function parseEvidenceReport(text: string): ImportedEvidenceReport {
     && declaredAlignment === "eligible"
     && trials.length > 0
     && trials.every((trial) => trial.alignment === "eligible");
+  const campaignStatus = optionalString(report.campaign_status);
   return {
     kind: report.comparison_ready === undefined ? "evidence-analysis" : "campaign-validation",
     reportStatus: optionalString(report.status) ?? "unknown",
+    campaignStatus,
+    completeCycleCount: finiteNumber(report.complete_cycle_count),
+    minimumCompleteCycles: finiteNumber(report.minimum_complete_cycles),
+    boundaryMetadataStatus: optionalString(report.boundary_metadata_status) ?? undefined,
+    boundaryEvidenceIntegrityStatus: optionalString(report.boundary_evidence_integrity_status) ?? undefined,
+    producerProvenanceStatus: optionalString(report.producer_provenance_status) ?? undefined,
+    clockMappingStatus: optionalString(report.clock_mapping_status) ?? undefined,
     comparisonReady,
     alignmentStatus: declaredAlignment ?? (comparisonReady ? "eligible" : "ineligible"),
     trials,
+    errors: [
+      ...stringArray(report.manifest_errors),
+      ...stringArray(report.campaign_errors),
+      ...stringArray(report.errors),
+    ],
   };
 }
