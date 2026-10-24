@@ -98,6 +98,7 @@ def test_source_host_is_validated_in_the_actual_producer_command(monkeypatch, tm
     supervisor._worker(ID, "normal", 3.0, 20, source_host)
     argv = captured["argv"]
     assert argv[argv.index("--source-host") + 1] == source_host
+    assert argv[argv.index("--experiment-id") + 1] == ID
     assert supervisor.CLIENT_FLOW_PORTS[source_host] == port
 
 
@@ -120,6 +121,7 @@ def test_producer_process_ownership_requires_the_recorded_source_host(
         "--rate-mbps", "3",
         "--duration-seconds", "20",
         "--source-host", source_host,
+        "--experiment-id", ID,
         "--output-dir", os.fspath(output_dir),
     ]
     monkeypatch.setattr(supervisor, "_pid_start_ticks", lambda _pid: 77)
@@ -130,11 +132,15 @@ def test_producer_process_ownership_requires_the_recorded_source_host(
     )
     monkeypatch.setattr(supervisor.os, "readlink", lambda _path: "/usr/bin/python3")
     assert supervisor._producer_matches(
-        4321, 77, "normal", output_dir, 3.0, 20, source_host
+        4321, 77, "normal", output_dir, 3.0, 20, source_host, ID
     )
     other_host = "h2" if source_host != "h2" else "h3"
     assert not supervisor._producer_matches(
-        4321, 77, "normal", output_dir, 3.0, 20, other_host
+        4321, 77, "normal", output_dir, 3.0, 20, other_host, ID
+    )
+    assert not supervisor._producer_matches(
+        4321, 77, "normal", output_dir, 3.0, 20, source_host,
+        "fedcba9876543210fedcba9876543210",
     )
 
 
@@ -310,6 +316,7 @@ def test_worker_passes_custom_parameters_to_existing_producer(monkeypatch, tmp_p
     assert captured["argv"][captured["argv"].index("--rate-mbps") + 1] == "5"
     assert captured["argv"][captured["argv"].index("--duration-seconds") + 1] == "17"
     assert captured["argv"][captured["argv"].index("--source-host") + 1] == "all"
+    assert captured["argv"][captured["argv"].index("--experiment-id") + 1] == ID
 
 
 def test_windows_adapter_uses_fixed_argument_list_and_no_shell(monkeypatch):

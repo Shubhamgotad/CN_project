@@ -1,14 +1,16 @@
 # Person 2 Handoff — Adaptive QoS
 
-## Scope and repository state
+## 1. Scope and repository state
 
-Person 2's offline scope covers telemetry contracts and validation, ML dataset quality, experiment-group evaluation, tests, and documentation. This handoff records offline evidence only. No live Mininet experiment, network/QoS policy change, commit, or push was performed.
+Person 2 owns offline telemetry-contract validation, ML dataset quality, experiment-group evaluation, tests, and documentation. Person 1 owns live/runtime verification. This handoff keeps the offline audit separate from Person 1's supplied runtime evidence. No new live Mininet experiment or network/QoS policy change was performed for this handoff.
 
 Audited checkout: branch `main`, baseline commit `0bff40216b3427f66192a8cf89ddb1707cc0e5c0`.
 
-## Dataset and duplicate audit
+## 2. Dataset and duplicate audit
 
 `telemetry/datasets/combined.jsonl` contains 48 JSONL records. The telemetry validator accepted all 48 (0 invalid); the prediction loader derived 22 experiment groups and threshold labels:
+
+**Historical context from the incoming handoff snapshot:** it identified the repository as `CN_project`, recorded branch `feature/telemetry-ml-docs` and baseline `4fc7aba`, and noted that tracked JSONL data inspected at that earlier point lacked `metadata.experiment_id`. That earlier observation does not describe the current `combined.jsonl` audit below, which finds 22 experiment groups. The current checkout baseline used for the offline audit is recorded above.
 
 | Label | Rows |
 |---|---:|
@@ -74,7 +76,9 @@ print(evaluation)
 
 The JSONL provides experiment ID, scenario, source, requested rate, and observation timestamp, but has no unique sample/collection lineage identifier. Different IDs and timestamps establish distinct metadata values, not independent collection provenance; the available source data cannot distinguish repeated conditions from a copied/re-collected measurement with certainty.
 
-## Grouped evaluation and interpretation
+## 3. Grouped evaluation and interpretation
+
+Person 1's evidence now covers real Normal and Moderate UDP traffic (Section 7). It does not satisfy the separate receiver-boundary, independent RTT/queue timestamp, congestion/burst, or live-policy validation requirements.
 
 `train_candidate_model()` selects the canonical features in stable `FEATURE_COLUMNS` order and keeps experiment IDs outside the feature matrix. Its seeded `StratifiedGroupKFold` uses a single two-fold grouped holdout; the observed split has 11 IDs / 24 rows in each partition, with no ID overlap. With `random_state=42`, the current snapshot produced:
 
@@ -87,7 +91,7 @@ This is a single holdout, not an average over repeated splits. Group separation 
 
 `train_random_forest()` remains the ordinary row-level split API and is now explicitly documented as not experiment-group leakage-safe. It must not be presented as group-separated evaluation.
 
-## Telemetry contract review
+## 4. Telemetry contract review
 
 The Person 1 adapter validates required fields and their types, timezone-bearing ISO-8601 observation timestamps, non-empty experiment/scenario/source/destination/traffic strings, finite non-negative requested rate and packet counters, and canonical numeric feature constraints. Repeated experiment IDs are retained as group membership; IDs are not predictive features. Existing fields such as queue size/drops remain metadata, not model inputs. The adapter and current fixtures preserve the established schema.
 
@@ -108,7 +112,7 @@ The bundle itself states that `receiver_observation_monotonic_seconds` and its t
 
 The bundle contains SHA-256 values for original state, summary, complete interval-file, and producer-log artifacts, but those original artifacts are not included. The redacted log excerpts and selected records therefore do not allow independent recomputation of every listed original-artifact hash or verification of all 21 source interval rows. No private machine hostname, username, or local path is recorded here.
 
-## Telemetry contract follow-up
+### Telemetry contract follow-up
 
 1. **Relative offsets vs receiver-monotonic time:** Field names and the producer/parser comments distinguish iperf offsets from callback-observation monotonic time; `receiver_windows.synchronized_receiver_aggregate()` separately requires versioned absolute receiver boundaries and does not accept relative offsets as proof. The JSONL validator does not require an explicit clock-domain marker for the relative offset fields. Do not use them as absolute edges.
 2. **Drain vs matched interval:** Existing producer output distinguishes matched intervals by a server-stream throughput source plus sender metadata, and drain intervals by receiver source without sender metadata. The validator accepts known source values, restricts the sender source to `iperf3_client_json_stream`, requires complete sender metadata for a server-stream matched row, rejects contradictory source combinations, and requires matched rows to have ordered, finite, non-negative iperf-relative `interval_start_seconds`/`interval_end_seconds`. Those relative offsets are not absolute receiver-monotonic boundaries. Receiver-only drain rows do not require sender metadata. For legacy records with no source and no sender fields, the validator leaves the match status unknown rather than inferring a drain.
@@ -117,7 +121,7 @@ The bundle contains SHA-256 values for original state, summary, complete interva
 
 Only the selected aggregate and first/middle/final interval rows from the supplied Normal/Moderate runs were checked against the offline telemetry validator; the full source interval files were not included. These selected records do not replace full-file, cryptographic, receiver-boundary, or live integration evidence.
 
-## Changes and offline validation
+## 5. Changes and offline validation
 
 - `ai/prediction/training.py`: reject boolean and coercible-string feature values in grouped candidate evaluation, convert a missing group collection into a clear validation error, and document that ordinary row-level training is not experiment-group leakage-safe.
 - `tests/test_prediction.py`: add regression coverage for invalid/missing group collections, empty data, missing/non-numeric/non-finite features, unsupported labels, feature ordering, fixed-seed reproducibility, finite metrics, and fixed class ordering/absent-class behavior. Existing group-disjoint and metadata separation tests remain in place.
@@ -125,7 +129,7 @@ Only the selected aggregate and first/middle/final interval rows from the suppli
 - `tests/test_interval_telemetry.py`: cover matched/drain mixed-file validation, unknown legacy records, required fields, measurement-source combinations, and matched relative interval boundaries.
 - `docs/experiments/person2-handoff.md`: record current dataset audit, grouped evaluation, supplied Person 1 evidence, contract gaps, validation results, and handoff requirements.
 
-Commands and results:
+Original Person 2 offline-validation commands and results (before the current merge integration):
 
 - `.\.venv\Scripts\python.exe -m pytest tests/test_interval_telemetry.py tests/test_receiver_windows.py -q` — **89 passed, 0 skipped, 0 warnings**.
 - `.\.venv\Scripts\python.exe -m telemetry.validate_telemetry telemetry/datasets/combined.jsonl` — **48 records, 48 valid, 0 invalid**.
@@ -133,11 +137,13 @@ Commands and results:
 - `.\.venv\Scripts\python.exe -m pytest -q` — **575 passed, 7 skipped, 3 warnings**.
 - `git diff --check` — passed.
 
+The merge-resolution context supplied with this handoff reports 202 passed and 3 skipped in the focused suite, and 581 passed and 7 skipped in the full suite. These merge-time results were not rerun during this documentation reconciliation.
+
 The full-suite warnings were the existing Starlette/httpx deprecation and two expected RuntimeWarnings from the missing-MEDIUM-class grouped-evaluation test. Skips were reported by pytest; none were forced or suppressed.
 
 The first telemetry-focused run failed because the drain test fixture used placeholder timestamp strings, which correctly failed ISO-8601 validation. The fixture was corrected to use UTC timestamps; the focused and full suites above then passed.
 
-## Remaining work
+## 6. Outstanding work and campaign context
 
 ### Offline
 
@@ -161,3 +167,78 @@ The first telemetry-focused run failed because the drain test fixture used place
 - Provide receiver-instrumented monotonic interval-boundary evidence before using interval data for synchronized measurement claims.
 
 The supplied bundle verifies selected Normal and Moderate run completion and record consistency only. No live runtime behavior beyond those reported run artifacts is claimed as verified.
+
+### Campaign and historical validation context
+
+The incoming handoff recorded a campaign requirement of at least three complete cycles and at least 48 trials, subject to the project's campaign-validation requirements. These are collection requirements, not evidence that a campaign has been completed. Campaign comparisons require source provenance, required fields, alignment, and completeness; incomplete or mismatched evidence must not be presented as a valid baseline-versus-adaptive comparison. Offline tests, dashboard demo data, model-artifact presence, or API startup do not establish live runtime readiness or QoS improvement.
+
+The incoming handoff's earlier snapshot reported 547 passed, 7 skipped, and 3 warnings for the full Python suite, and 19 passed with 2 warnings for focused prediction/dataset-builder tests. It also cautioned that no unverified model score or model-artifact presence should be presented as evidence of model quality. Those are historical results, superseded for the current merge by the results recorded below and the merge-time results supplied with this task.
+
+## 7. Person 1 runtime evidence update — 2026-10-24
+
+No additional live experiments were performed for this evidence collection. The evidence bundle was assembled from two existing local Mininet runs and reviewed for identity consistency. The shareable bundle was provided separately as `CN_project_evidence_bundle_20261024_163758_shareable.zip`; it is not committed as a repository artifact. It contains selected interval records and log excerpts, state fields, output-file inventories, timestamp-semantics source excerpts, and SHA-256 hashes of source artifacts. The full original source files are not included in that bundle, so recipients cannot independently recompute every source-artifact hash from the bundle alone.
+
+### 7.1 Verified run summaries
+
+| Field | Normal | Moderate |
+|---|---|---|
+| Run / experiment ID | `4fd268ba3d29444e8c607720a4edaeb6` | `a2aa9106eb484a66ba3211e1f232bb6b` |
+| Source host | `h2` | `h3` |
+| Requested UDP rate | 3.0 Mbps | 3.0 Mbps |
+| Requested duration | 20 seconds | 20 seconds |
+| State status / exit code | `completed` / 0 | `completed` / 0 |
+| Process alive at inspection | false | false |
+| Aggregate summary file | `normal.jsonl` | `moderate.jsonl` |
+| Interval file | `normal_4fd268ba3d29444e8c607720a4edaeb6_h2_intervals.jsonl` | `moderate_a2aa9106eb484a66ba3211e1f232bb6b_h3_intervals.jsonl` |
+| Interval record count | 21 | 21 |
+
+The execution ID in `state.json`, the aggregate summary's `experiment_id`, and the ID encoded in the interval filename match for both runs. The summary's scenario and source also agree with the state fields.
+
+### 7.2 Aggregate summary measurements
+
+These values are copied from the respective aggregate summary JSONL records; they describe these two traffic runs and are not evidence of QoS improvement.
+
+| Summary field | Normal | Moderate |
+|---|---:|---:|
+| `throughput_mbps` | 2.99718658122217 | 2.9971445144223523 |
+| `latency_ms` | 20.53875 | 20.3364 |
+| `jitter_ms` | 0.008157464799468434 | 0.010964410308177037 |
+| `packet_loss_percent` | 0.0 | 0.0 |
+| `lost_packets` / `total_packets` | 0 / 5180 | 0 / 5180 |
+| `bandwidth_mbps` | 10.0 | 10.0 |
+| `utilization_percent` | 29.97 | 29.97 |
+| `active_flows` | 1 | 1 |
+| `queue_size` / `queue_drops` | 3 / 0 | 3 / 0 |
+
+### 7.3 Selected interval records and timestamp semantics
+
+The bundle preserves the first, middle, and final interval JSONL records from each run with their original field names and values. The selected relative interval offsets are:
+
+| Selected record | Normal | Moderate |
+|---|---|---|
+| First interval | 0.0–1.000303 s | 0.0–1.000150 s |
+| Middle interval | 10.000291–11.000274 s | 10.000125–11.000258 s |
+| Final interval | 20.000286–20.020482 s | 20.000144–20.020763 s |
+
+The producer implementation captures `receiver_observation_monotonic_seconds` when a receiver JSON callback is handled and labels its role `diagnostic_only`. This is callback-observation time, not a measurement edge. The `interval_start_seconds` and `interval_end_seconds` values originate from iperf3's test-relative interval offsets; they are not absolute receiver-monotonic boundaries. The producer log/source excerpts show this distinction.
+
+The final selected record for each run is a receiver-only post-client drain interval. It has no matching sender interval fields and must not be described as a normal matched sender/receiver interval. Other selected records include sender-side relative offsets and sender metrics alongside receiver-stream measurements.
+
+The selected records include `latency_measurement_timestamp`, `queue_measurement_timestamp`, and corresponding age fields. Their presence alone does not establish independent timestamp provenance, validate stale-measurement handling, or make them synchronized receiver-window boundaries.
+
+### 7.4 What this evidence does and does not establish
+
+**Established for these two runs:**
+- Normal UDP traffic from `h2` and Moderate UDP traffic from `h3` completed with exit code 0.
+- Execution, summary telemetry, and interval-file identities are consistent.
+- Each run has 21 interval records and an aggregate summary record with the fields and values shown above.
+- The reviewed record excerpts show the distinction between receiver callback-observation time and iperf-relative interval offsets.
+
+**Not established by this evidence:**
+- Genuine receiver-monotonic measurement boundaries with independently validated uncertainty and clock/host/boot provenance.
+- Independent RTT/queue timestamp provenance or validated stale-measurement handling.
+- Runtime behavior for Burst or Congestion (including all-four-client concurrency and receiver readiness).
+- Live prediction-to-QoS policy application, kernel-state verification, rollback/restoration, or a baseline-versus-adaptive QoS improvement.
+- A completed experiment campaign meeting the three-cycle/48-trial requirement.
+
+The full local run directories contain `state.json`, producer logs, and output files. The paths are machine-local and are intentionally not embedded in this shared document. The reviewed evidence bundle is available separately from Person 1; no new traffic experiment was run to assemble it.

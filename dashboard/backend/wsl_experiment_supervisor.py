@@ -80,13 +80,20 @@ def _rate_arg(rate: float) -> str:
     return format(rate, ".10g")
 
 
-def _tracked_parameters(state: dict[str, Any]):
+def _tracked_parameters(
+    state: dict[str, Any],
+) -> tuple[Any, Any, str | None, str | None]:
     version = state.get("execution_contract_version")
     if version == 3:
-        return state["target_rate_mbps"], state["duration_seconds"], state["source_host"]
+        return (
+            state["target_rate_mbps"],
+            state["duration_seconds"],
+            state["source_host"],
+            state["experiment_id"],
+        )
     if version == 2:
-        return state["target_rate_mbps"], state["duration_seconds"], None
-    return None, None, None
+        return state["target_rate_mbps"], state["duration_seconds"], None, None
+    return None, None, None, None
 
 
 def _wait_for_supervisor_ready(experiment_id: str, process, *, timeout: float = 5.0) -> dict[str, Any]:
@@ -236,7 +243,16 @@ def _supervisor_matches(state: dict[str, Any]) -> bool:
     return actual == expected and executable.startswith("python3")
 
 
-def _producer_matches(pid: int, start_ticks: int, scenario: str, output_dir: Path, rate_mbps=None, duration_seconds=None, source_host=None) -> bool:
+def _producer_matches(
+    pid: int,
+    start_ticks: int,
+    scenario: str,
+    output_dir: Path,
+    rate_mbps=None,
+    duration_seconds=None,
+    source_host=None,
+    experiment_id=None,
+) -> bool:
     if _pid_start_ticks(pid) != start_ticks:
         return False
     try:
@@ -257,6 +273,8 @@ def _producer_matches(pid: int, start_ticks: int, scenario: str, output_dir: Pat
         expected.extend(["--rate-mbps", _rate_arg(rate), "--duration-seconds", str(duration)])
     if source_host is not None:
         expected.extend(["--source-host", _selected_source_host(scenario, source_host)])
+    if experiment_id is not None:
+        expected.extend(["--experiment-id", experiment_id])
     expected.extend(["--output-dir", os.fspath(output_dir)])
     return actual == expected and executable.startswith("python3")
 
@@ -555,6 +573,7 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
                 "--rate-mbps", _rate_arg(rate_mbps),
                 "--duration-seconds", str(duration_seconds),
                 "--source-host", source_host,
+                "--experiment-id", experiment_id,
                 "--output-dir", os.fspath(output_dir),
             ]
             producer = subprocess.Popen(
@@ -590,7 +609,8 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
                 state["process_exit_code"] = producer.poll()
                 state["process_alive"] = not stopped
                 state["can_stop"] = not stopped and _producer_matches(
-                    producer.pid, producer_ticks, scenario, output_dir, rate_mbps, duration_seconds, source_host
+                    producer.pid, producer_ticks, scenario, output_dir,
+                    rate_mbps, duration_seconds, source_host, experiment_id,
                 )
                 state["status"] = "stopped" if stopped else "failed"
                 state["error"] = None if stopped else "Producer termination could not be verified; workload state is uncertain."
@@ -632,7 +652,16 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
             producer is not None
             and producer_ticks is not None
             and producer.poll() is None
-            and _producer_matches(producer.pid, producer_ticks, scenario, _run_dir(experiment_id) / "output", rate_mbps, duration_seconds, source_host)
+            and _producer_matches(
+                producer.pid,
+                producer_ticks,
+                scenario,
+                _run_dir(experiment_id) / "output",
+                rate_mbps,
+                duration_seconds,
+                source_host,
+                experiment_id,
+            )
         )
         state["error"] = str(exc)[:240] if isinstance(exc, (RuntimeError, ValueError)) else "Producer failed unexpectedly."
     finally:
