@@ -1,13 +1,17 @@
 # Receiver-boundary producer interface design
 
-**Status:** Design proposal only. No receiver-boundary producer is implemented,
-and no live measurement capability or readiness is established.
+**Status:** An offline source-instrumentation prototype is implemented for
+upstream iperf3 3.17.1. It has not been installed or used for traffic. Its
+uncertainty values and evidence are deliberately absent, so its records are
+schema-incomplete and alignment-ineligible. No producer capability, clock
+accuracy, multi-flow alignment, or live readiness is established.
 
 ## Purpose and current evidence
 
 The telemetry pipeline needs the actual start and end of each receiver
-measurement interval in a named receiver monotonic clock domain. The current
-collector does not provide those boundaries:
+measurement interval in a named receiver monotonic clock domain. The stock
+system iperf3 and its current output do not provide those boundaries to the
+collector:
 
 - `traffic.traffic_generator.IntervalTelemetryCollector.add_receiver_event`
   captures `time.monotonic()` while handling the receiver JSON callback. That
@@ -17,9 +21,19 @@ collector does not provide those boundaries:
   are test-relative elapsed offsets, not absolute receiver-clock values.
 - The parser's UTC `timestamp`/`observation_timestamp` is set when the report
   is parsed. It is report-observation time.
-- The receiver listener starts iperf3 with `--json-stream`; the repository
-  contains no instrumented iperf3 source, separate receiver-boundary producer,
-  producer binary, or existing actual-boundary artifact.
+- The receiver listener starts the installed iperf3 with `--json-stream`;
+  stock JSON has only test-relative `start`/`end` offsets. No instrumented
+  binary is installed and no real run has emitted the prototype fields.
+- `tools/receiver-boundary/patches/iperf-3.17.1-receiver-boundaries.patch`
+  instruments the upstream server's stored interval-result timestamps, and
+  `tools/receiver-boundary/build_iperf3_receiver_boundaries.sh` builds it in a
+  caller-selected scratch directory. This path never installs or replaces the
+  system executable.
+- `telemetry.receiver_boundaries.receiver_boundary_fields` preserves
+  instrumented edges and identities, rejects malformed producer metadata,
+  and forces capability, clock-validation, and alignment statuses closed.
+  The collector rejects changes to a flow's receiver clock, host, boot, build,
+  or process identity.
 
 The existing `receiver_windows` contract rejects missing/invalid declared
 boundaries, requires clock/host/boot consistency, and computes guaranteed
@@ -36,6 +50,11 @@ Relevant implementation and tests:
 
 - `traffic/traffic_generator.py`: `IntervalTelemetryCollector`,
   `start_receiver_listener`, and `_run_udp_flow`.
+- `tools/receiver-boundary/patches/iperf-3.17.1-receiver-boundaries.patch`:
+  opt-in source prototype; it emits null uncertainty/evidence and a blocked
+  status rather than inventing a bound.
+- `telemetry/receiver_boundaries.py`: producer stream contract parsing and
+  fail-closed status derivation.
 - `telemetry/iperf_parser.py`: `parse_iperf_interval_events` and
   `_parse_interval_payload`.
 - `telemetry/receiver_windows.py`: `validate_receiver_interval_record` and
@@ -52,31 +71,31 @@ Relevant implementation and tests:
 
 | Dimension | A. Instrument iperf3 receiver interval accounting | B. Separate receiver-side measurement producer |
 |---|---|---|
-| Genuine edges | Could capture edges if timestamps are taken at the actual receiver interval accounting transitions, not when JSON is emitted. Repository evidence does not establish that the current iperf3 build exposes those transition points or that an instrumented build is available. | Could capture edges if it owns the measurement window and timestamps the events that define its metrics. A process that only parses iperf output or observes callbacks would not qualify. No such producer exists in the repository. |
+| Genuine edges | The pinned 3.17.1 source stores per-stream interval start/end `iperf_time` values in `iperf_stats_callback`; the prototype exports those values from each receiver stream object. This is source evidence for an instrumentation point, not independent validation of timing truth. | Could capture edges if it owns the measurement window and timestamps the events that define its metrics. A process that only parses iperf output or observes callbacks would not qualify. No such producer exists in the repository. |
 | Required components | Obtain and maintain an instrumented iperf3 source/build; identify the exact accounting transition; capture both edges in the receiver monotonic clock; emit versioned JSON fields while retaining the original relative offsets; teach the telemetry parser/collector to preserve and validate those fields. | Implement a receiver-side producer, its interval/event accounting, versioned output, lifecycle and run identity; make it the authoritative source for the metrics it reports; add an adapter to the collector/parser and keep iperf-relative timing separate. |
 | Identity | Include receiver host and boot identity, the concrete monotonic clock implementation/domain, clock instance identity, iperf build identity, and process-instance identity. | Include receiver host and boot identity, concrete monotonic clock implementation/domain and instance identity, producer build identity, and producer process-instance identity. |
 | Uncertainty and provenance | Characterize edge capture/resolution and accounting-to-timestamp placement. Emit per-edge uncertainty and hash-linked evidence for the method, build, raw characterization data, and independent validation. A source patch or self-declared uncertainty is not independent validation. | Characterize event timestamping and metric accounting in the producer. Emit per-edge uncertainty and hash-linked method, implementation/build, raw characterization data, and independent validation. Any use of packet capture or another measurement backend must specify packet inclusion, loss accounting, and interval semantics. |
 | Offline testing | Test JSON serialization/parsing, malformed values, clock identity changes, interval edge semantics with a deterministic injectable clock, and regression that relative offsets are never copied into absolute fields. The actual patched iperf accounting path also needs an offline build/harness test. | Test the producer's interval state machine using deterministic synthetic event streams and clock injection, output validation, lifecycle/error cases, and metric accounting. Synthetic tests validate software behavior, not timing truth. |
 | Independent validation | Compare emitted edges with a separately instrumented reference at the accounting transition; preserve raw traces/build hashes and quantify edge error under the intended load. Validate the exact binary used, not just a source revision. | Compare the producer's event/metric semantics and edges with an independent reference; quantify timing error and metric agreement, retain raw traces and build hashes, and validate the exact deployed binary. |
-| Compatibility and operational risks | Requires an external source/build process not present here; upstream version drift, build reproducibility, binary distribution, and mismatch with stock iperf3 output are risks. The receiver's measurement meaning can stay close to iperf3 if the true accounting edge is instrumented correctly. | Adds a new runtime component and possibly a second definition of receiver metrics. Packet/accounting semantics may diverge from iperf3; lifecycle, permissions, filtering, performance overhead, and evidence management must be designed. |
+| Compatibility and operational risks | The pinned source/build path now exists; upstream version drift, toolchain/dependency recording, binary distribution, and mismatch with stock iperf3 output remain risks. The receiver's measurement meaning can stay close to iperf3 if the true accounting edge is instrumented correctly. | Adds a new runtime component and possibly a second definition of receiver metrics. Packet/accounting semantics may diverge from iperf3; lifecycle, permissions, filtering, performance overhead, and evidence management must be designed. |
 | Failures that must block | Missing/unsupported instrumentation fields, unsupported binary hash, unknown clock or boot, malformed/non-finite edges, invalid uncertainty evidence, or disagreement between raw and parsed output. | Missing/failed producer, missing or inconsistent identity, invalid evidence, event loss, metric mismatch, or unsupported producer build. It must never fall back to callback time or relative offsets. |
 
-**Recommendation:** unresolved. The repository has no instrumented iperf3
-source/build or independent receiver producer, and therefore does not provide
-evidence that either implementation can be safely selected. Option A is more
-direct if the project can obtain and maintain the relevant iperf3 source and
-instrument the actual accounting transition. Option B is viable only if the
-project accepts a separately specified authoritative receiver measurement
-semantics and its additional runtime/validation burden. The project owner must
-select the source after confirming source availability, metrics semantics, and
-operational ownership.
+**Prototype decision:** option A is selected because the pinned upstream source
+is obtainable and exposes the timestamps used by its server interval-accounting
+records. The source patch and reproducible scratch build are implemented, but
+the system iperf3 path is unchanged and no traffic has used the patched binary.
+The uncertainty study and independent capability validation remain unowned and
+uncompleted. Option B remains a fallback only if later independent testing
+shows the iperf accounting transition does not meet the approved semantics.
 
 ## Draft versioned producer contract
 
-The following is a proposed JSON-lines record shape, not a current collector
-output or evidence that these values can be produced. `schema` identifies the
-contract; `producer`, `clock`, `identity`, and `measurement` must be populated
-from the actual run rather than copied from a template.
+The following is the design-level record shape. The source prototype emits the
+flat interval fields consumed by this project, including stored `iperf_time`
+values and producer identity. Since no uncertainty study has been performed,
+the prototype emits null per-edge uncertainty/evidence and marks the record
+incomplete and alignment-ineligible. It does not emit a schema-valid comparison
+record.
 
 ```json
 {
@@ -248,11 +267,13 @@ an earlier one.
 1. Select and own producer option A or B; document exact metric and interval
    edge semantics and approve the measurement-error budget before setting a
    numeric maximum uncertainty.
-2. Implement the producer and its deterministic clock-injected unit tests.
-   Keep iperf-relative offsets and callback observations in their existing
-   fields and semantics; add separate producer fields.
-3. Add a parser/adapter that validates the versioned producer record without
-   translating relative offsets or observations into absolute boundaries.
+2. The current source patch, scratch build script, parser/collector adapter,
+   and offline contract tests provide an unvalidated prototype. Keep
+   iperf-relative offsets and callback observations in their existing fields
+   and semantics; the adapter never translates them into absolute boundaries.
+3. Independently characterize the exact built binary's edge placement, clock
+   behavior, and per-edge uncertainty against an approved reference. Until
+   then, uncertainty remains null and the aggregation validator rejects rows.
 4. Extend the trial evidence manifest and analyzer to require/hash-check raw
    producer output and capability-validation evidence. Distinguish
    `contract_valid` from independently validated producer capability in the
@@ -284,5 +305,24 @@ an earlier one.
   considered later?
 
 Until these decisions and gates are satisfied, current collected records
-cannot qualify as receiver-boundary-aligned measurements. No producer
-capability, live validation, or live readiness is claimed by this design.
+cannot qualify as receiver-boundary-aligned measurements. Offline source
+inspection/build and contract tests do not establish edge accuracy or bound
+timing error. No producer capability, live validation, or readiness is claimed.
+
+### Reproducible offline prototype build
+
+In WSL, run:
+
+```sh
+bash tools/receiver-boundary/build_iperf3_receiver_boundaries.sh /tmp
+```
+
+The script downloads the official iperf 3.17.1 source archive, verifies SHA-256
+`84404ca8431b595e86c473d8f23d8bb102810001f15feaf610effd3b318788aa`, applies
+the source patch, requires the configured `CLOCK_MONOTONIC` implementation,
+and builds under a fresh `/tmp/adaptive-qos-iperf3-rb.*` directory. It requires
+the OpenSSL development library for hashing `/proc/self/exe` at runtime and
+prints the resulting binary hash. Each emitted record includes that exact
+executable SHA-256 together with the pinned source-archive and patch hashes.
+The build does not install the binary, change the system-default iperf3 path,
+start a server, or launch traffic.

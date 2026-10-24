@@ -41,6 +41,41 @@ def validate_receiver_interval_record(row: Mapping) -> None:
     if not isinstance(boot_id, str) or not boot_id.strip():
         raise ValueError("receiver interval boot_id is required")
     for field in (
+        "clock_unit",
+        "clock_semantics",
+        "boundary_semantics",
+        "producer_name",
+        "producer_version",
+        "producer_build_identity",
+        "producer_binary_sha256",
+        "producer_process_instance_id",
+        "producer_process_start_ticks",
+    ):
+        if not isinstance(row.get(field), str) or not row[field].strip():
+            raise ValueError(f"receiver interval {field} is required")
+    pid = row.get("producer_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("receiver interval producer_pid must be a positive integer")
+    binary_digest = row.get("producer_binary_sha256")
+    if (
+        not isinstance(binary_digest, str)
+        or len(binary_digest) != 64
+        or any(character not in "0123456789abcdef" for character in binary_digest)
+    ):
+        raise ValueError("receiver interval producer_binary_sha256 must be lowercase SHA-256")
+    if row.get("clock_unit") != "seconds":
+        raise ValueError("receiver interval clock_unit must be seconds")
+    if row.get("boundary_metadata_status") != "schema_valid":
+        raise ValueError("receiver interval boundary metadata status is not schema_valid")
+    if row.get("boundary_evidence_integrity_status") != "not_checked":
+        raise ValueError("receiver interval boundary evidence integrity must be not_checked")
+    if row.get("producer_capability_validation_status") != "not_independently_validated":
+        raise ValueError("receiver interval producer capability must remain unvalidated")
+    if row.get("clock_validation_status") != "not_independently_validated":
+        raise ValueError("receiver interval clock must remain independently unvalidated")
+    if row.get("measurement_alignment_eligibility") != "ineligible":
+        raise ValueError("receiver interval alignment must remain ineligible")
+    for field in (
         "absolute_start_seconds",
         "absolute_end_seconds",
         "start_boundary_uncertainty_seconds",

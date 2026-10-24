@@ -29,8 +29,7 @@ from traffic.traffic_generator import IntervalTelemetryCollector
 
 
 def _interval(start=1.0, end=2.0):
-    return json.dumps(
-        {
+    return json.dumps({
             "event": "interval",
             "data": {
                 "streams": [{
@@ -52,8 +51,49 @@ def _interval(start=1.0, end=2.0):
                     "lost_percent": 2.0,
                 },
             },
-        }
-    )
+        })
+
+
+def _receiver_boundary(**overrides):
+    """Synthetic contract fixture; it is not evidence of clock accuracy."""
+    return {
+        "receiver_interval_schema_version": 1,
+        "boundary_source": "receiver_measurement",
+        "clock_domain": "receiver_monotonic",
+        "clock_id": "CLOCK_MONOTONIC:test-boot",
+        "clock_unit": "seconds",
+        "clock_semantics": "Linux CLOCK_MONOTONIC seconds since boot; excludes suspend",
+        "absolute_start_seconds": 1000.0,
+        "absolute_end_seconds": 1001.0,
+        "boundary_semantics": "[start,end); iperf receiver interval-accounting edges",
+        "start_boundary_uncertainty_seconds": 0.0001,
+        "end_boundary_uncertainty_seconds": 0.0002,
+        "boundary_uncertainty_evidence": {
+            "method": "synthetic fixture only",
+            "evidence_path": "boundary.json",
+            "sha256": "a" * 64,
+        },
+        "host_id": "fixture-host",
+        "boot_id": "fixture-boot",
+        "producer_name": "iperf3",
+        "producer_version": "3.17.1",
+        "producer_build_identity": "synthetic-source-and-patch-digests",
+        "producer_binary_sha256": "b" * 64,
+        "producer_process_instance_id": "fixture-boot:123:456",
+        "producer_pid": 123,
+        "producer_process_start_ticks": "456",
+        "producer_capability_validation_status": "validated",
+        "clock_validation_status": "validated",
+        "measurement_alignment_eligibility": "eligible",
+        **overrides,
+    }
+
+
+def _interval_with_boundary(start=1.0, end=2.0, **boundary_overrides):
+    payload = json.loads(_interval(start, end))
+    payload["data"]["streams"][0]["sender"] = False
+    payload["data"]["streams"][0].update(_receiver_boundary(**boundary_overrides))
+    return json.dumps(payload, allow_nan=True)
 
 
 def _client_interval(start=1.0, end=2.0, throughput=4_000_000):
@@ -128,6 +168,166 @@ def test_interval_parser_uses_observation_timestamp_and_metadata():
     assert record["packet_loss_percent"] == 2.0
     assert record["interval_duration_seconds"] == 1.0
     assert record["interval_start_seconds"] == 1.0
+
+
+def test_parser_preserves_receiver_edges_separately_and_forces_unvalidated_status():
+    record = parse_iperf_interval(
+        _interval_with_boundary(0.0, 1.0),
+        source="h1",
+        experiment_id="exp-1",
+        scenario="normal",
+        requested_mbps=3,
+        active_flows=1,
+    )
+
+    assert record["interval_start_seconds"] == 0.0
+    assert record["interval_end_seconds"] == 1.0
+    assert record["absolute_start_seconds"] == 1000.0
+    assert record["absolute_end_seconds"] == 1001.0
+    assert record["boundary_source"] == "receiver_measurement"
+    assert record["boundary_semantics"].startswith("[start,end)")
+    assert record["producer_build_identity"] == "synthetic-source-and-patch-digests"
+    assert record["boundary_metadata_status"] == "schema_valid"
+    assert record["boundary_evidence_integrity_status"] == "not_checked"
+    assert record["producer_capability_validation_status"] == "not_independently_validated"
+    assert record["clock_validation_status"] == "not_independently_validated"
+    assert record["measurement_alignment_eligibility"] == "ineligible"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "receiver_interval_schema_version",
+        "boundary_source",
+        "absolute_start_seconds",
+        "absolute_end_seconds",
+        "clock_id",
+        "host_id",
+        "boot_id",
+        "producer_build_identity",
+        "producer_binary_sha256",
+        "producer_process_instance_id",
+        "start_boundary_uncertainty_seconds",
+        "end_boundary_uncertainty_seconds",
+        "boundary_uncertainty_evidence",
+    ],
+)
+def test_partial_receiver_boundary_output_fails_closed(field):
+    boundary = _receiver_boundary()
+    boundary.pop(field)
+    payload = json.loads(_interval())
+    payload["data"]["streams"][0].update(boundary)
+
+    with pytest.raises(ValueError, match="missing fields"):
+        parse_iperf_interval(
+            json.dumps(payload), "h1", "exp-1", "normal", 3, 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("absolute_start_seconds", float("nan"), "must be finite"),
+        ("absolute_end_seconds", float("inf"), "must be finite"),
+        ("absolute_end_seconds", 999.0, "end must be after start"),
+        ("clock_domain", "callback", "clock domain is unsupported"),
+        ("clock_unit", "milliseconds", "clock unit must be seconds"),
+        ("producer_build_identity", "", "producer_build_identity is required"),
+        ("producer_binary_sha256", "z" * 64, "lowercase SHA-256"),
+        ("producer_process_instance_id", "", "producer_process_instance_id is required"),
+        ("start_boundary_uncertainty_seconds", -0.1, "finite and nonnegative"),
+        ("end_boundary_uncertainty_seconds", float("nan"), "finite and nonnegative"),
+    ],
+)
+def test_receiver_boundary_malformed_and_nonfinite_fields_rejected(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        parse_iperf_interval(
+            _interval_with_boundary(**{field: value}),
+            "h1", "exp-1", "normal", 3, 1,
+        )
+
+
+def test_missing_uncertainty_is_retained_but_marked_invalid_and_ineligible():
+    from telemetry.receiver_windows import validate_receiver_interval_record
+
+    record = parse_iperf_interval(
+        _interval_with_boundary(
+            start_boundary_uncertainty_seconds=None,
+            end_boundary_uncertainty_seconds=None,
+            boundary_uncertainty_evidence={
+                "method": None, "evidence_path": None, "sha256": None,
+            },
+        ),
+        "h1", "exp-1", "normal", 3, 1,
+    )
+
+    assert record["absolute_start_seconds"] == 1000.0
+    assert record["start_boundary_uncertainty_seconds"] is None
+    assert record["boundary_metadata_status"] == "invalid_or_incomplete"
+    assert record["measurement_alignment_eligibility"] == "ineligible"
+    with pytest.raises(ValueError, match="metadata status is not schema_valid"):
+        validate_receiver_interval_record(record)
+
+
+def test_invalid_uncertainty_evidence_digest_is_rejected():
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        parse_iperf_interval(
+            _interval_with_boundary(
+                boundary_uncertainty_evidence={
+                    "method": "characterization",
+                    "evidence_path": "evidence.json",
+                    "sha256": "z" * 64,
+                }
+            ),
+            "h1", "exp-1", "normal", 3, 1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("clock_id", "different-clock", "identity changed"),
+        ("host_id", "different-host", "identity changed"),
+        ("boot_id", "different-boot", "identity changed"),
+        ("producer_build_identity", "different-build", "identity changed"),
+        ("producer_binary_sha256", "c" * 64, "identity changed"),
+        ("producer_process_instance_id", "different-process", "identity changed"),
+    ],
+)
+def test_collector_rejects_boundary_identity_mismatch(field, value, message, tmp_path):
+    collector = IntervalTelemetryCollector(
+        "h1", "normal", 5201, "exp-identity", 3, 1, _FakeMonitor(),
+        output_directory=_run_directory(tmp_path),
+    )
+    collector.add_receiver_event(_interval_with_boundary(0, 1))
+    with pytest.raises(ValueError, match=message):
+        collector.add_receiver_event(
+            _interval_with_boundary(
+                1, 2,
+                absolute_start_seconds=1001.0,
+                absolute_end_seconds=1002.0,
+                **{field: value},
+            )
+        )
+
+
+def test_boundary_source_patch_uses_accounting_edges_and_no_uncertainty_guess():
+    patch_path = (
+        Path(__file__).resolve().parents[1]
+        / "tools" / "receiver-boundary" / "patches"
+        / "iperf-3.17.1-receiver-boundaries.patch"
+    )
+    patch_text = patch_path.read_text(encoding="utf-8")
+
+    assert "interval->interval_start_time" in patch_text
+    assert "interval->interval_end_time" in patch_text
+    assert "producer_binary_sha256" in patch_text
+    assert "EVP_DigestFinal_ex" in patch_text
+    assert "[start,end); iperf receiver interval-accounting edges" in patch_text
+    assert "cJSON_AddNullToObject(stream_json, \"start_boundary_uncertainty_seconds\")" in patch_text
+    assert "not_independently_validated" in patch_text
+    assert "measurement_alignment_eligibility" in patch_text
+    assert "receiver_observation_monotonic_seconds\"" not in patch_text
 
 
 def test_sender_interval_parser_accepts_udp_without_receiver_metrics():

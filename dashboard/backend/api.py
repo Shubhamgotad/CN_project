@@ -32,6 +32,7 @@ MAX_TELEMETRY_HISTORY_BYTES = 25 * 1024 * 1024
 EXPERIMENT_RUN_ROOT = Path(__file__).resolve().parents[2].parent / ".adaptive-qos-runs"
 REPORT_DIRECTORY_ENV = "ADAPTIVE_QOS_REPORT_DIR"
 TELEMETRY_FILE_ENV = "ADAPTIVE_QOS_TELEMETRY_FILE"
+QOS_APPLICATION_ENV = "ADAPTIVE_QOS_ENABLE_APPLICATION"
 REPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 EXPERIMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -192,6 +193,8 @@ class DryRunDecisionResponse(APIModel):
     status: Literal["ready", "stale", "unavailable"]
     dry_run: Literal[True] = True
     applied: Literal[False] = False
+    execution_state: Literal["dry_run"] = "dry_run"
+    application_enabled: bool = False
     telemetry_status: Literal["available", "stale", "unavailable"]
     telemetry_source: Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl", "none"]
     measurement_age_seconds: float | None = None
@@ -210,6 +213,30 @@ class DryRunDecisionResponse(APIModel):
     proposed_policy: dict[str, Any] | None = None
     tc_commands: list[str]
     history: list[dict[str, Any]]
+    message: str
+
+
+class QosApplyRequest(APIModel):
+    profile: Literal["LOW", "MEDIUM", "HIGH"]
+    measurement_timestamp: str = Field(min_length=1, max_length=64)
+    authorization: Literal["APPLY_QOS_PROFILE"]
+
+
+class QosApplyResponse(APIModel):
+    status: Literal["applied_verified"]
+    dry_run: Literal[False] = False
+    applied: Literal[True] = True
+    profile: Literal["LOW", "MEDIUM", "HIGH"]
+    interface: Literal["s1-eth5"]
+    measurement_timestamp: str
+    verification: Literal["kernel_readback_verified"]
+    message: str
+
+
+class QosApplicationStatusResponse(APIModel):
+    status: Literal["verified", "unrecognized", "unavailable"]
+    applied_profile: Literal["LOW", "MEDIUM", "HIGH"] | None = None
+    interface: Literal["s1-eth5"] = "s1-eth5"
     message: str
 
 
@@ -880,9 +907,9 @@ def _latest_experiment_status(reports: list[ReportSummary], root: Path) -> Exper
 
 
 app = FastAPI(
-    title="Adaptive QoS Read-only API",
+    title="Adaptive QoS Dashboard API",
     version=API_VERSION,
-    description="Read-only topology, explicitly configured telemetry, and sanitized offline reports.",
+    description="Read-only telemetry and reports plus explicitly authorized local QoS application.",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -921,7 +948,7 @@ def _require_local_mutation(request: Request) -> None:
         or request.headers.get("host", "").lower() not in _LOCAL_HOSTS
         or not client_is_loopback
     ):
-        raise HTTPException(status_code=403, detail="Traffic execution is restricted to the local dashboard origin.")
+        raise HTTPException(status_code=403, detail="Network changes are restricted to the local dashboard origin.")
 
 
 def _public_experiment(state: dict[str, Any]) -> ExperimentResponse:
@@ -1203,8 +1230,121 @@ def telemetry_history(
 
 @app.get("/api/qos/decision", response_model=DryRunDecisionResponse)
 def qos_dry_run_decision() -> DryRunDecisionResponse:
-    """Return a validated, rule-based QoS proposal; never apply it to the network."""
-    return DryRunDecisionResponse(**decision_loop.evaluate(latest_telemetry()))
+    """Return a validated, rule-based QoS proposal without applying it."""
+    result = decision_loop.evaluate(latest_telemetry())
+    result["application_enabled"] = os.environ.get(QOS_APPLICATION_ENV) == "1"
+    return DryRunDecisionResponse(**result)
+
+
+@app.get("/api/qos/status", response_model=QosApplicationStatusResponse)
+def qos_application_status() -> QosApplicationStatusResponse:
+    from dashboard.backend.execution_manager import (
+        ExecutionUnavailable,
+        TopologyUnavailable,
+        inspect_qos_profile,
+    )
+
+    try:
+        result = inspect_qos_profile()
+    except (TopologyUnavailable, ExecutionUnavailable) as exc:
+        return QosApplicationStatusResponse(
+            status="unavailable",
+            message=f"Applied QoS state could not be read: {exc}",
+        )
+    if (
+        not isinstance(result, dict)
+        or result.get("interface") != "s1-eth5"
+        or result.get("status") not in {"verified", "unrecognized"}
+    ):
+        raise HTTPException(status_code=502, detail="The QoS supervisor returned invalid readback state.")
+    profile = result.get("profile")
+    if profile not in {None, "LOW", "MEDIUM", "HIGH"}:
+        raise HTTPException(status_code=502, detail="The QoS supervisor returned an unsupported profile.")
+    if (result["status"] == "verified") != (profile is not None):
+        raise HTTPException(status_code=502, detail="The QoS supervisor returned inconsistent profile state.")
+    return QosApplicationStatusResponse(
+        status=result["status"],
+        applied_profile=profile,
+        message=(
+            "Current managed QoS profile confirmed by kernel readback."
+            if profile is not None
+            else "No recognized managed profile is confirmed; existing state is not inferred."
+        ),
+    )
+
+
+@app.post("/api/qos/apply", response_model=QosApplyResponse)
+def apply_qos_profile(request: Request, body: QosApplyRequest) -> QosApplyResponse:
+    _require_local_mutation(request)
+    if os.environ.get(QOS_APPLICATION_ENV) != "1":
+        raise HTTPException(
+            status_code=403,
+            detail="QoS application is disabled; explicitly enable it for a trusted local lab.",
+        )
+
+    decision = decision_loop.evaluate(latest_telemetry())
+    measurement = decision.get("measurement")
+    proposed_policy = decision.get("proposed_policy")
+    if (
+        decision.get("status") != "ready"
+        or decision.get("telemetry_status") != "available"
+        or not isinstance(measurement, dict)
+        or not isinstance(proposed_policy, dict)
+        or decision.get("selected_profile") != body.profile
+        or measurement.get("timestamp") != body.measurement_timestamp
+        or decision.get("candidate_profile") is not None
+        or proposed_policy.get("interface") != "s1-eth5"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The fresh, stable QoS proposal changed or is unavailable; refresh the decision before applying.",
+        )
+
+    from dashboard.backend.execution_manager import (
+        ExecutionUnavailable,
+        QosVerificationFailed,
+        TopologyUnavailable,
+        invoke_qos_profile,
+    )
+
+    try:
+        result = invoke_qos_profile(body.profile)
+    except QosVerificationFailed as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "state": "verification_failed",
+                "message": "QoS application did not pass kernel readback verification.",
+            },
+        ) from exc
+    except (TopologyUnavailable, ExecutionUnavailable) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"state": "failed", "message": str(exc)},
+        ) from exc
+
+    if (
+        not isinstance(result, dict)
+        or result.get("status") != "applied_verified"
+        or result.get("profile") != body.profile
+        or result.get("interface") != "s1-eth5"
+        or result.get("kernel_readback_verified") is not True
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "state": "verification_failed",
+                "message": "QoS readback result was incomplete or mismatched.",
+            },
+        )
+    return QosApplyResponse(
+        status="applied_verified",
+        profile=body.profile,
+        interface="s1-eth5",
+        measurement_timestamp=body.measurement_timestamp,
+        verification="kernel_readback_verified",
+        message="The selected profile was applied by the WSL QoS controller and confirmed by kernel readback.",
+    )
 
 
 def _list_report_summaries(root: Path) -> list[ReportSummary]:

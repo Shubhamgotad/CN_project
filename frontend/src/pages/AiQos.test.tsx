@@ -2,7 +2,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiQosDryRunDecision } from "../api/client";
-import { getQosDryRunDecision, getReports } from "../api/client";
+import {
+  ApiRequestError,
+  applyQosProfile,
+  getQosApplicationStatus,
+  getQosDryRunDecision,
+  getReports,
+} from "../api/client";
 import { AiQos } from "./AiQos";
 
 vi.mock("../api/client", () => ({
@@ -10,12 +16,25 @@ vi.mock("../api/client", () => ({
   backendConnection: { baseUrl: "http://127.0.0.1:8000", message: "local" },
   getReport: vi.fn(),
   getReports: vi.fn(),
+  getQosApplicationStatus: vi.fn(),
   getQosDryRunDecision: vi.fn(),
+  applyQosProfile: vi.fn(),
+  ApiRequestError: class extends Error {
+    statusCode: number;
+    lifecycleState?: "failed" | "verification_failed";
+    constructor(message: string, statusCode: number, lifecycleState?: "failed" | "verification_failed") {
+      super(message);
+      this.statusCode = statusCode;
+      this.lifecycleState = lifecycleState;
+    }
+  },
   parseRunnerReport: vi.fn(),
 }));
 
 const getDecisionMock = vi.mocked(getQosDryRunDecision);
 const getReportsMock = vi.mocked(getReports);
+const getQosStatusMock = vi.mocked(getQosApplicationStatus);
+const applyQosProfileMock = vi.mocked(applyQosProfile);
 let root: Root;
 let container: HTMLDivElement;
 
@@ -24,6 +43,8 @@ function decision(overrides: Partial<ApiQosDryRunDecision> = {}): ApiQosDryRunDe
     status: "ready",
     dry_run: true,
     applied: false,
+    execution_state: "dry_run",
+    application_enabled: false,
     telemetry_status: "available",
     telemetry_source: "configured_person1_jsonl",
     measurement_age_seconds: 2.5,
@@ -84,6 +105,22 @@ beforeEach(() => {
   root = createRoot(container);
   getReportsMock.mockReset().mockResolvedValue({ status: "available", message: "No reports", reports: [] });
   getDecisionMock.mockReset().mockResolvedValue(decision());
+  getQosStatusMock.mockReset().mockResolvedValue({
+    status: "unrecognized",
+    applied_profile: null,
+    interface: "s1-eth5",
+    message: "No recognized managed profile.",
+  });
+  applyQosProfileMock.mockReset().mockResolvedValue({
+    status: "applied_verified",
+    dry_run: false,
+    applied: true,
+    profile: "LOW",
+    interface: "s1-eth5",
+    measurement_timestamp: "2026-10-20T10:00:00+00:00",
+    verification: "kernel_readback_verified",
+    message: "Applied and verified.",
+  });
 });
 
 afterEach(async () => {
@@ -95,7 +132,8 @@ afterEach(async () => {
 describe("AI & QoS dry-run decision panel", () => {
   it("displays the returned telemetry and proposed policy as not applied", async () => {
     await render();
-    expect(container.textContent).toContain("Dry Run — Not Applied");
+    expect(container.textContent).toContain("AI & QoS Decision");
+    expect(container.textContent).toContain("Application is disabled by default");
     expect(container.textContent).toContain("Telemetry available");
     expect(container.textContent).toContain("2.997 Mbps throughput");
     expect(container.textContent).toContain("20.630 ms latency");
@@ -125,7 +163,7 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("1 / 2");
     expect(container.textContent).toContain("24.5s");
     expect(container.textContent).toContain("Proposed LOW HTB profile");
-    expect(container.textContent).toContain("dry-run only · not applied");
+    expect(container.textContent).toContain("currently proposed, not an applied-state claim");
     expect(container.textContent).toContain("Predicted congestionUnavailable");
     expect(container.textContent).toContain("No model prediction loaded.");
     expect(container.textContent).toContain("No report loaded");
@@ -167,6 +205,72 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("No safe QoS decision available");
     expect(container.textContent).toContain("No valid telemetry is available.");
     expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+  });
+
+  it("requires explicit authorization and displays a verified application", async () => {
+    getDecisionMock.mockResolvedValue(decision({ application_enabled: true }));
+    getQosStatusMock
+      .mockResolvedValueOnce({
+        status: "unrecognized",
+        applied_profile: null,
+        interface: "s1-eth5",
+        message: "No recognized managed profile.",
+      })
+      .mockResolvedValueOnce({
+        status: "verified",
+        applied_profile: "LOW",
+        interface: "s1-eth5",
+        message: "Kernel readback verified.",
+      });
+    await render();
+
+    const applyButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Apply QoS Profile");
+    expect(applyButton).toBeDefined();
+    await act(async () => applyButton?.click());
+    expect(container.textContent).toContain("pending authorization");
+    const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    expect(checkbox).not.toBeNull();
+    await act(async () => checkbox?.click());
+    const confirmButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Confirm Apply QoS Profile");
+    await act(async () => {
+      confirmButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applyQosProfileMock).toHaveBeenCalledWith(
+      "LOW",
+      "2026-10-20T10:00:00+00:00",
+    );
+    expect(container.textContent).toContain("applied verified");
+    expect(container.textContent).toContain("Currently applied profileLOW");
+    expect(container.textContent).toContain("controller applied and verified");
+  });
+
+  it("shows verification failure without claiming the profile was applied", async () => {
+    getDecisionMock.mockResolvedValue(decision({ application_enabled: true }));
+    applyQosProfileMock.mockRejectedValue(
+      new ApiRequestError("Kernel readback did not match.", 502, "verification_failed"),
+    );
+    await render();
+    const applyButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Apply QoS Profile");
+    await act(async () => applyButton?.click());
+    const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    await act(async () => checkbox?.click());
+    const confirmButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Confirm Apply QoS Profile");
+    await act(async () => {
+      confirmButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("verification failed");
+    expect(container.textContent).toContain("Kernel readback did not match.");
+    expect(container.textContent).not.toContain("applied verified");
   });
 
   it("clears old decision data and explains API failures", async () => {

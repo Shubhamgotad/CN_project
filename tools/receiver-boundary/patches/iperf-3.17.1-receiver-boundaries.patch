@@ -1,0 +1,232 @@
+--- a/src/iperf_api.c
++++ b/src/iperf_api.c
+@@ -84,8 +84,10 @@
+ #include "iperf_util.h"
+ #include "iperf_locale.h"
+ #include "version.h"
++#include "aqos_receiver_boundary_build.h"
+ #if defined(HAVE_SSL)
+ #include <openssl/bio.h>
++#include <openssl/evp.h>
+ #include <openssl/err.h>
+ #include "iperf_auth.h"
+ #endif /* HAVE_SSL */
+@@ -101,6 +103,200 @@
+ static void print_interval_results(struct iperf_test *test, struct iperf_stream *sp, cJSON *json_interval_streams);
+ static cJSON *JSON_read(int fd);
+ static int JSONStream_Output(struct iperf_test *test, const char* event_name, cJSON* obj);
++
++/* Adaptive QoS receiver-boundary prototype. Edges come from the interval
++ * timestamps stored by iperf_stats_callback, not from JSON/callback time. */
++static int
++aqos_read_identity_file(const char *path, char *value, size_t value_size)
++{
++    FILE *file;
++    size_t length;
++    if (value_size == 0)
++        return -1;
++    file = fopen(path, "r");
++    if (file == NULL)
++        return -1;
++    if (fgets(value, (int)value_size, file) == NULL) {
++        fclose(file);
++        return -1;
++    }
++    fclose(file);
++    length = strcspn(value, "\r\n");
++    value[length] = '\0';
++    return length == 0 ? -1 : 0;
++}
++
++static int
++aqos_process_start_ticks(char *value, size_t value_size)
++{
++    FILE *file;
++    char line[4096];
++    char *right_paren, *token, *save = NULL;
++    int field;
++    file = fopen("/proc/self/stat", "r");
++    if (file == NULL)
++        return -1;
++    if (fgets(line, sizeof(line), file) == NULL) {
++        fclose(file);
++        return -1;
++    }
++    fclose(file);
++    /* comm may contain spaces and ')'; field 3 starts after the last ')'. */
++    right_paren = strrchr(line, ')');
++    if (right_paren == NULL || right_paren[1] != ' ')
++        return -1;
++    token = strtok_r(right_paren + 2, " ", &save); /* field 3: state */
++    for (field = 3; field < 22 && token != NULL; ++field)
++        token = strtok_r(NULL, " ", &save);
++    if (token == NULL || field != 22 || strlen(token) >= value_size)
++        return -1;
++    strcpy(value, token);
++    return 0;
++}
++
++static int
++aqos_executable_sha256(char *value, size_t value_size)
++{
++#if defined(HAVE_SSL)
++    unsigned char digest[EVP_MAX_MD_SIZE];
++    unsigned char buffer[8192];
++    unsigned int digest_length = 0;
++    ssize_t count;
++    size_t index;
++    int descriptor;
++    EVP_MD_CTX *context;
++
++    if (value_size < 65)
++        return -1;
++    descriptor = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
++    if (descriptor < 0)
++        return -1;
++    context = EVP_MD_CTX_new();
++    if (context == NULL) {
++        close(descriptor);
++        return -1;
++    }
++    if (EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1) {
++        EVP_MD_CTX_free(context);
++        close(descriptor);
++        return -1;
++    }
++    while ((count = read(descriptor, buffer, sizeof(buffer))) > 0) {
++        if (EVP_DigestUpdate(context, buffer, (size_t)count) != 1) {
++            EVP_MD_CTX_free(context);
++            close(descriptor);
++            return -1;
++        }
++    }
++    close(descriptor);
++    if (count < 0 || EVP_DigestFinal_ex(context, digest, &digest_length) != 1 ||
++        digest_length != 32) {
++        EVP_MD_CTX_free(context);
++        return -1;
++    }
++    EVP_MD_CTX_free(context);
++    for (index = 0; index < digest_length; ++index)
++        snprintf(value + (index * 2), value_size - (index * 2), "%02x",
++                 digest[index]);
++    value[64] = '\0';
++    return 0;
++#else
++    (void)value;
++    (void)value_size;
++    return -1;
++#endif
++}
++
++static void
++aqos_add_receiver_boundary_fields(cJSON *stream_json,
++                                 const struct iperf_interval_results *interval)
++{
++    char host_id[256], boot_id[128], start_ticks[64];
++    char clock_id[256];
++    char process_instance_id[512], build_identity[768];
++    char binary_sha256[65];
++    cJSON *uncertainty_evidence;
++    int boot_id_available;
++    int binary_sha_available;
++
++    cJSON_AddNumberToObject(stream_json, "receiver_interval_schema_version", 1);
++    cJSON_AddStringToObject(stream_json, "boundary_source", "receiver_measurement");
++    cJSON_AddStringToObject(stream_json, "clock_domain", "receiver_monotonic");
++    cJSON_AddStringToObject(stream_json, "clock_unit", "seconds");
++    cJSON_AddStringToObject(stream_json, "clock_semantics",
++        "Linux CLOCK_MONOTONIC seconds since boot; excludes suspend");
++    cJSON_AddNumberToObject(stream_json, "absolute_start_seconds",
++        iperf_time_in_secs((struct iperf_time *)&interval->interval_start_time));
++    cJSON_AddNumberToObject(stream_json, "absolute_end_seconds",
++        iperf_time_in_secs((struct iperf_time *)&interval->interval_end_time));
++    cJSON_AddStringToObject(stream_json, "boundary_semantics",
++        "[start,end); iperf receiver interval-accounting edges");
++
++    if (aqos_read_identity_file("/etc/machine-id", host_id, sizeof(host_id)) == 0)
++        cJSON_AddStringToObject(stream_json, "host_id", host_id);
++    else
++        cJSON_AddNullToObject(stream_json, "host_id");
++    boot_id_available = aqos_read_identity_file(
++        "/proc/sys/kernel/random/boot_id", boot_id, sizeof(boot_id)) == 0;
++    if (boot_id_available) {
++        cJSON_AddStringToObject(stream_json, "boot_id", boot_id);
++        snprintf(clock_id, sizeof(clock_id), "CLOCK_MONOTONIC@%s", boot_id);
++        cJSON_AddStringToObject(stream_json, "clock_id", clock_id);
++    } else {
++        cJSON_AddNullToObject(stream_json, "boot_id");
++        cJSON_AddNullToObject(stream_json, "clock_id");
++    }
++
++    if (boot_id_available &&
++        aqos_process_start_ticks(start_ticks, sizeof(start_ticks)) == 0) {
++        snprintf(process_instance_id, sizeof(process_instance_id),
++                 "%s:%ld:%s", boot_id, (long)getpid(), start_ticks);
++        cJSON_AddStringToObject(stream_json, "producer_process_instance_id",
++                                process_instance_id);
++        cJSON_AddNumberToObject(stream_json, "producer_pid", (double)getpid());
++        cJSON_AddStringToObject(stream_json, "producer_process_start_ticks",
++                                start_ticks);
++    } else {
++        cJSON_AddNullToObject(stream_json, "producer_process_instance_id");
++        cJSON_AddNullToObject(stream_json, "producer_pid");
++        cJSON_AddNullToObject(stream_json, "producer_process_start_ticks");
++    }
++
++    binary_sha_available = aqos_executable_sha256(
++        binary_sha256, sizeof(binary_sha256)) == 0;
++    if (binary_sha_available)
++        cJSON_AddStringToObject(stream_json, "producer_binary_sha256",
++                                binary_sha256);
++    else
++        cJSON_AddNullToObject(stream_json, "producer_binary_sha256");
++    snprintf(build_identity, sizeof(build_identity),
++             "iperf=%s;source_sha256=%s;patch_sha256=%s;binary_sha256=%s",
++             IPERF_VERSION, AQOS_RB_SOURCE_SHA256, AQOS_RB_PATCH_SHA256,
++             binary_sha_available ? binary_sha256 : "unavailable");
++    cJSON_AddStringToObject(stream_json, "producer_name", "iperf3");
++    cJSON_AddStringToObject(stream_json, "producer_version", IPERF_VERSION);
++    cJSON_AddStringToObject(stream_json, "producer_build_identity",
++                            build_identity);
++
++    /* No empirical uncertainty evidence exists yet: keep the prototype
++     * explicitly invalid/ineligible instead of inventing a bound. */
++    cJSON_AddNullToObject(stream_json, "start_boundary_uncertainty_seconds");
++    cJSON_AddNullToObject(stream_json, "end_boundary_uncertainty_seconds");
++    uncertainty_evidence = cJSON_CreateObject();
++    cJSON_AddNullToObject(uncertainty_evidence, "method");
++    cJSON_AddNullToObject(uncertainty_evidence, "evidence_path");
++    cJSON_AddNullToObject(uncertainty_evidence, "sha256");
++    cJSON_AddItemToObject(stream_json, "boundary_uncertainty_evidence",
++                          uncertainty_evidence);
++    cJSON_AddStringToObject(stream_json, "boundary_schema_status",
++                            "incomplete_uncertainty_unavailable");
++    cJSON_AddStringToObject(stream_json, "producer_capability_validation_status",
++                            "not_independently_validated");
++    cJSON_AddStringToObject(stream_json, "clock_validation_status",
++                            "not_independently_validated");
++    cJSON_AddStringToObject(stream_json, "measurement_alignment_eligibility",
++                            "ineligible");
++}
+ 
+ 
+ /*************************** Print usage functions ****************************/
+@@ -4347,9 +4543,14 @@
+ 	    else {
+ 		lost_percent = 0.0;
+ 	    }
+-	    if (test->json_output)
+-		cJSON_AddItemToArray(json_interval_streams, iperf_json_printf("socket: %d  start: %f  end: %f  seconds: %f  bytes: %d  bits_per_second: %f  jitter_ms: %f  lost_packets: %d  packets: %d  lost_percent: %f  omitted: %b sender: %b", (int64_t) sp->socket, (double) st, (double) et, (double) irp->interval_duration, (int64_t) irp->bytes_transferred, bandwidth * 8, (double) irp->jitter * 1000.0, (int64_t) irp->interval_cnt_error, (int64_t) irp->interval_packet_count, (double) lost_percent, irp->omitted, sp->sender));
+-	    else
++	    if (test->json_output) {
++                cJSON *json_stream = iperf_json_printf("socket: %d  start: %f  end: %f  seconds: %f  bytes: %d  bits_per_second: %f  jitter_ms: %f  lost_packets: %d  packets: %d  lost_percent: %f  omitted: %b sender: %b", (int64_t) sp->socket, (double) st, (double) et, (double) irp->interval_duration, (int64_t) irp->bytes_transferred, bandwidth * 8, (double) irp->jitter * 1000.0, (int64_t) irp->interval_cnt_error, (int64_t) irp->interval_packet_count, (double) lost_percent, irp->omitted, sp->sender);
++                if (json_stream != NULL) {
++                    if (test->role == 's' && !sp->sender)
++                        aqos_add_receiver_boundary_fields(json_stream, irp);
++                    cJSON_AddItemToArray(json_interval_streams, json_stream);
++                }
++            } else
+ 		iperf_printf(test, report_bw_udp_format, sp->socket, mbuf, st, et, ubuf, nbuf, irp->jitter * 1000.0, irp->interval_cnt_error, irp->interval_packet_count, lost_percent, irp->omitted?report_omitted:"");
+ 	}
+     }

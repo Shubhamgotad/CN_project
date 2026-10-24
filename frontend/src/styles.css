@@ -155,6 +155,9 @@ h1 { margin: 10px 0 7px; font-size: clamp(26px, 3vw, 34px); line-height: 1.12; l
 .qos-dry-run-explanation ul, .qos-dry-run-history ul { margin: 7px 0 0; padding-left: 20px; color: var(--color-secondary); }
 .qos-dry-run-note { margin: 0; font-size: 12px; }
 .qos-dry-run-history { color: var(--color-secondary); overflow-wrap: anywhere; }
+.qos-apply-authorization { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; border: 1px solid rgba(53, 35, 28, .24); border-radius: 10px; background: rgba(214, 191, 169, .2); }
+.qos-apply-authorization label { display: flex; align-items: center; gap: 8px; flex: 1 1 100%; }
+.qos-apply-authorization input { accent-color: var(--color-primary); }
 @media (max-width: 720px) { .qos-dry-run-summary { grid-template-columns: 1fr; } }
 .api-report-status { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .evidence-errors { padding: 12px 15px; }

@@ -337,6 +337,91 @@ def test_windows_adapter_uses_fixed_argument_list_and_no_shell(monkeypatch):
     ]
 
 
+def test_wsl_qos_apply_runs_topology_guard_and_kernel_verification(monkeypatch):
+    from qos import tc_controller
+
+    calls = []
+    monkeypatch.setattr(supervisor, "verify_topology", lambda: calls.append("topology"))
+    monkeypatch.setattr(
+        tc_controller,
+        "apply_managed_htb_policy",
+        lambda config: calls.append(("apply", config.service_allocations_mbps["gaming"])),
+    )
+    monkeypatch.setattr(
+        tc_controller,
+        "verify_managed_htb_policy",
+        lambda config: calls.append(("verify", config.interface)),
+    )
+    result = supervisor.apply_qos_profile("LOW")
+
+    assert result == {
+        "status": "applied_verified",
+        "profile": "LOW",
+        "interface": "s1-eth5",
+        "kernel_readback_verified": True,
+    }
+    assert calls == ["topology", ("apply", 2.7), ("verify", "s1-eth5")]
+
+
+def test_wsl_qos_apply_rejects_unsupported_profile_before_preflight(monkeypatch):
+    monkeypatch.setattr(
+        supervisor,
+        "verify_topology",
+        lambda: pytest.fail("invalid profile must be rejected before topology access"),
+    )
+    with pytest.raises(ValueError, match="Unsupported QoS profile"):
+        supervisor.apply_qos_profile("custom")
+
+
+def test_wsl_qos_apply_distinguishes_failed_readback(monkeypatch):
+    from qos import tc_controller
+
+    monkeypatch.setattr(supervisor, "verify_topology", lambda: {"bottleneck_interface": "s1-eth5"})
+    monkeypatch.setattr(tc_controller, "apply_managed_htb_policy", lambda _config: [])
+    monkeypatch.setattr(
+        tc_controller,
+        "verify_managed_htb_policy",
+        lambda _config: (_ for _ in ()).throw(
+            tc_controller.TCVerificationError("readback mismatch")
+        ),
+    )
+    with pytest.raises(supervisor.QosVerificationFailed, match="readback mismatch"):
+        supervisor.apply_qos_profile("HIGH")
+
+
+def test_windows_qos_adapter_uses_a_fixed_profile_argument(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(execution_manager.os, "name", "nt")
+    monkeypatch.setattr(execution_manager, "_wsl_project_root", lambda: "/mnt/c/project root")
+    monkeypatch.setattr(
+        execution_manager,
+        "_run_wsl",
+        lambda arguments, *, timeout: captured.update(arguments=arguments, timeout=timeout)
+        or {"status": "applied_verified"},
+    )
+
+    result = execution_manager.invoke_qos_profile("MEDIUM")
+
+    assert result == {"status": "applied_verified"}
+    assert captured["arguments"] == [
+        "python3",
+        "/mnt/c/project root/dashboard/backend/wsl_experiment_supervisor.py",
+        "qos-apply",
+        "MEDIUM",
+    ]
+
+
+def test_windows_qos_adapter_rejects_unallowlisted_profile_before_wsl(monkeypatch):
+    monkeypatch.setattr(execution_manager.os, "name", "nt")
+    monkeypatch.setattr(
+        execution_manager,
+        "_wsl_project_root",
+        lambda: pytest.fail("invalid profile must not reach WSL"),
+    )
+    with pytest.raises(execution_manager.ExecutionUnavailable, match="Unsupported QoS profile"):
+        execution_manager.invoke_qos_profile("custom")
+
+
 def test_windows_adapter_passes_only_validated_scalar_parameters(monkeypatch):
     captured = {}
     monkeypatch.setattr(execution_manager.os, "name", "nt")
