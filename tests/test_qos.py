@@ -8,7 +8,7 @@ from qos import (
     generate_tc_commands,
     get_policy,
 )
-from qos.tc_controller import apply_tc_commands
+from qos.tc_controller import FLOW_PORTS
 from qos.policy import validate_policy
 from qos.validator import validate_allocations, validate_interface
 
@@ -59,64 +59,70 @@ def test_fractional_allocation_and_validation():
         validate_interface("eth0; rm -rf /")
 
 
-def test_tc_commands_are_configurable_and_not_executed():
-    allocations = allocate_bandwidth(10, congestion="HIGH")
+def test_tc_commands_are_nested_and_never_replace_the_root():
+    allocations = {port: 2.5 for port in FLOW_PORTS}
+    priorities = {port: 10 + index for index, port in enumerate(FLOW_PORTS)}
     commands = generate_tc_commands(
-        "demo0",
+        "s1-eth5",
         10,
         allocations,
-        {"gaming": {"port": 5000, "protocol": "udp"}, "video": {"ip": "10.0.0.2"}},
+        priorities,
+        default_port=5204,
     )
-    assert commands[0] == "tc qdisc add dev demo0 root handle 1: htb default 40"
-    assert any("rate 5mbit" in command for command in commands)
-    assert any("fq_codel" in command for command in commands)
-    assert any("dport 5000" in command for command in commands)
-    assert any("dst 10.0.0.2" in command for command in commands)
-
-    called = []
-    apply_tc_commands(["echo safe"], runner=lambda *args, **kwargs: called.append((args, kwargs)))
-    assert called
-
-
-def test_tc_commands_have_root_htb_class_and_child_hierarchy():
-    commands = generate_tc_commands("demo0", 10, allocate_bandwidth(10, congestion="HIGH"))
-    assert commands[0] == "tc qdisc add dev demo0 root handle 1: htb default 40"
-    assert commands[1] == (
-        "tc class add dev demo0 parent 1: classid 1:1 htb rate 10mbit ceil 10mbit"
+    assert commands[0] == (
+        "tc qdisc replace dev s1-eth5 parent 5:1 handle 1: htb default 14"
     )
-    class_commands = [
-        command for command in commands if command.startswith("tc class add")
-    ]
-    qdisc_commands = [
-        command for command in commands if " fq_codel" in command
-    ]
-    assert len(class_commands) == 5
-    assert all("parent 1:1 classid 1:" in command for command in class_commands[1:])
-    assert all(
-        f"parent 1:{class_id}" in command
-        for command, class_id in zip(qdisc_commands, ("10", "20", "30", "40"))
-    )
-
-
-@pytest.mark.parametrize("filter_config", [
-    {"port": 0},
-    {"port": 65536},
-    {"port": "5201"},
-    {"protocol": "icmp", "port": 5201},
-    {"priority": 0, "port": 5201},
-    {"priority": "1", "port": 5201},
-    {"ip": "not-an-ip"},
-    {"dscp": -1},
-    {"dscp": 64},
-])
-def test_invalid_tc_filter_values_are_rejected(filter_config):
-    with pytest.raises(ValueError):
-        generate_tc_commands(
-            "demo0",
-            10,
-            allocate_bandwidth(10, congestion="LOW"),
-            {"web": filter_config},
+    assert "root handle" not in " ".join(commands)
+    assert any("classid 1:1 htb rate 10mbit ceil 10mbit" in c for c in commands)
+    for port, minor in zip(FLOW_PORTS, (11, 12, 13, 14)):
+        assert any(f"classid 1:{minor} htb rate 2.5mbit ceil 2.5mbit" in c for c in commands)
+        assert any(f"parent 1:{minor} handle {110 + (minor - 11) * 10}: netem limit 1000 delay 10ms" in c for c in commands)
+        assert any(
+            f"dev s1-eth5 protocol ip parent 1: prio {priorities[port]} u32 "
+            f"match ip protocol 17 0xff match ip dport {port} 0xffff flowid 1:{minor}" in c
+            for c in commands
         )
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"allocations_mbps": {5201: 1, 5202: 2, 5203: 3}},
+    {"allocations_mbps": {5201: 1, 5202: 2, 5203: 3, 5204: 3}},
+    {"filter_priorities": {5201: 1, 5202: 1, 5203: 3, 5204: 4}},
+    {"default_port": None},
+])
+def test_incomplete_or_unsafe_hierarchy_settings_are_rejected(kwargs):
+    args = {
+        "interface": "s1-eth5",
+        "total_bandwidth_mbps": 10,
+        "allocations_mbps": {port: 2.5 for port in FLOW_PORTS},
+        "filter_priorities": {port: i + 1 for i, port in enumerate(FLOW_PORTS)},
+        "default_port": 5204,
+    }
+    args.update(kwargs)
+    with pytest.raises(ValueError):
+        generate_tc_commands(**args)
+
+
+def test_tc_filters_are_udp_destination_matches_on_client_egress():
+    commands = generate_tc_commands(
+        "s1-eth5", 10, {port: 2.5 for port in FLOW_PORTS},
+        {port: 10 + i for i, port in enumerate(FLOW_PORTS)}, 5204,
+    )
+    filters = [command for command in commands if "filter add" in command]
+    assert len(filters) == 4
+    assert all("dev s1-eth5" in command for command in filters)
+    assert all("protocol ip parent 1:" in command for command in filters)
+    assert all("match ip protocol 17 0xff" in command for command in filters)
+    assert not any("dev s2-eth1" in command for command in commands)
+
+
+def test_controller_rejects_other_interfaces_and_wrong_aggregate():
+    allocations = {port: 2.5 for port in FLOW_PORTS}
+    priorities = {port: index + 1 for index, port in enumerate(FLOW_PORTS)}
+    with pytest.raises(ValueError, match="s1-eth5"):
+        generate_tc_commands("s2-eth1", 10, allocations, priorities, 5204)
+    with pytest.raises(ValueError, match="10 Mbps"):
+        generate_tc_commands("s1-eth5", 9, allocations, priorities, 5204)
 
 
 @pytest.mark.parametrize("state", ["LOW", "MEDIUM", "HIGH"])

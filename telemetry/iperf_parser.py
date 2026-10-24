@@ -1,12 +1,50 @@
 import json
 import math
+import os
 import re
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 _INTERVAL_WRITE_LOCK = threading.Lock()
+_RUN_JSONL_LOCK = threading.Lock()
+_RUN_JSONL_FILES = set()
+
+
+def _open_run_jsonl(path: Path, *, read=False):
+    """Open only files created by this process in an exclusive run directory."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"run evidence file must not be a symlink: {path}")
+    for parent in (path.parent, *path.parent.parents):
+        if parent.exists() and parent.is_symlink():
+            raise ValueError(f"run evidence directory must not contain symlinks: {parent}")
+    identity = os.fspath(path.absolute())
+    if identity not in _RUN_JSONL_FILES:
+        if read or path.exists():
+            raise FileExistsError(
+                f"run evidence file was not exclusively created by this process: {path}"
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        _RUN_JSONL_FILES.add(identity)
+    else:
+        if not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError(f"run evidence file changed type or disappeared: {path}")
+        flags = os.O_RDONLY if read else os.O_WRONLY | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError(f"run evidence target is not a regular file: {path}")
+    return os.fdopen(
+        descriptor,
+        "r" if read else "a",
+        encoding="utf-8",
+    )
 
 
 def parse_iperf_output(
@@ -165,6 +203,50 @@ def parse_iperf_interval_events(
     ]
 
 
+def parse_iperf_sender_interval_events(line, measurement_timestamp=None):
+    """Extract interval timing and throughput from client JSON-stream output."""
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError("iperf event is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("iperf event must be a JSON object")
+    if payload.get("event") != "interval":
+        raise ValueError("iperf event must use event=interval")
+
+    timestamp = measurement_timestamp or datetime.now(timezone.utc).isoformat()
+    events = []
+    for interval in _interval_payloads(payload):
+        if not isinstance(interval, dict):
+            raise ValueError("iperf interval must be an object")
+        summary = interval.get("sum") or interval.get("sum_sent")
+        if not isinstance(summary, dict):
+            streams = interval.get("streams")
+            if not isinstance(streams, list) or not streams:
+                raise ValueError("client interval is missing sum or streams data")
+            summary = streams[0]
+        required = ("start", "end", "bits_per_second")
+        if not all(field in summary for field in required):
+            raise ValueError("client interval is missing timing or throughput")
+        try:
+            start = float(summary["start"])
+            end = float(summary["end"])
+            throughput = float(summary["bits_per_second"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("client interval contains invalid metrics") from exc
+        if not all(math.isfinite(value) for value in (start, end, throughput)):
+            raise ValueError("client interval metrics must be finite")
+        if end <= start or throughput < 0:
+            raise ValueError("client interval timing or throughput is invalid")
+        events.append({
+            "start": start,
+            "end": end,
+            "throughput_mbps": throughput / 1_000_000,
+            "timestamp": timestamp,
+        })
+    return events
+
+
 def parse_iperf_interval(
     line,
     source,
@@ -307,16 +389,26 @@ def _parse_interval_payload(
     }
 
 
-def write_jsonl(record, filename):
+def write_jsonl(record, filename, *, secure_run=False):
     """Append one telemetry record to a JSONL file."""
 
+    if secure_run:
+        with _RUN_JSONL_LOCK:
+            file = _open_run_jsonl(Path(filename))
+            with file:
+                file.write(json.dumps(record) + "\n")
+        return
     with open(filename, "a", encoding="utf-8") as file:
         file.write(json.dumps(record) + "\n")
 
 
-def write_interval_jsonl(record, filename):
+def write_interval_jsonl(record, filename, *, secure_run=False):
     """Write interval samples to a dedicated file, separate from final aggregates."""
-    normalized_path = Path(filename).expanduser().resolve()
+    normalized_path = Path(filename).expanduser()
+    if secure_run:
+        normalized_path = normalized_path.absolute()
+    else:
+        normalized_path = normalized_path.resolve()
     identity = (
         record.get("experiment_id"),
         record.get("source"),
@@ -326,7 +418,11 @@ def write_interval_jsonl(record, filename):
     with _INTERVAL_WRITE_LOCK:
         existing_identities = set()
         if normalized_path.exists():
-            with normalized_path.open("r", encoding="utf-8") as file:
+            if secure_run:
+                file = _open_run_jsonl(normalized_path, read=True)
+            else:
+                file = normalized_path.open("r", encoding="utf-8")
+            with file:
                 for line in file:
                     try:
                         existing = json.loads(line)
@@ -342,6 +438,13 @@ def write_interval_jsonl(record, filename):
                     )
         if identity in existing_identities:
             return False
-        with normalized_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, allow_nan=False) + "\n")
+        if secure_run:
+            with _RUN_JSONL_LOCK:
+                file = _open_run_jsonl(normalized_path)
+                with file:
+                    file.write(json.dumps(record, allow_nan=False) + "\n")
+        else:
+            file = normalized_path.open("a", encoding="utf-8")
+            with file:
+                file.write(json.dumps(record, allow_nan=False) + "\n")
     return True

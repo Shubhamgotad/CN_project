@@ -111,6 +111,14 @@ PERSON1_METADATA_FIELDS = (
     "queue_drops",
 )
 
+PERSON1_STRING_METADATA_FIELDS = (
+    "experiment_id",
+    "scenario",
+    "source",
+    "destination",
+    "traffic_type",
+)
+
 PERSON1_REQUIRED_FIELDS = (
     "timestamp",
     "experiment_id",
@@ -164,6 +172,26 @@ def adapt_person1_telemetry(
     missing = [field for field in PERSON1_REQUIRED_FIELDS if field not in telemetry]
     if missing:
         raise ValueError("missing Person 1 telemetry fields: " + ", ".join(missing))
+
+    for field in PERSON1_STRING_METADATA_FIELDS:
+        value = telemetry[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must be a non-empty string")
+
+    requested_mbps = telemetry["requested_mbps"]
+    if isinstance(requested_mbps, bool) or not isinstance(
+        requested_mbps, (int, float)
+    ):
+        raise ValueError("requested_mbps must be a finite non-negative number")
+    if isinstance(requested_mbps, float) and not math.isfinite(requested_mbps):
+        raise ValueError("requested_mbps must be a finite non-negative number")
+    if requested_mbps < 0:
+        raise ValueError("requested_mbps must be a finite non-negative number")
+
+    for field in ("lost_packets", "total_packets"):
+        value = telemetry[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{field} must be a non-negative integer")
 
     adapted = {
         "timestamp": _timestamp_to_epoch(telemetry["timestamp"]),

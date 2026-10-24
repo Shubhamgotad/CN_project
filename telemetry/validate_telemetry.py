@@ -7,6 +7,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from telemetry.receiver_windows import validate_receiver_interval_record
+
 
 REQUIRED_FIELDS = (
     "timestamp",
@@ -35,10 +37,36 @@ OPTIONAL_INTERVAL_FIELDS = (
     "interval_end_seconds",
     "interval_duration_seconds",
     "interval_id",
+    "measurement_direction",
+    "receiver_interval_schema_version",
+    "boundary_source",
+    "clock_domain",
+    "clock_id",
+    "host_id",
+    "boot_id",
+    "absolute_start_seconds",
+    "absolute_end_seconds",
+    "start_boundary_uncertainty_seconds",
+    "end_boundary_uncertainty_seconds",
+    "boundary_uncertainty_evidence",
+    "receiver_observation_role",
+    "receiver_observation_timestamp",
+    "receiver_observation_monotonic_seconds",
+    "receiver_interval_start_seconds",
+    "receiver_interval_end_seconds",
+    "receiver_interval_duration_seconds",
+    "client_observation_timestamp",
+    "sender_interval_start_seconds",
+    "sender_interval_end_seconds",
+    "sender_interval_duration_seconds",
+    "sender_throughput_mbps",
+    "sender_measurement_source",
     "latency_measurement_timestamp",
     "queue_measurement_timestamp",
     "latency_measurement_age_seconds",
     "queue_measurement_age_seconds",
+    "throughput_measurement_source",
+    "sender_measurement_source",
 )
 
 STRING_FIELDS = (
@@ -48,6 +76,17 @@ STRING_FIELDS = (
     "source",
     "destination",
     "traffic_type",
+    "measurement_direction",
+    "throughput_measurement_source",
+    "sender_measurement_source",
+    "boundary_source",
+    "clock_domain",
+    "clock_id",
+    "host_id",
+    "boot_id",
+    "receiver_observation_role",
+    "receiver_observation_timestamp",
+    "client_observation_timestamp",
 )
 
 NUMERIC_FIELDS = (
@@ -63,6 +102,7 @@ NUMERIC_FIELDS = (
     "active_flows",
     "queue_size",
     "queue_drops",
+    "receiver_interval_schema_version",
 )
 
 NULLABLE_NUMERIC_FIELDS = {
@@ -84,6 +124,7 @@ INTEGER_FIELDS = {
     "active_flows",
     "queue_size",
     "queue_drops",
+    "receiver_interval_schema_version",
 }
 
 
@@ -111,6 +152,8 @@ def _validate_record(record):
 
     for field in (
         "observation_timestamp",
+        "receiver_observation_timestamp",
+        "client_observation_timestamp",
         "latency_measurement_timestamp",
         "queue_measurement_timestamp",
         "interval_id",
@@ -118,9 +161,20 @@ def _validate_record(record):
         if field in record and not isinstance(record[field], str):
             errors.append(f"{field} must be a string")
 
+    throughput_source = record.get("throughput_measurement_source")
+    if throughput_source is not None and throughput_source not in (
+        "client",
+        "receiver",
+    ):
+        errors.append(
+            "throughput_measurement_source must be client or receiver"
+        )
+
     for timestamp_field in (
         "timestamp",
         "observation_timestamp",
+        "receiver_observation_timestamp",
+        "client_observation_timestamp",
         "latency_measurement_timestamp",
         "queue_measurement_timestamp",
     ):
@@ -181,6 +235,18 @@ def _validate_record(record):
         "interval_start_seconds",
         "interval_end_seconds",
         "interval_duration_seconds",
+        "absolute_start_seconds",
+        "absolute_end_seconds",
+        "start_boundary_uncertainty_seconds",
+        "end_boundary_uncertainty_seconds",
+        "receiver_observation_monotonic_seconds",
+        "receiver_interval_start_seconds",
+        "receiver_interval_end_seconds",
+        "receiver_interval_duration_seconds",
+        "sender_interval_start_seconds",
+        "sender_interval_end_seconds",
+        "sender_interval_duration_seconds",
+        "sender_throughput_mbps",
         "latency_measurement_age_seconds",
         "queue_measurement_age_seconds",
     ):
@@ -194,6 +260,35 @@ def _validate_record(record):
     active_flows = record.get("active_flows")
     if isinstance(active_flows, int) and active_flows < 0:
         errors.append("active_flows must be a non-negative integer")
+
+    receiver_boundary_fields = {
+        "receiver_interval_schema_version",
+        "boundary_source",
+        "clock_domain",
+        "clock_id",
+        "host_id",
+        "boot_id",
+        "absolute_start_seconds",
+        "absolute_end_seconds",
+        "start_boundary_uncertainty_seconds",
+        "end_boundary_uncertainty_seconds",
+        "boundary_uncertainty_evidence",
+    }
+    if receiver_boundary_fields.intersection(record):
+        try:
+            validate_receiver_interval_record(record)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if (
+        (
+            "receiver_observation_monotonic_seconds" in record
+            or "receiver_observation_timestamp" in record
+        )
+        and record.get("receiver_observation_role") != "diagnostic_only"
+    ):
+        errors.append(
+            "receiver_observation_monotonic_seconds must be marked diagnostic_only"
+        )
 
     return errors
 

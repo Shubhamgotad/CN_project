@@ -10,6 +10,60 @@ The labels are assigned from measured utilization, latency, and packet loss.
 A trial is MEDIUM only when its measured threshold score is 2 or 3. The
 scenario name or offered traffic rate does not determine the label.
 
+## Receiver/client measurements and scenario commands
+
+Run commands from the repository root while the existing Mininet topology is
+active with hosts `h1`-`h4` and `server` (`server` uses `10.0.0.5`). The
+traffic generator owns the iperf3 receiver listeners for each run. Before
+starting a listener it checks that its port is free; an already-listening
+port is reported rather than being shared or silently reused. Listeners use
+`iperf3 -s -1 --json-stream` in the `server` namespace and exit after their
+single owned client completes; startup failures, timeouts, and interruptions
+are also cleaned up.
+
+Client JSON-stream interval events are authoritative for matched interval
+boundaries, observation timestamps, and throughput. Matching server-side
+interval events provide the UDP receiver's measured jitter, lost packets,
+packet count, and loss percentage. Receiver-only post-client drain intervals
+retain their receiver-observed boundaries, timestamp, and throughput and are
+marked with `throughput_measurement_source=receiver`. The records are paired by
+flow and interval start/end; the
+congestion flow ports are 5201-5204 and the single-client scenarios use 5201.
+An unmatched active interval or receiver event missing UDP metrics fails the
+run with the flow, port, experiment ID, and interval identified. Receiver-only
+intervals are accepted only when they begin at or after the client's final
+interval boundary (within 50 ms); they represent receiver drain time, not
+traffic intervals with missing client metrics. RTT and queue values continue
+to come from the existing freshness-checked monitor. These interval samples are
+written to separate `*_intervals.jsonl` files. The existing
+scenario JSONL aggregate files and their schemas are unchanged: aggregate
+throughput/loss/jitter still comes from each client's completed iperf3 output.
+
+Run any scenario from the repository root:
+
+```text
+python traffic/traffic_generator.py --scenario normal --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5 --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario burst --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario congestion --output-dir /absolute/path/to/isolated-run
+```
+
+The output directory is mandatory and must be outside the project worktree.
+The generator rejects the project dataset tree and its descendants; it does
+not create a campaign manifest or make a run safe on a shared host. Use a
+fresh, approved evidence directory for each isolated run.
+
+`normal` sends one 3 Mbps flow for 20 seconds; `moderate` sends one 6 Mbps
+flow for 20 seconds by default (or the supplied `--rate-mbps`); `burst` runs
+five 3-second 8 Mbps bursts; and `congestion` runs four simultaneous 4 Mbps
+flows from `h1`-`h4` for 20 seconds.
+
+The `congestion` value is a traffic-generator scenario, not a comparison
+condition. The comparison campaign has the four separately defined strata in
+`adaptive-qos-comparison-plan.md`: Baseline/BASELINE and QoS LOW, MEDIUM, and
+HIGH.
+
 ## Fixed network conditions
 
 - Use the existing four-client/two-switch topology.
@@ -26,9 +80,9 @@ append mode at a path anchored to the project directory, so running from another
 working directory does not redirect output or replace prior records.
 
 ```text
-python traffic/traffic_generator.py --scenario moderate
-python traffic/traffic_generator.py --scenario moderate --rate-mbps 7
-python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5
+python traffic/traffic_generator.py --scenario moderate --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7 --output-dir /absolute/path/to/isolated-run
+python traffic/traffic_generator.py --scenario moderate --rate-mbps 7.5 --output-dir /absolute/path/to/isolated-run
 ```
 
 The first command is an independent 6 Mbps baseline run; the existing recorded
