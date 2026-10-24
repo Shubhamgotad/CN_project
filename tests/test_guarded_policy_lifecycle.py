@@ -176,6 +176,23 @@ def test_measurement_exception_still_restores_then_reports_failure(monkeypatch):
     assert state["restores"] == 1
 
 
+def test_keyboard_interrupt_during_measurement_restores_then_propagates(monkeypatch):
+    state = install_fake_backend(monkeypatch)
+
+    def interrupt_measurement():
+        assert state["current"] == MANAGED
+        raise KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle.run_guarded_policy_lifecycle(
+            config(), **live_kwargs(measure=interrupt_measurement)
+        )
+
+    assert state["current"] == BASELINE
+    assert state["applies"] == 1
+    assert state["restores"] == 1
+
+
 def test_non_json_measurement_value_restores_and_fails_closed(monkeypatch):
     state = install_fake_backend(monkeypatch)
 
