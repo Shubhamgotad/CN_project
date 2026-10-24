@@ -618,6 +618,48 @@ def test_moderate_rate_cli_keeps_default_and_accepts_sweep_value(
     assert observed == [expected_rate]
 
 
+def test_experiment_id_cli_is_forwarded_to_selected_scenario(monkeypatch):
+    experiment_id = "8c07075b6d3b448db0d8b1453c1e4ff8"
+    observed = {}
+    monkeypatch.setattr("sys.argv", [
+        "traffic_generator",
+        "--scenario", "normal",
+        "--source-host", "h2",
+        "--experiment-id", experiment_id,
+        "--output-dir", "C:\\temp\\qos-evidence",
+    ])
+    monkeypatch.setattr(
+        traffic_generator,
+        "normal",
+        lambda **kwargs: observed.update(kwargs),
+    )
+
+    traffic_generator.main()
+
+    assert observed["experiment_id"] == experiment_id
+    assert observed["source_host"] == "h2"
+
+
+@pytest.mark.parametrize(
+    "experiment_id",
+    [
+        "not-a-uuid",
+        "8C07075B6D3B448DB0D8B1453C1E4FF8",
+        "8c07075b-6d3b-448d-b0d8-b1453c1e4ff8-extra",
+    ],
+)
+def test_experiment_id_cli_rejects_noncanonical_ids(monkeypatch, experiment_id):
+    monkeypatch.setattr("sys.argv", [
+        "traffic_generator",
+        "--scenario", "normal",
+        "--experiment-id", experiment_id,
+        "--output-dir", "C:\\temp\\qos-evidence",
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        traffic_generator.main()
+
+
 @pytest.mark.parametrize("rate_mbps", [0, -1, float("inf"), float("nan")])
 def test_moderate_rejects_invalid_rate(rate_mbps):
     with pytest.raises(ValueError, match="between 0.1 and 10"):
@@ -729,7 +771,10 @@ def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch, t
         def stop(self):
             return {"latency_ms": 20.0, "queue_size": 0, "queue_drops": 0}
 
-    generated_ids = iter(("trial-id-1", "trial-id-2"))
+    generated_ids = iter((
+        traffic_generator.uuid.UUID("8c07075b6d3b448db0d8b1453c1e4ff8"),
+        traffic_generator.uuid.UUID("fedcba9876543210fedcba9876543210"),
+    ))
     recorded_ids = []
     monkeypatch.setattr(traffic_generator.uuid, "uuid4", lambda: next(generated_ids))
     monkeypatch.setattr(
@@ -755,7 +800,33 @@ def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch, t
         output_directory=tmp_path / "run-2",
     )
 
-    assert recorded_ids == ["trial-id-1", "trial-id-2"]
+    assert recorded_ids == [
+        "8c07075b-6d3b-448d-b0d8-b1453c1e4ff8",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+    ]
+
+
+def test_interval_filename_uses_provided_experiment_id(tmp_path):
+    experiment_id = "8c07075b6d3b448db0d8b1453c1e4ff8"
+    output_directory = traffic_generator._prepare_output_directory(
+        tmp_path / "interval-output"
+    )
+
+    collector = traffic_generator.IntervalTelemetryCollector(
+        "h2",
+        "congestion",
+        5202,
+        experiment_id,
+        4,
+        4,
+        monitor=None,
+        output_directory=output_directory,
+    )
+
+    assert collector.experiment_id == experiment_id
+    assert collector.filename.name == (
+        f"congestion_{experiment_id}_h2_intervals.jsonl"
+    )
 
 
 @pytest.mark.parametrize("scenario", ["normal", "moderate", "burst"])
@@ -765,6 +836,7 @@ def test_single_flow_scenarios_use_selected_host_and_mapped_port(
 ):
     monitors = []
     collectors = []
+    collector_ids = []
     flow_calls = []
     saved = []
 
@@ -780,8 +852,9 @@ def test_single_flow_scenarios_use_selected_host_and_mapped_port(
             return {"latency_ms": None, "queue_size": None, "queue_drops": None}
 
     class FakeCollector:
-        def __init__(self, host, name, port, *_args, **_kwargs):
+        def __init__(self, host, name, port, _experiment_id, *_args, **_kwargs):
             collectors.append((host, name, port))
+            collector_ids.append(_experiment_id)
 
     monkeypatch.setattr(traffic_generator, "ScenarioMonitor", FakeMonitor)
     monkeypatch.setattr(traffic_generator, "IntervalTelemetryCollector", FakeCollector)
@@ -798,12 +871,25 @@ def test_single_flow_scenarios_use_selected_host_and_mapped_port(
     monkeypatch.setattr(traffic_generator.time, "sleep", lambda *_args: None)
 
     output_directory = tmp_path / f"{scenario}-{source_host}"
+    experiment_id = "8c07075b6d3b448db0d8b1453c1e4ff8"
     if scenario == "normal":
-        traffic_generator.normal(output_directory=output_directory, source_host=source_host)
+        traffic_generator.normal(
+            output_directory=output_directory,
+            source_host=source_host,
+            experiment_id=experiment_id,
+        )
     elif scenario == "moderate":
-        traffic_generator.moderate(output_directory=output_directory, source_host=source_host)
+        traffic_generator.moderate(
+            output_directory=output_directory,
+            source_host=source_host,
+            experiment_id=experiment_id,
+        )
     else:
-        traffic_generator.burst(output_directory=output_directory, source_host=source_host)
+        traffic_generator.burst(
+            output_directory=output_directory,
+            source_host=source_host,
+            experiment_id=experiment_id,
+        )
 
     port = traffic_generator.CLIENT_FLOW_PORTS[source_host]
     expected_calls = 5 if scenario == "burst" else 1
@@ -811,7 +897,9 @@ def test_single_flow_scenarios_use_selected_host_and_mapped_port(
     assert all(call[:3] == (source_host, 8 if scenario == "burst" else (6.0 if scenario == "moderate" else 3.0), port) for call in flow_calls)
     assert all(monitor.hosts == [source_host] for monitor in monitors)
     assert all(item[0] == source_host and item[2] == port for item in collectors)
+    assert collector_ids == [experiment_id] * expected_calls
     assert all(item["source"] == source_host for item in saved)
+    assert all(item["experiment_id"] == experiment_id for item in saved)
     assert all(item["active_flows"] == 1 for item in saved)
     if scenario == "burst":
         assert all(call[3] == 3 for call in flow_calls)
@@ -883,10 +971,13 @@ def test_congestion_uses_selected_or_all_approved_client_flows(
     telemetry = []
     monitor_hosts = []
     collector_flows = []
+    collector_ids = []
 
     class FakeProcess:
         def poll(self):
             return None
+
+    experiment_id = "8c07075b6d3b448db0d8b1453c1e4ff8"
 
     class FakeMonitor:
         def __init__(self, hosts):
@@ -899,9 +990,10 @@ def test_congestion_uses_selected_or_all_approved_client_flows(
             return {"latency_ms": None, "queue_size": None, "queue_drops": None}
 
     class FakeCollector:
-        def __init__(self, host, _scenario, port, _id, _rate, active_flows, _monitor, **_kwargs):
+        def __init__(self, host, _scenario, port, collector_id, _rate, active_flows, _monitor, **_kwargs):
             self.host = host
             collector_flows.append((host, port, active_flows))
+            collector_ids.append(collector_id)
 
         def add_receiver_event(self, *_args):
             return None
@@ -945,6 +1037,7 @@ def test_congestion_uses_selected_or_all_approved_client_flows(
         rate_mbps=4,
         duration_seconds=20,
         source_host=source_host,
+        experiment_id=experiment_id,
     )
 
     assert [item[0] for item in launched] == expected_hosts
@@ -953,10 +1046,14 @@ def test_congestion_uses_selected_or_all_approved_client_flows(
     assert [item[:2] for item in collector_flows] == [
         (host, traffic_generator.CLIENT_FLOW_PORTS[host]) for host in expected_hosts
     ]
+    assert collector_ids == [experiment_id] * len(expected_hosts)
     assert all(item[2] == len(expected_hosts) for item in collector_flows)
     for host, command, interface in launched:
         assert interface == traffic_generator.MININET_HOST_INTERFACES[host]
         assert command[command.index("-c") + 1] == "10.0.0.5"
         assert command[command.index("-p") + 1] == str(traffic_generator.CLIENT_FLOW_PORTS[host])
     assert [item["source"] for item in telemetry] == expected_hosts
+    assert [item["experiment_id"] for item in telemetry] == [
+        experiment_id,
+    ] * len(expected_hosts)
     assert all(item["active_flows"] == len(expected_hosts) for item in telemetry)

@@ -1119,13 +1119,33 @@ def _single_source_flow(source_host):
     return source_host, CLIENT_FLOW_PORTS[source_host]
 
 
-def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION, source_host="h1"):
+def _resolve_experiment_id(experiment_id):
+    if experiment_id is None:
+        return str(uuid.uuid4())
+    if not isinstance(experiment_id, str):
+        raise ValueError("experiment ID must be a canonical UUID.")
+    try:
+        parsed = uuid.UUID(experiment_id)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("experiment ID must be a canonical UUID.") from exc
+    if experiment_id not in {parsed.hex, str(parsed)}:
+        raise ValueError("experiment ID must be a canonical UUID.")
+    return experiment_id
+
+
+def normal(
+    output_directory=None,
+    rate_mbps=3.0,
+    duration_seconds=DURATION,
+    source_host="h1",
+    experiment_id=None,
+):
     """One selected-client UDP flow for the requested duration."""
 
     source_host, port = _single_source_flow(source_host)
+    experiment_id = _resolve_experiment_id(experiment_id)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== NORMAL SCENARIO ===")
-    experiment_id = str(uuid.uuid4())
 
     monitor = ScenarioMonitor([source_host]).start()
     collector = IntervalTelemetryCollector(
@@ -1151,7 +1171,13 @@ def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION, sour
     print("\n[TRAFFIC] Normal scenario completed.")
 
 
-def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION, source_host="all"):
+def congestion(
+    output_directory=None,
+    rate_mbps=4.0,
+    duration_seconds=DURATION,
+    source_host="all",
+    experiment_id=None,
+):
     """One selected client or all four clients send UDP through the bottleneck.
 
     A startup or collection failure aborts the scenario without writing
@@ -1159,9 +1185,9 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION, 
     because the scenario result is intentionally all-or-nothing.
     """
 
+    experiment_id = _resolve_experiment_id(experiment_id)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== CONGESTION SCENARIO ===")
-    experiment_id = str(uuid.uuid4())
 
     if source_host == "all":
         selected_hosts = CLIENT_HOSTS
@@ -1266,13 +1292,13 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION, 
 
     print("\n[TRAFFIC] Congestion scenario completed.")
 
-def burst(output_directory=None, source_host="h1"):
+def burst(output_directory=None, source_host="h1", experiment_id=None):
     """Five fixed-rate short UDP bursts from one selected client."""
 
     source_host, port = _single_source_flow(source_host)
+    experiment_id = _resolve_experiment_id(experiment_id)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== BURST SCENARIO ===")
-    experiment_id = str(uuid.uuid4())
 
     for i in range(5):
 
@@ -1306,7 +1332,14 @@ def burst(output_directory=None, source_host="h1"):
 
     print("\n[TRAFFIC] Burst scenario completed.")
 
-def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=DURATION, source_host="h1"):
+def moderate(
+    rate_mbps: float = 6.0,
+    *,
+    output_directory=None,
+    duration_seconds=DURATION,
+    source_host="h1",
+    experiment_id=None,
+):
     """One configurable-rate UDP flow for the requested duration."""
     source_host, port = _single_source_flow(source_host)
     if (
@@ -1320,9 +1353,9 @@ def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int) or not 1 <= duration_seconds <= 60:
         raise ValueError("moderate duration must be a whole number between 1 and 60 seconds")
 
+    experiment_id = _resolve_experiment_id(experiment_id)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== MODERATE SCENARIO ===")
-    experiment_id = str(uuid.uuid4())
     print(f"[EXPERIMENT] experiment_id={experiment_id}")
 
     monitor = ScenarioMonitor([source_host]).start()
@@ -1370,6 +1403,12 @@ def main():
         help="allowlisted Mininet client; all is supported only for Congestion",
     )
     parser.add_argument(
+        "--experiment-id",
+        type=_resolve_experiment_id,
+        default=None,
+        help="canonical UUID identifying this execution",
+    )
+    parser.add_argument(
         "--rate-mbps",
         type=float,
         default=None,
@@ -1405,6 +1444,7 @@ def main():
             rate_mbps=3.0 if args.rate_mbps is None else args.rate_mbps,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
             source_host=source_host,
+            experiment_id=args.experiment_id,
         )
 
     elif args.scenario == "congestion":
@@ -1413,18 +1453,24 @@ def main():
             rate_mbps=4.0 if args.rate_mbps is None else args.rate_mbps,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
             source_host=source_host,
+            experiment_id=args.experiment_id,
         )
 
     elif args.scenario == "burst":
         if args.rate_mbps not in (None, 8.0) or args.duration_seconds not in (None, 23):
             parser.error("Burst uses a fixed 8 Mbps flow schedule lasting 23 seconds")
-        burst(output_directory=args.output_dir, source_host=source_host)
+        burst(
+            output_directory=args.output_dir,
+            source_host=source_host,
+            experiment_id=args.experiment_id,
+        )
     elif args.scenario == "moderate":
         moderate(
             6.0 if args.rate_mbps is None else args.rate_mbps,
             output_directory=args.output_dir,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
             source_host=source_host,
+            experiment_id=args.experiment_id,
         )
 
 
