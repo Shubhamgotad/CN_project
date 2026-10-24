@@ -13,6 +13,7 @@ The module `integration/guarded_policy_lifecycle.py` provides a narrow orchestra
 5. Uses the existing controller apply function, which performs its own ownership preflight, guarded update, kernel read-back, and rollback on a failed application.
 6. Checks that the resulting kernel state matches the requested policy before calling the measurement callback.
 7. Attempts to restore the known original baseline even when measurement fails. It only requests restoration for a complete controller-owned managed hierarchy; an unknown state is not overwritten. The restored baseline must be verified.
+   If the apply/measurement path is interrupted by `KeyboardInterrupt`, `SystemExit`, or generator closure, restoration is attempted before the interruption is re-raised. If restoration cannot be verified, the lifecycle raises `LifecycleSafetyError` and requires manual inspection.
 8. Records hashes of the observed pre-apply, active-policy, and restored state strings to help identify the recorded state. These hashes are not a substitute for independently captured raw kernel evidence.
 
 ## Example shape
