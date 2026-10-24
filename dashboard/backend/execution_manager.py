@@ -114,9 +114,22 @@ def invoke_supervisor(
     scenario: str | None = None,
     rate_mbps: float | None = None,
     duration_seconds: int | None = None,
+    source_host: str | None = None,
 ) -> dict[str, Any] | None:
     if action == "start" and (rate_mbps is None) != (duration_seconds is None):
         raise ExecutionUnavailable("Rate and duration must be provided together.")
+    if action == "start":
+        if not isinstance(scenario, str) or scenario not in {"normal", "moderate", "congestion", "burst"}:
+            raise ExecutionUnavailable("Unsupported traffic scenario.")
+        if source_host is not None and (
+            not isinstance(source_host, str)
+            or source_host not in {"h1", "h2", "h3", "h4", "all"}
+        ):
+            raise ExecutionUnavailable("Unsupported traffic source host.")
+        if source_host == "all" and scenario != "congestion":
+            raise ExecutionUnavailable("All flows are supported only for the congestion scenario.")
+        if source_host is not None and rate_mbps is None:
+            raise ExecutionUnavailable("Rate and duration are required with an explicit source host.")
     project_root = _wsl_project_root()
     helper = f"{project_root.rstrip('/')}/dashboard/backend/wsl_experiment_supervisor.py"
     arguments = ["python3", helper, action]
@@ -128,4 +141,6 @@ def invoke_supervisor(
         arguments.append(format(rate_mbps, ".10g"))
     if duration_seconds is not None:
         arguments.append(str(duration_seconds))
+    if action == "start" and source_host is not None:
+        arguments.append(source_host)
     return _run_wsl(arguments, timeout=30 if action == "stop" else 15)

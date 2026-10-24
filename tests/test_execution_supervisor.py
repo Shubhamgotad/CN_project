@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 import os
@@ -35,6 +36,105 @@ def test_supervisor_preserves_custom_values_and_fixed_burst(scenario, rate, dura
     assert state["duration_seconds"] == duration
     assert state["flows"] == (
         ["h1", "h2", "h3", "h4"] if scenario == "congestion" else ["h1"]
+    )
+    assert state["source_host"] == ("all" if scenario == "congestion" else "h1")
+
+
+@pytest.mark.parametrize("scenario", ["normal", "moderate", "burst"])
+@pytest.mark.parametrize("source_host", ["h1", "h2", "h3", "h4"])
+def test_single_flow_scenarios_plan_the_selected_host(scenario, source_host):
+    state = supervisor._scenario_state(ID, scenario, source_host=source_host)
+    assert state["source_host"] == source_host
+    assert state["flows"] == [source_host]
+
+
+@pytest.mark.parametrize("source_host", ["h1", "h2", "h3", "h4"])
+def test_congestion_can_plan_one_selected_host(source_host):
+    state = supervisor._scenario_state(ID, "congestion", source_host=source_host)
+    assert state["source_host"] == source_host
+    assert state["flows"] == [source_host]
+
+
+def test_all_flows_is_limited_to_congestion():
+    assert supervisor._scenario_state(ID, "congestion", source_host="all")["flows"] == [
+        "h1", "h2", "h3", "h4",
+    ]
+    for scenario in ("normal", "moderate", "burst"):
+        with pytest.raises(ValueError, match="only for the congestion"):
+            supervisor._scenario_state(ID, scenario, source_host="all")
+    with pytest.raises(ValueError, match="source host"):
+        supervisor._scenario_state(ID, "normal", source_host="10.0.0.1")
+
+
+def test_version_three_state_recovery_validates_host_and_flow_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr(supervisor, "RUN_ROOT", tmp_path)
+    run_dir = tmp_path / ID
+    run_dir.mkdir()
+    state_path = run_dir / "state.json"
+    payload = supervisor._scenario_state(ID, "normal", source_host="h3")
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert supervisor._read_state(ID)["flows"] == ["h3"]
+
+    payload["flows"] = ["h1"]
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="state is invalid"):
+        supervisor._read_state(ID)
+
+
+@pytest.mark.parametrize("source_host,port", [
+    ("h1", 5201), ("h2", 5202), ("h3", 5203), ("h4", 5204),
+])
+def test_source_host_is_validated_in_the_actual_producer_command(monkeypatch, tmp_path, source_host, port):
+    state, _writes, process = run_worker_with_fake_producer(monkeypatch, tmp_path, exit_code=0)
+    state["source_host"] = source_host
+    state["flows"] = [source_host]
+    captured = {}
+
+    def fake_popen(argv, **_kwargs):
+        captured["argv"] = argv
+        return process
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", fake_popen)
+    supervisor._worker(ID, "normal", 3.0, 20, source_host)
+    argv = captured["argv"]
+    assert argv[argv.index("--source-host") + 1] == source_host
+    assert supervisor.CLIENT_FLOW_PORTS[source_host] == port
+
+
+def test_preflight_rejects_selected_host_missing_from_verified_topology(monkeypatch):
+    monkeypatch.setattr(supervisor, "verify_topology", lambda: {"hosts": ["h1", "server"]})
+    with pytest.raises(RuntimeError, match="selected Mininet client"):
+        supervisor.start_experiment(ID, "normal", source_host="h3")
+
+
+@pytest.mark.parametrize("source_host", ["h2", "h3", "h4"])
+def test_producer_process_ownership_requires_the_recorded_source_host(
+    monkeypatch, tmp_path, source_host
+):
+    producer = (supervisor.PROJECT_ROOT / "traffic" / "traffic_generator.py").resolve()
+    output_dir = tmp_path / "output"
+    arguments = [
+        supervisor.sys.executable,
+        os.fspath(producer),
+        "--scenario", "normal",
+        "--rate-mbps", "3",
+        "--duration-seconds", "20",
+        "--source-host", source_host,
+        "--output-dir", os.fspath(output_dir),
+    ]
+    monkeypatch.setattr(supervisor, "_pid_start_ticks", lambda _pid: 77)
+    monkeypatch.setattr(
+        supervisor.Path,
+        "read_bytes",
+        lambda _self: b"\0".join(os.fsencode(argument) for argument in arguments) + b"\0",
+    )
+    monkeypatch.setattr(supervisor.os, "readlink", lambda _path: "/usr/bin/python3")
+    assert supervisor._producer_matches(
+        4321, 77, "normal", output_dir, 3.0, 20, source_host
+    )
+    other_host = "h2" if source_host != "h2" else "h3"
+    assert not supervisor._producer_matches(
+        4321, 77, "normal", output_dir, 3.0, 20, other_host
     )
 
 
@@ -138,7 +238,7 @@ def run_worker_with_fake_producer(monkeypatch, tmp_path, *, exit_code=None, max_
     monkeypatch.setattr(supervisor, "_read_state", lambda _id: current_state)
     monkeypatch.setattr(supervisor, "_write_state", lambda _id, value: writes.append(dict(value)))
     monkeypatch.setattr(supervisor, "_run_dir", lambda _id: run_dir)
-    monkeypatch.setattr(supervisor, "verify_topology", lambda: {"hosts": ["h1"]})
+    monkeypatch.setattr(supervisor, "verify_topology", lambda: {"hosts": ["h1", "h2", "h3", "h4"]})
     monkeypatch.setattr(supervisor, "_pid_start_ticks", lambda _pid: 88)
     monkeypatch.setattr(supervisor, "_process_group_has_live_members", lambda _pgid: False)
     monkeypatch.setattr(supervisor.signal, "signal", lambda *_args: None)
@@ -193,7 +293,13 @@ def test_worker_enforces_max_runtime_and_verifies_cleanup(monkeypatch, tmp_path)
 
 def test_worker_passes_custom_parameters_to_existing_producer(monkeypatch, tmp_path):
     state, _writes, _process = run_worker_with_fake_producer(monkeypatch, tmp_path, exit_code=0)
-    state.update({"scenario": "congestion", "target_rate_mbps": 5.0, "duration_seconds": 17})
+    state.update({
+        "scenario": "congestion",
+        "source_host": "all",
+        "flows": ["h1", "h2", "h3", "h4"],
+        "target_rate_mbps": 5.0,
+        "duration_seconds": 17,
+    })
     captured = {}
     def fake_popen(argv, **_kwargs):
         captured["argv"] = argv
@@ -203,6 +309,7 @@ def test_worker_passes_custom_parameters_to_existing_producer(monkeypatch, tmp_p
     assert "--scenario" in captured["argv"]
     assert captured["argv"][captured["argv"].index("--rate-mbps") + 1] == "5"
     assert captured["argv"][captured["argv"].index("--duration-seconds") + 1] == "17"
+    assert captured["argv"][captured["argv"].index("--source-host") + 1] == "all"
 
 
 def test_windows_adapter_uses_fixed_argument_list_and_no_shell(monkeypatch):
@@ -228,8 +335,21 @@ def test_windows_adapter_passes_only_validated_scalar_parameters(monkeypatch):
     monkeypatch.setattr(execution_manager.os, "name", "nt")
     monkeypatch.setattr(execution_manager, "_wsl_project_root", lambda: "/mnt/c/project")
     monkeypatch.setattr(execution_manager, "_run_wsl", lambda arguments, *, timeout: captured.update(arguments=arguments) or {"status": "starting"})
-    execution_manager.invoke_supervisor("start", ID, "congestion", 5.0, 17)
-    assert captured["arguments"][-5:] == ["start", ID, "congestion", "5", "17"]
+    execution_manager.invoke_supervisor("start", ID, "congestion", 5.0, 17, "h3")
+    assert captured["arguments"][-6:] == ["start", ID, "congestion", "5", "17", "h3"]
+
+
+@pytest.mark.parametrize("scenario,source_host", [
+    ("normal", "h5"),
+    ("normal", "10.0.0.1"),
+    ("normal", "all"),
+    ("congestion", "; touch /tmp/nope"),
+])
+def test_windows_adapter_rejects_invalid_source_hosts_before_wsl(scenario, source_host, monkeypatch):
+    monkeypatch.setattr(execution_manager.os, "name", "nt")
+    monkeypatch.setattr(execution_manager, "_wsl_project_root", lambda: pytest.fail("must reject before WSL"))
+    with pytest.raises(execution_manager.ExecutionUnavailable):
+        execution_manager.invoke_supervisor("start", ID, scenario, 3.0, 20, source_host)
 
 
 def test_wsl_adapter_calls_subprocess_with_a_fixed_argv_not_a_shell(monkeypatch):

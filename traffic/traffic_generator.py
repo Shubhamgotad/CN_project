@@ -35,6 +35,8 @@ IPERF_SERVER_PORTS = range(5201, 5205)
 IPERF_LISTENER_START_TIMEOUT_SECONDS = 5.0
 MAX_INTERVAL_MATCH_TOLERANCE_SECONDS = 0.25
 MININET_HOSTS = frozenset({"h1", "h2", "h3", "h4", "server"})
+CLIENT_HOSTS = ("h1", "h2", "h3", "h4")
+CLIENT_FLOW_PORTS = {"h1": 5201, "h2": 5202, "h3": 5203, "h4": 5204}
 MININET_HOST_INTERFACES = {
     host: f"{host}-eth0" for host in MININET_HOSTS
 }
@@ -1111,26 +1113,33 @@ def _run_udp_flow(
     return output
 
 
-def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION):
-    """One 3 Mbps UDP flow for 20 seconds."""
+def _single_source_flow(source_host):
+    if not isinstance(source_host, str) or source_host not in CLIENT_FLOW_PORTS:
+        raise ValueError(f"unsupported traffic source host: {source_host!r}")
+    return source_host, CLIENT_FLOW_PORTS[source_host]
 
+
+def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION, source_host="h1"):
+    """One selected-client UDP flow for the requested duration."""
+
+    source_host, port = _single_source_flow(source_host)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== NORMAL SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
-    monitor = ScenarioMonitor(["h1"]).start()
+    monitor = ScenarioMonitor([source_host]).start()
     collector = IntervalTelemetryCollector(
-        "h1", "normal", 5201, experiment_id, rate_mbps, 1, monitor,
+        source_host, "normal", port, experiment_id, rate_mbps, 1, monitor,
         output_directory=output_directory,
     )
     try:
-        output = _run_udp_flow("h1", rate_mbps, 5201, duration_seconds, collector)
+        output = _run_udp_flow(source_host, rate_mbps, port, duration_seconds, collector)
     finally:
         summary = monitor.stop()
 
     save_telemetry(
         output,
-        source="h1",
+        source=source_host,
         scenario="normal",
         experiment_id=experiment_id,
         requested_mbps=rate_mbps,
@@ -1142,8 +1151,8 @@ def normal(output_directory=None, rate_mbps=3.0, duration_seconds=DURATION):
     print("\n[TRAFFIC] Normal scenario completed.")
 
 
-def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
-    """Four 4 Mbps UDP flows for 20 seconds through the bottleneck.
+def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION, source_host="all"):
+    """One selected client or all four clients send UDP through the bottleneck.
 
     A startup or collection failure aborts the scenario without writing
     incomplete flow records; successfully collected output is not persisted
@@ -1154,17 +1163,19 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
     print("\n=== CONGESTION SCENARIO ===")
     experiment_id = str(uuid.uuid4())
 
+    if source_host == "all":
+        selected_hosts = CLIENT_HOSTS
+    else:
+        selected_hosts = (_single_source_flow(source_host)[0],)
     flows = [
-        ("h1", rate_mbps, 5201),
-        ("h2", rate_mbps, 5202),
-        ("h3", rate_mbps, 5203),
-        ("h4", rate_mbps, 5204),
+        (host, rate_mbps, CLIENT_FLOW_PORTS[host])
+        for host in selected_hosts
     ]
 
-    monitor = ScenarioMonitor(["h1", "h2", "h3", "h4"]).start()
+    monitor = ScenarioMonitor(list(selected_hosts)).start()
     collectors = [
         IntervalTelemetryCollector(
-            host, "congestion", port, experiment_id, rate, 4, monitor,
+            host, "congestion", port, experiment_id, rate, len(flows), monitor,
             output_directory=output_directory,
         )
         for host, rate, port in flows
@@ -1196,7 +1207,7 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
             processes.append(process)
             start_interval_reader(process, collector.add_client_event)
 
-        print("\n[TRAFFIC] All congestion flows started.")
+        print("\n[TRAFFIC] Congestion flow(s) started.")
         for process, flow in zip(processes, flows):
             output = wait_for_process(process, timeout=duration_seconds + 30)
             flow_outputs.append((output, flow))
@@ -1232,7 +1243,7 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
             scenario="congestion",
             traffic_type="udp",
             requested_mbps=rate,
-            active_flows=4,
+            active_flows=len(flows),
             bandwidth_mbps=10.0,
         )
         for output, (host, rate, port) in flow_outputs
@@ -1247,7 +1258,7 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
             scenario="congestion",
             experiment_id=experiment_id,
             requested_mbps=rate,
-            active_flows=4,
+            active_flows=len(flows),
             total_throughput_mbps=total_throughput_mbps,
             output_directory=output_directory,
             **summary,
@@ -1255,9 +1266,10 @@ def congestion(output_directory=None, rate_mbps=4.0, duration_seconds=DURATION):
 
     print("\n[TRAFFIC] Congestion scenario completed.")
 
-def burst(output_directory=None):
-    """Five short UDP traffic bursts."""
+def burst(output_directory=None, source_host="h1"):
+    """Five fixed-rate short UDP bursts from one selected client."""
 
+    source_host, port = _single_source_flow(source_host)
     output_directory = _prepare_output_directory(output_directory)
     print("\n=== BURST SCENARIO ===")
     experiment_id = str(uuid.uuid4())
@@ -1266,19 +1278,19 @@ def burst(output_directory=None):
 
         print(f"\n[TRAFFIC] Starting burst {i + 1}/5")
 
-        monitor = ScenarioMonitor(["h1"]).start()
+        monitor = ScenarioMonitor([source_host]).start()
         collector = IntervalTelemetryCollector(
-            "h1", "burst", 5201, experiment_id, 8, 1, monitor,
+            source_host, "burst", port, experiment_id, 8, 1, monitor,
             output_directory=output_directory,
         )
         try:
-            output = _run_udp_flow("h1", 8, 5201, 3, collector)
+            output = _run_udp_flow(source_host, 8, port, 3, collector)
         finally:
             summary = monitor.stop()
 
         save_telemetry(
             output,
-            source="h1",
+            source=source_host,
             scenario="burst",
             experiment_id=experiment_id,
             requested_mbps=8,
@@ -1294,8 +1306,9 @@ def burst(output_directory=None):
 
     print("\n[TRAFFIC] Burst scenario completed.")
 
-def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=DURATION):
+def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=DURATION, source_host="h1"):
     """One configurable-rate UDP flow for the requested duration."""
+    source_host, port = _single_source_flow(source_host)
     if (
         isinstance(rate_mbps, bool)
         or not isinstance(rate_mbps, (int, float))
@@ -1312,22 +1325,22 @@ def moderate(rate_mbps: float = 6.0, *, output_directory=None, duration_seconds=
     experiment_id = str(uuid.uuid4())
     print(f"[EXPERIMENT] experiment_id={experiment_id}")
 
-    monitor = ScenarioMonitor(["h1"]).start()
+    monitor = ScenarioMonitor([source_host]).start()
     collector = IntervalTelemetryCollector(
-        "h1", "moderate", 5201, experiment_id, rate_mbps, 1, monitor,
+        source_host, "moderate", port, experiment_id, rate_mbps, 1, monitor,
         output_directory=output_directory,
     )
 
     try:
         output = _run_udp_flow(
-            "h1", rate_mbps, 5201, duration_seconds, collector
+            source_host, rate_mbps, port, duration_seconds, collector
         )
     finally:
         summary = monitor.stop()
 
     save_telemetry(
         output,
-        source="h1",
+        source=source_host,
         scenario="moderate",
         experiment_id=experiment_id,
         requested_mbps=rate_mbps,
@@ -1351,6 +1364,12 @@ def main():
         required=True
     )
     parser.add_argument(
+        "--source-host",
+        choices=[*CLIENT_HOSTS, "all"],
+        default=None,
+        help="allowlisted Mininet client; all is supported only for Congestion",
+    )
+    parser.add_argument(
         "--rate-mbps",
         type=float,
         default=None,
@@ -1369,6 +1388,9 @@ def main():
     )
 
     args = parser.parse_args()
+    source_host = args.source_host or ("all" if args.scenario == "congestion" else "h1")
+    if source_host == "all" and args.scenario != "congestion":
+        parser.error("--source-host all is supported only for congestion")
     if args.scenario in {"normal", "moderate", "congestion"}:
         default_rate = {"normal": 3.0, "moderate": 6.0, "congestion": 4.0}[args.scenario]
         rate = default_rate if args.rate_mbps is None else args.rate_mbps
@@ -1382,6 +1404,7 @@ def main():
             output_directory=args.output_dir,
             rate_mbps=3.0 if args.rate_mbps is None else args.rate_mbps,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+            source_host=source_host,
         )
 
     elif args.scenario == "congestion":
@@ -1389,17 +1412,19 @@ def main():
             output_directory=args.output_dir,
             rate_mbps=4.0 if args.rate_mbps is None else args.rate_mbps,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+            source_host=source_host,
         )
 
     elif args.scenario == "burst":
         if args.rate_mbps not in (None, 8.0) or args.duration_seconds not in (None, 23):
             parser.error("Burst uses a fixed 8 Mbps flow schedule lasting 23 seconds")
-        burst(output_directory=args.output_dir)
+        burst(output_directory=args.output_dir, source_host=source_host)
     elif args.scenario == "moderate":
         moderate(
             6.0 if args.rate_mbps is None else args.rate_mbps,
             output_directory=args.output_dir,
             duration_seconds=DURATION if args.duration_seconds is None else args.duration_seconds,
+            source_host=source_host,
         )
 
 

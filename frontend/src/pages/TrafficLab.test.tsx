@@ -159,14 +159,14 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     const notice = container.querySelector('[role="note"][aria-label="Local preview information"]');
     expect(startButton?.disabled).toBe(false);
     expect(stopButton?.disabled).toBe(true);
-    expect(notice?.textContent).toContain("Preview only");
-    expect(notice?.textContent).toContain("Preview configuration stays in your browser.");
-    expect(notice?.textContent).toContain("validated Normal/Moderate/Congestion values");
-    expect(container.textContent).toContain("Not launched here");
+    expect(notice?.textContent).toContain("Preview and execution");
+    expect(notice?.textContent).toContain("Preview stays in your browser");
+    expect(notice?.textContent).toContain("Start executes the selected source and planned flow(s)");
+    expect(container.textContent).toContain("Planned");
 
     await act(async () => previewButton?.click());
     expect(container.textContent).toContain("Local configuration preview");
-    expect(container.textContent).toContain("This browser-only preview does not launch traffic");
+    expect(container.textContent).toContain("This preview does not launch traffic");
     expect(getLatestTelemetryMock).toHaveBeenCalledTimes(1);
   });
 
@@ -183,9 +183,53 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Total offered rate: 16 Mbps"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("h1, h2, h3, h4"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Destination ports: 5201, 5202, 5203, 5204"));
-    expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20);
+    expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20, "all");
     expect(container.textContent).toContain("Starting");
     expect(container.textContent).toContain("Traffic execution");
+  });
+
+  it.each(["normal", "moderate", "burst"] as const)(
+    "sends the selected host to the %s execution request",
+    async (scenarioName) => {
+      const host = "h3" as const;
+      startExecutionMock.mockResolvedValue(execution("starting", {
+        scenario: scenarioName,
+        source_host: host,
+        flows: [host],
+        target_rate_mbps: scenarioName === "normal" ? 3 : scenarioName === "moderate" ? 6 : 8,
+        duration_seconds: scenarioName === "burst" ? 23 : 20,
+      }));
+      vi.stubGlobal("confirm", vi.fn(() => true));
+      await renderTrafficLab();
+
+      const scenario = container.querySelector<HTMLSelectElement>("#scenario");
+      await act(async () => {
+        if (scenario) {
+          scenario.value = scenarioName;
+          scenario.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      });
+      const hostChoice = Array.from(container.querySelectorAll<HTMLButtonElement>(".flow-choice"))
+        .find((button) => button.textContent?.startsWith(`${host} ·`));
+      await act(async () => hostChoice?.click());
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.click());
+
+      expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining(`Selected source: ${host}`));
+      expect(startExecutionMock).toHaveBeenCalledWith(scenarioName, expect.any(Number), expect.any(Number), host);
+      expect(container.textContent).toContain(`API-reported source: ${host}`);
+      expect(container.textContent).toContain(`Actual flows: ${host}`);
+    },
+  );
+
+  it("reports source hosts from the API rather than the changed local selection", async () => {
+    getActiveMock.mockResolvedValue(execution("running", {
+      scenario: "normal",
+      source_host: "h2",
+      flows: ["h2"],
+    }));
+    await renderTrafficLab();
+    expect(container.textContent).toContain("API-reported source: h2");
+    expect(container.textContent).toContain("Actual flows: h2");
   });
 
   it("confirms and sends the actual custom rate and duration", async () => {
@@ -206,7 +250,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Rate: 5 Mbps per flow"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Total offered rate: 20 Mbps"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Duration: 17 seconds"));
-    expect(startExecutionMock).toHaveBeenCalledWith("congestion", 5, 17);
+    expect(startExecutionMock).toHaveBeenCalledWith("congestion", 5, 17, "all");
   });
 
   it("disables Start and explains an out-of-range rate", async () => {
@@ -243,7 +287,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     await act(async () => start?.click());
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Duration: 23 seconds total"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Rate: 8 Mbps per flow"));
-    expect(startExecutionMock).toHaveBeenCalledWith("burst", 8, 23);
+    expect(startExecutionMock).toHaveBeenCalledWith("burst", 8, 23, "h1");
   });
 
   it("retains the Normal default execution values", async () => {
@@ -259,11 +303,11 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     });
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.disabled).toBe(false);
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.click());
-    expect(startExecutionMock).toHaveBeenCalledWith("normal", 3, 20);
+    expect(startExecutionMock).toHaveBeenCalledWith("normal", 3, 20, "h1");
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Destination ports: 5201"));
   });
 
-  it("makes All flows preview-only for Normal and reports only h1 in execution", async () => {
+  it("does not offer All flows outside Congestion and reports the planned host", async () => {
     startExecutionMock.mockResolvedValue(execution("starting", {
       scenario: "normal", flows: ["h1"], target_rate_mbps: 3, duration_seconds: 20,
     }));
@@ -277,17 +321,13 @@ describe("Traffic Lab telemetry and execution boundary", () => {
         scenario.dispatchEvent(new Event("change", { bubbles: true }));
       }
     });
-    const allFlows = Array.from(container.querySelectorAll<HTMLButtonElement>(".flow-choice"))
-      .find((button) => button.textContent?.startsWith("All flows"));
-    await act(async () => allFlows?.click());
-
-    expect(container.textContent).toContain("Normal launches only h1 on UDP 5201");
-    expect(container.textContent).toContain("local selection only");
+    expect(Array.from(container.querySelectorAll(".flow-choice")).some((button) => button.textContent?.startsWith("All flows"))).toBe(false);
+    expect(container.textContent).toContain("Normal plans only h1 on UDP 5201");
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.click());
-    expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Execution flows: h1"));
-    expect(startExecutionMock).toHaveBeenCalledWith("normal", 3, 20);
+    expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Planned execution flows: h1"));
+    expect(startExecutionMock).toHaveBeenCalledWith("normal", 3, 20, "h1");
     expect(container.textContent).toContain("Not in execution");
-    expect(container.textContent).toContain("Outside the server-defined execution plan");
+    expect(container.textContent).toContain("Not included in the API-reported execution");
   });
 
   it("confirms and starts the documented Moderate profile", async () => {
@@ -306,7 +346,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     await act(async () => start?.click());
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Moderate"));
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Rate: 6 Mbps per flow"));
-    expect(startExecutionMock).toHaveBeenCalledWith("moderate", 6, 20);
+    expect(startExecutionMock).toHaveBeenCalledWith("moderate", 6, 20, "h1");
   });
 
   it.each(["h1", "h2", "h3", "h4"] as const)(
@@ -326,12 +366,13 @@ describe("Traffic Lab telemetry and execution boundary", () => {
       expect(startButton?.disabled).toBe(false);
       await act(async () => startButton?.click());
 
-      expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Execution flows: h1, h2, h3, h4"));
+      expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining(`Selected source: ${flow}`));
+      expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining(`Planned execution flows: ${flow}`));
       expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Rate: 4 Mbps per flow"));
       expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Duration: 20 seconds"));
       expect(startExecutionMock).toHaveBeenCalledTimes(1);
-      expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20);
-      expect(container.textContent).toContain("Congestion always launches four concurrent flows");
+      expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20, flow);
+      expect(container.textContent).toContain(`Congestion plans only ${flow}`);
       expect(container.textContent).toContain("h1 · Gaming");
       expect(container.textContent).toContain("h2 · Video Streaming");
       expect(container.textContent).toContain("h3 · Web");
@@ -440,6 +481,7 @@ function execution(status: "starting" | "running" | "stopping" | "completed" | "
   return {
     experiment_id: "0123456789abcdef0123456789abcdef",
     scenario: "congestion",
+    source_host: "all",
     status,
     flows: ["h1", "h2", "h3", "h4"],
     target_rate_mbps: 4,

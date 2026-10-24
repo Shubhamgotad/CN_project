@@ -8,10 +8,10 @@ import type { FlowId } from "../types";
 type Scenario = "normal" | "moderate" | "congestion" | "burst";
 
 const SCENARIOS: Record<Scenario, { label: string; rate: number; duration: number; description: string }> = {
-  normal: { label: "Normal", rate: 3, duration: 20, description: "One 3 Mbps UDP flow for 20 seconds." },
-  moderate: { label: "Moderate", rate: 6, duration: 20, description: "One configurable-rate UDP flow; default 6 Mbps for 20 seconds." },
-  congestion: { label: "Congestion", rate: 4, duration: 20, description: "Four concurrent UDP flows at 4 Mbps each for 20 seconds." },
-  burst: { label: "Burst", rate: 8, duration: 23, description: "Fixed schedule: five 3-second UDP bursts with four 2-second gaps (23 seconds total)." },
+  normal: { label: "Normal", rate: 3, duration: 20, description: "One selected-client 3 Mbps UDP flow for 20 seconds." },
+  moderate: { label: "Moderate", rate: 6, duration: 20, description: "One selected-client configurable-rate UDP flow; default 6 Mbps for 20 seconds." },
+  congestion: { label: "Congestion", rate: 4, duration: 20, description: "All flows: four concurrent UDP flows at 4 Mbps each. Select one client for a single 4 Mbps flow." },
+  burst: { label: "Burst", rate: 8, duration: 23, description: "Fixed schedule from one selected client: five 3-second UDP bursts with four 2-second gaps (23 seconds total)." },
 };
 
 const TELEMETRY_REFRESH_MS = 5_000;
@@ -109,16 +109,18 @@ export function TrafficLab() {
     return () => { active = false; if (timer !== undefined) clearTimeout(timer); };
   }, [execution?.experiment_id, execution?.status, execution?.process_alive]);
 
-  const selectedFlows = useMemo(
-    () => selectedFlow === "all" ? CLIENT_FLOWS : CLIENT_FLOWS.filter((flow) => flow.id === selectedFlow),
-    [selectedFlow],
-  );
   const scenarioDetails = SCENARIOS[scenario];
   const apiConnected = telemetry !== null && !telemetryError;
-  const expectedFlows = scenario === "congestion" ? ["h1", "h2", "h3", "h4"] : ["h1"];
-  const executionPlanHelp = scenario === "congestion"
-    ? "Congestion always launches four concurrent flows: h1–h4 on UDP 5201–5204. Client selection changes only the local preview; it cannot select or remove execution flows."
-    : `${scenarioDetails.label} launches only h1 on UDP 5201. Selecting All flows or another client changes only the local preview and does not change the execution plan.`;
+  const plannedFlows = useMemo(
+    () => scenario === "congestion" && selectedFlow === "all"
+      ? CLIENT_FLOWS
+      : CLIENT_FLOWS.filter((flow) => flow.id === selectedFlow),
+    [scenario, selectedFlow],
+  );
+  const selectedSourceHost = scenario === "congestion" ? selectedFlow : selectedFlow === "all" ? "h1" : selectedFlow;
+  const executionPlanHelp = scenario === "congestion" && selectedFlow === "all"
+    ? "All flows plans four concurrent UDP flows: h1–h4 on UDP 5201–5204."
+    : `${scenarioDetails.label} plans only ${selectedSourceHost} on UDP ${CLIENT_FLOWS.find((flow) => flow.id === selectedSourceHost)?.port}.`;
   const validationReason = !Number.isFinite(rate) || rate < 0.1 || rate > 10 || Math.abs(rate * 10 - Math.round(rate * 10)) > 1e-8
       ? "Rate must be between 0.1 and 10 Mbps per flow, in 0.1 Mbps increments."
       : !Number.isInteger(duration) || duration < 1 || duration > 60
@@ -145,18 +147,18 @@ export function TrafficLab() {
   async function startExecution() {
     if (!canStart) return;
     const preset = SCENARIOS[scenario];
-    const flowNames = expectedFlows.join(", ");
-    const ports = expectedFlows.map((flow) => CLIENT_FLOWS.find((item) => item.id === flow)?.port).filter((port): port is number => port !== undefined);
-    const totalRate = rate * expectedFlows.length;
+    const flowNames = plannedFlows.map((flow) => flow.id).join(", ");
+    const ports = plannedFlows.map((flow) => flow.port);
+    const totalRate = rate * plannedFlows.length;
     const durationLabel = scenario === "burst" ? "23 seconds total (5 × 3-second bursts, 4 × 2-second gaps)" : `${duration} seconds`;
-    const selectionLabel = selectedFlow === "all" ? "All clients selected for local preview only" : `${selectedFlow} selected for local preview only; execution flows remain server-defined`;
-    const confirmation = `Launch real ${preset.label} traffic after the API confirms the expected Mininet topology is running?\n\nExecution flows: ${flowNames}\nClient selection: ${selectionLabel}\nProtocol: UDP\nRate: ${rate} Mbps per flow\nTotal offered rate: ${totalRate} Mbps across ${expectedFlows.length} flow${expectedFlows.length === 1 ? "" : "s"}\nDuration: ${durationLabel}\nDestination ports: ${ports.join(", ")}\n\nThis sends real UDP traffic. Preview configuration does not launch traffic.`;
+    const sourceLabel = selectedFlow === "all" ? "All flows (h1–h4)" : selectedSourceHost;
+    const confirmation = `Launch real ${preset.label} traffic after the API confirms the expected Mininet topology is running?\n\nSelected source: ${sourceLabel}\nPlanned execution flows: ${flowNames}\nProtocol: UDP\nRate: ${rate} Mbps per flow\nTotal offered rate: ${totalRate} Mbps across ${plannedFlows.length} flow${plannedFlows.length === 1 ? "" : "s"}\nDuration: ${durationLabel}\nDestination ports: ${ports.join(", ")}\n\nThis sends real UDP traffic. Preview configuration does not launch traffic.`;
     if (!window.confirm(confirmation)) return;
     setRequestPending("start");
     setExecutionError("");
     setError("");
     try {
-      const result = await startTrafficExecution(scenario as ExecutionScenario, rate, duration);
+      const result = await startTrafficExecution(scenario as ExecutionScenario, rate, duration, selectedSourceHost);
       setExecution(result);
     } catch (reason: unknown) {
       setExecutionError(reason instanceof Error ? reason.message : "Traffic start request failed.");
@@ -186,7 +188,7 @@ export function TrafficLab() {
 
   function updateScenario(value: Scenario) {
     setScenario(value);
-    setSelectedFlow(value === "congestion" ? "all" : "h1");
+    setSelectedFlow(value === "congestion" ? "all" : selectedFlow === "all" ? "h1" : selectedFlow);
     setRate(value === "congestion" ? 4 : SCENARIOS[value].rate);
     setDuration(SCENARIOS[value].duration);
     setPreviewed(false);
@@ -286,19 +288,19 @@ export function TrafficLab() {
             ))}
           </select>
           <p className="field-help">{scenarioDetails.description}</p>
-          <p className="field-help">Client selection affects local preview only. Execution flows are fixed by the selected scenario. Valid Normal, Moderate, and Congestion rate/duration values are sent to the guarded runner after confirmation.</p>
+          <p className="field-help">Client selection sets the source host used by Start. Preview remains local; traffic starts only after you press Start and confirm.</p>
 
           <fieldset className="flow-picker">
             <legend className="field-label">Client selection</legend>
             <div className="flow-choice-grid">
-              <button
+              {scenario === "congestion" && <button
                 type="button"
                 className={`flow-choice ${selectedFlow === "all" ? "flow-choice--active" : ""}`}
                 onClick={() => { setSelectedFlow("all"); setPreviewed(false); }}
                 aria-pressed={selectedFlow === "all"}
               >
-                <strong>All flows · preview</strong><span>h1-h4 · local selection only</span>
-              </button>
+                <strong>All flows</strong><span>h1-h4 · UDP 5201-5204</span>
+              </button>}
               {CLIENT_FLOWS.map((flow) => (
                 <button
                   type="button"
@@ -345,8 +347,8 @@ export function TrafficLab() {
           <div className="execution-notice" role="note" aria-label="Local preview information">
             <ShieldAlert size={15} aria-hidden="true" />
             <div>
-              <strong>Preview only</strong>
-            <span>Preview configuration stays in your browser. Start sends validated Normal/Moderate/Congestion values, or the fixed Burst schedule, only after confirmation. Limits: 0.1–10 Mbps per flow and 1–60 seconds; Burst is fixed at 8 Mbps and 23 seconds total.</span>
+              <strong>Preview and execution</strong>
+              <span>Preview stays in your browser and never launches traffic. Start executes the selected source and planned flow(s) only after confirmation. Limits: 0.1–10 Mbps per flow and 1–60 seconds; Burst is fixed at 8 Mbps and 23 seconds total.</span>
             </div>
           </div>
         </section>
@@ -360,34 +362,34 @@ export function TrafficLab() {
           {!executionLoading && !execution && !executionError && <p className="api-data-card__message" role="status">No guarded traffic experiment has been started.</p>}
           {execution && <div className={`execution-state execution-state--${execution.status}`} role="status">
             <strong>{execution.status[0].toUpperCase() + execution.status.slice(1)}</strong>
-            <span>{SCENARIOS[execution.scenario].label} · {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps per flow · {execution.duration_seconds}s</span>
+            <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps per flow · {execution.duration_seconds}s</span>
             <span>Elapsed {execution.elapsed_seconds.toFixed(1)}s{execution.process_exit_code !== null ? ` · Process exit ${execution.process_exit_code}` : ""}</span>
             {execution.error && <span className="execution-state__error">{execution.error}</span>}
             {executionError && <span className="execution-state__error">Last status refresh failed. Showing the last confirmed process state.</span>}
           </div>}
           <div className="flow-status-list">
             {CLIENT_FLOWS.map((flow) => {
-              const includedInExecution = execution?.flows.includes(flow.id) ?? false;
-              const flowStatus = includedInExecution
-                ? execution?.status === "failed" ? "Outcome unavailable" : execution?.status
-                : execution ? "Not in execution" : "Not launched here";
-              const flowDetail = includedInExecution && execution?.status === "failed"
-                ? "Scenario failed; per-flow result is not reported"
-                : includedInExecution
-                  ? `Scenario elapsed ${execution?.elapsed_seconds.toFixed(1)}s`
-                  : execution ? "Outside the server-defined execution plan" : "Progress not monitored";
+              const inActualExecution = execution?.flows.includes(flow.id) ?? false;
+              const inPlan = execution ? inActualExecution : plannedFlows.some((planned) => planned.id === flow.id);
+              const flowStatus = execution && inActualExecution
+                ? execution.status
+                : inPlan ? execution ? "Planned" : selectedFlow === flow.id ? "Selected · planned" : "Planned"
+                  : execution ? "Not in execution" : "Not planned";
+              const flowDetail = execution && inActualExecution
+                ? execution.status === "failed" ? "Execution failed; per-flow result is unavailable" : `API execution elapsed ${execution.elapsed_seconds.toFixed(1)}s`
+                : inPlan ? "Included in the current Start plan" : execution ? "Not included in the API-reported execution" : "Outside the current plan";
               return <div className="flow-status-row" key={flow.id}>
                 <span className="flow-status-marker" />
                 <div><strong>{flow.id} · {flow.service}</strong><small>UDP destination port {flow.port}</small></div>
-                <span className="flow-run-state"><span className={`status-pill ${includedInExecution ? "status-pill--surface" : "status-pill--muted"}`}>{flowStatus}</span><small>{flowDetail}</small></span>
+                <span className="flow-run-state"><span className={`status-pill ${inPlan ? "status-pill--surface" : "status-pill--muted"}`}>{flowStatus}</span><small>{flowDetail}</small></span>
               </div>
             })}
           </div>
           {previewed ? (
             <div className="preview-result" role="status">
               <div className="preview-result__title"><Check size={16} /> Local configuration preview</div>
-              <p>{SCENARIOS[scenario].label} · {selectedFlows.length} locally selected flow{selectedFlows.length === 1 ? "" : "s"} · {rate} Mbps each · {duration}s</p>
-              <small>This browser-only preview does not launch traffic or change the server-defined execution flow plan.</small>
+              <p>{SCENARIOS[scenario].label} · selected source {selectedFlow === "all" ? "All flows" : selectedSourceHost} · planned: {plannedFlows.map((flow) => flow.id).join(", ")} · {rate} Mbps each · {duration}s</p>
+              <small>This preview does not launch traffic. Start uses this plan after confirmation.</small>
             </div>
           ) : (
             <div className="summary-empty"><span>01</span><p>Select options, then preview the local configuration.</p></div>

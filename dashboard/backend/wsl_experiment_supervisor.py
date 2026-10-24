@@ -18,6 +18,9 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, os.fspath(PROJECT_ROOT))
+from traffic.traffic_generator import CLIENT_FLOW_PORTS
+
 RUN_ROOT = PROJECT_ROOT.parent / ".adaptive-qos-runs"
 MAX_RUNTIME_SECONDS = 90
 GRACEFUL_STOP_SECONDS = 18
@@ -35,7 +38,7 @@ MAX_DURATION_SECONDS = 60
 
 
 def _execution_parameters(scenario: str, rate_mbps=None, duration_seconds=None):
-    if scenario not in SCENARIOS:
+    if not isinstance(scenario, str) or scenario not in SCENARIOS:
         raise ValueError("Unsupported traffic scenario.")
     defaults = SCENARIOS[scenario]
     rate = defaults["rate_mbps"] if rate_mbps is None else rate_mbps
@@ -55,14 +58,35 @@ def _execution_parameters(scenario: str, rate_mbps=None, duration_seconds=None):
     return float(rate), duration
 
 
+def _selected_source_host(scenario: str, source_host: str | None) -> str:
+    if not isinstance(scenario, str) or scenario not in SCENARIOS:
+        raise ValueError("Unsupported traffic scenario.")
+    if source_host is None:
+        return "all" if scenario == "congestion" else "h1"
+    if not isinstance(source_host, str) or source_host not in {*CLIENT_FLOW_PORTS, "all"}:
+        raise ValueError("Unsupported traffic source host.")
+    if source_host == "all" and scenario != "congestion":
+        raise ValueError("All flows are supported only for the congestion scenario.")
+    return source_host
+
+
+def _planned_flows(scenario: str, source_host: str) -> list[str]:
+    if source_host == "all":
+        return list(SCENARIOS[scenario]["flows"])
+    return [source_host]
+
+
 def _rate_arg(rate: float) -> str:
     return format(rate, ".10g")
 
 
 def _tracked_parameters(state: dict[str, Any]):
-    if state.get("execution_contract_version") == 2:
-        return state["target_rate_mbps"], state["duration_seconds"]
-    return None, None
+    version = state.get("execution_contract_version")
+    if version == 3:
+        return state["target_rate_mbps"], state["duration_seconds"], state["source_host"]
+    if version == 2:
+        return state["target_rate_mbps"], state["duration_seconds"], None
+    return None, None, None
 
 
 def _wait_for_supervisor_ready(experiment_id: str, process, *, timeout: float = 5.0) -> dict[str, Any]:
@@ -114,6 +138,21 @@ def _read_state(experiment_id: str) -> dict[str, Any]:
         payload = json.load(stream)
     if not isinstance(payload, dict) or payload.get("experiment_id") != experiment_id:
         raise ValueError("Experiment state is invalid.")
+    if payload.get("execution_contract_version") == 3:
+        scenario = payload.get("scenario")
+        source_host = _selected_source_host(scenario, payload.get("source_host"))
+        rate, duration = _execution_parameters(
+            scenario,
+            payload.get("target_rate_mbps"),
+            payload.get("duration_seconds"),
+        )
+        if (
+            payload.get("source_host") != source_host
+            or payload.get("flows") != _planned_flows(scenario, source_host)
+            or payload.get("target_rate_mbps") != rate
+            or payload.get("duration_seconds") != duration
+        ):
+            raise ValueError("Experiment state is invalid.")
     return payload
 
 
@@ -188,10 +227,16 @@ def _supervisor_matches(state: dict[str, Any]) -> bool:
             _rate_arg(float(state["target_rate_mbps"])),
             str(state["duration_seconds"]),
         ])
+    elif state.get("execution_contract_version") == 3:
+        expected.extend([
+            _rate_arg(float(state["target_rate_mbps"])),
+            str(state["duration_seconds"]),
+            state["source_host"],
+        ])
     return actual == expected and executable.startswith("python3")
 
 
-def _producer_matches(pid: int, start_ticks: int, scenario: str, output_dir: Path, rate_mbps=None, duration_seconds=None) -> bool:
+def _producer_matches(pid: int, start_ticks: int, scenario: str, output_dir: Path, rate_mbps=None, duration_seconds=None, source_host=None) -> bool:
     if _pid_start_ticks(pid) != start_ticks:
         return False
     try:
@@ -210,6 +255,8 @@ def _producer_matches(pid: int, start_ticks: int, scenario: str, output_dir: Pat
     ]
     if rate_mbps is not None and duration_seconds is not None:
         expected.extend(["--rate-mbps", _rate_arg(rate), "--duration-seconds", str(duration)])
+    if source_host is not None:
+        expected.extend(["--source-host", _selected_source_host(scenario, source_host)])
     expected.extend(["--output-dir", os.fspath(output_dir)])
     return actual == expected and executable.startswith("python3")
 
@@ -293,17 +340,18 @@ def verify_topology() -> dict[str, Any]:
     return {"hosts": sorted(hosts), "bridges": ["s1", "s2"], "bottleneck_interface": "s1-eth5"}
 
 
-def _scenario_state(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None) -> dict[str, Any]:
+def _scenario_state(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None, source_host=None) -> dict[str, Any]:
     rate_mbps, duration_seconds = _execution_parameters(scenario, rate_mbps, duration_seconds)
-    values = SCENARIOS[scenario]
+    source_host = _selected_source_host(scenario, source_host)
     now = _utc_now()
     return {
         "experiment_id": experiment_id,
-        "execution_contract_version": 2,
+        "execution_contract_version": 3,
         "supervisor_ready": False,
         "scenario": scenario,
+        "source_host": source_host,
         "status": "starting",
-        "flows": values["flows"],
+        "flows": _planned_flows(scenario, source_host),
         "target_rate_mbps": rate_mbps,
         "duration_seconds": duration_seconds,
         "created_at": now,
@@ -322,10 +370,14 @@ def _scenario_state(experiment_id: str, scenario: str, rate_mbps=None, duration_
     }
 
 
-def start_experiment(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None) -> dict[str, Any]:
+def start_experiment(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None, source_host=None) -> dict[str, Any]:
     experiment_id = _experiment_id(experiment_id)
     rate_mbps, duration_seconds = _execution_parameters(scenario, rate_mbps, duration_seconds)
+    source_host = _selected_source_host(scenario, source_host)
     topology = verify_topology()
+    expected_hosts = _planned_flows(scenario, source_host)
+    if any(host not in topology["hosts"] for host in expected_hosts):
+        raise RuntimeError("A selected Mininet client is not available.")
     lock = _locked_root()
     try:
         for path in RUN_ROOT.iterdir():
@@ -348,13 +400,13 @@ def start_experiment(experiment_id: str, scenario: str, rate_mbps=None, duration
         run_dir = _run_dir(experiment_id)
         run_dir.mkdir(mode=0o700)
         output_dir = run_dir / "output"
-        payload = _scenario_state(experiment_id, scenario, rate_mbps, duration_seconds)
+        payload = _scenario_state(experiment_id, scenario, rate_mbps, duration_seconds, source_host)
         payload["topology_verified"] = topology
         _write_state(experiment_id, payload)
         log_path = run_dir / "supervisor.log"
         with log_path.open("xb") as log:
             process = subprocess.Popen(
-                [sys.executable, os.fspath(Path(__file__).resolve()), "run", experiment_id, scenario, _rate_arg(rate_mbps), str(duration_seconds)],
+                [sys.executable, os.fspath(Path(__file__).resolve()), "run", experiment_id, scenario, _rate_arg(rate_mbps), str(duration_seconds), source_host],
                 cwd=PROJECT_ROOT,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
@@ -449,8 +501,9 @@ def _stop_producer(process: subprocess.Popen[bytes], start_ticks: int) -> bool:
     return stopped
 
 
-def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None) -> None:
+def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None, source_host=None) -> None:
     rate_mbps, duration_seconds = _execution_parameters(scenario, rate_mbps, duration_seconds)
+    source_host = _selected_source_host(scenario, source_host)
     stop_requested = threading.Event()
     signal.signal(signal.SIGUSR1, lambda *_: stop_requested.set())
     signal.signal(signal.SIGTERM, lambda *_: stop_requested.set())
@@ -476,7 +529,19 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
     producer: subprocess.Popen[bytes] | None = None
     producer_ticks: int | None = None
     try:
-        verify_topology()
+        if (
+            state.get("execution_contract_version") != 3
+            or state.get("scenario") != scenario
+            or state.get("source_host") != source_host
+            or state.get("target_rate_mbps") != rate_mbps
+            or state.get("duration_seconds") != duration_seconds
+            or state.get("flows") != _planned_flows(scenario, source_host)
+        ):
+            raise RuntimeError("Experiment state does not match the validated execution request.")
+        topology = verify_topology()
+        expected_hosts = _planned_flows(scenario, source_host)
+        if any(host not in topology["hosts"] for host in expected_hosts):
+            raise RuntimeError("A selected Mininet client is not available.")
         if stop_requested.is_set():
             state.update({"status": "stopped", "process_alive": False, "can_stop": False})
             return
@@ -489,6 +554,7 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
                 "--scenario", scenario,
                 "--rate-mbps", _rate_arg(rate_mbps),
                 "--duration-seconds", str(duration_seconds),
+                "--source-host", source_host,
                 "--output-dir", os.fspath(output_dir),
             ]
             producer = subprocess.Popen(
@@ -524,7 +590,7 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
                 state["process_exit_code"] = producer.poll()
                 state["process_alive"] = not stopped
                 state["can_stop"] = not stopped and _producer_matches(
-                    producer.pid, producer_ticks, scenario, output_dir, rate_mbps, duration_seconds
+                    producer.pid, producer_ticks, scenario, output_dir, rate_mbps, duration_seconds, source_host
                 )
                 state["status"] = "stopped" if stopped else "failed"
                 state["error"] = None if stopped else "Producer termination could not be verified; workload state is uncertain."
@@ -566,7 +632,7 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
             producer is not None
             and producer_ticks is not None
             and producer.poll() is None
-            and _producer_matches(producer.pid, producer_ticks, scenario, _run_dir(experiment_id) / "output", rate_mbps, duration_seconds)
+            and _producer_matches(producer.pid, producer_ticks, scenario, _run_dir(experiment_id) / "output", rate_mbps, duration_seconds, source_host)
         )
         state["error"] = str(exc)[:240] if isinstance(exc, (RuntimeError, ValueError)) else "Producer failed unexpectedly."
     finally:
@@ -705,14 +771,16 @@ def main(argv: list[str] | None = None) -> int:
         action = arguments[0]
         if action == "preflight" and len(arguments) == 1:
             result = {"status": "ready", "topology": verify_topology()}
-        elif action == "start" and len(arguments) in {3, 5}:
-            rate = float(arguments[3]) if len(arguments) == 5 else None
-            duration = int(arguments[4]) if len(arguments) == 5 else None
-            result = start_experiment(arguments[1], arguments[2], rate, duration)
-        elif action == "run" and len(arguments) in {3, 5}:
-            rate = float(arguments[3]) if len(arguments) == 5 else None
-            duration = int(arguments[4]) if len(arguments) == 5 else None
-            _worker(_experiment_id(arguments[1]), arguments[2], rate, duration)
+        elif action == "start" and len(arguments) in {3, 5, 6}:
+            rate = float(arguments[3]) if len(arguments) >= 5 else None
+            duration = int(arguments[4]) if len(arguments) >= 5 else None
+            source_host = arguments[5] if len(arguments) == 6 else None
+            result = start_experiment(arguments[1], arguments[2], rate, duration, source_host)
+        elif action == "run" and len(arguments) in {3, 5, 6}:
+            rate = float(arguments[3]) if len(arguments) >= 5 else None
+            duration = int(arguments[4]) if len(arguments) >= 5 else None
+            source_host = arguments[5] if len(arguments) == 6 else None
+            _worker(_experiment_id(arguments[1]), arguments[2], rate, duration, source_host)
             return 0
         elif action == "status" and len(arguments) == 2:
             result = status_experiment(arguments[1])

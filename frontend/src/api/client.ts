@@ -28,6 +28,7 @@ export type ExecutionStatus = "starting" | "running" | "stopping" | "completed" 
 export interface ApiExecution {
   experiment_id: string;
   scenario: ExecutionScenario;
+  source_host: "h1" | "h2" | "h3" | "h4" | "all" | null;
   status: ExecutionStatus;
   flows: string[];
   target_rate_mbps: number;
@@ -355,11 +356,12 @@ export function startTrafficExecution(
   scenario: ExecutionScenario,
   rate_mbps: number,
   duration_seconds: number,
+  source_host: "h1" | "h2" | "h3" | "h4" | "all",
 ): Promise<ApiExecution> {
   return requestJson<ApiExecution>("/api/experiments/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ scenario, rate_mbps, duration_seconds }),
+    body: JSON.stringify({ scenario, source_host, rate_mbps, duration_seconds }),
   });
 }
 

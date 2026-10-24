@@ -756,3 +756,207 @@ def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch, t
     )
 
     assert recorded_ids == ["trial-id-1", "trial-id-2"]
+
+
+@pytest.mark.parametrize("scenario", ["normal", "moderate", "burst"])
+@pytest.mark.parametrize("source_host", ["h1", "h2", "h3", "h4"])
+def test_single_flow_scenarios_use_selected_host_and_mapped_port(
+    monkeypatch, tmp_path, scenario, source_host
+):
+    monitors = []
+    collectors = []
+    flow_calls = []
+    saved = []
+
+    class FakeMonitor:
+        def __init__(self, hosts):
+            self.hosts = hosts
+            monitors.append(self)
+
+        def start(self):
+            return self
+
+        def stop(self):
+            return {"latency_ms": None, "queue_size": None, "queue_drops": None}
+
+    class FakeCollector:
+        def __init__(self, host, name, port, *_args, **_kwargs):
+            collectors.append((host, name, port))
+
+    monkeypatch.setattr(traffic_generator, "ScenarioMonitor", FakeMonitor)
+    monkeypatch.setattr(traffic_generator, "IntervalTelemetryCollector", FakeCollector)
+    monkeypatch.setattr(
+        traffic_generator,
+        "_run_udp_flow",
+        lambda *args: flow_calls.append(args) or "iperf",
+    )
+    monkeypatch.setattr(
+        traffic_generator,
+        "save_telemetry",
+        lambda *args, **kwargs: saved.append(kwargs),
+    )
+    monkeypatch.setattr(traffic_generator.time, "sleep", lambda *_args: None)
+
+    output_directory = tmp_path / f"{scenario}-{source_host}"
+    if scenario == "normal":
+        traffic_generator.normal(output_directory=output_directory, source_host=source_host)
+    elif scenario == "moderate":
+        traffic_generator.moderate(output_directory=output_directory, source_host=source_host)
+    else:
+        traffic_generator.burst(output_directory=output_directory, source_host=source_host)
+
+    port = traffic_generator.CLIENT_FLOW_PORTS[source_host]
+    expected_calls = 5 if scenario == "burst" else 1
+    assert len(flow_calls) == expected_calls
+    assert all(call[:3] == (source_host, 8 if scenario == "burst" else (6.0 if scenario == "moderate" else 3.0), port) for call in flow_calls)
+    assert all(monitor.hosts == [source_host] for monitor in monitors)
+    assert all(item[0] == source_host and item[2] == port for item in collectors)
+    assert all(item["source"] == source_host for item in saved)
+    assert all(item["active_flows"] == 1 for item in saved)
+    if scenario == "burst":
+        assert all(call[3] == 3 for call in flow_calls)
+
+
+@pytest.mark.parametrize("source_host", ["h1", "h2", "h3", "h4"])
+def test_udp_flow_uses_fixed_server_and_selected_mininet_namespace(
+    monkeypatch, source_host
+):
+    port = traffic_generator.CLIENT_FLOW_PORTS[source_host]
+    launched = []
+    listeners = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    def launch(host, command, *, interface):
+        launched.append((host, command, interface))
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        traffic_generator,
+        "start_receiver_listener",
+        lambda listener_port, _callback: listeners.append(listener_port) or FakeProcess(),
+    )
+    monkeypatch.setattr(traffic_generator, "run_on_host", launch)
+    monkeypatch.setattr(traffic_generator, "start_interval_reader", lambda *_args: None)
+    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda *_args, **_kwargs: "iperf")
+    monkeypatch.setattr(traffic_generator, "_stop_process", lambda *_args: None)
+    monkeypatch.setattr(traffic_generator, "stop_receiver_listener", lambda *_args: None)
+
+    class Collector:
+        def add_receiver_event(self, *_args):
+            return None
+
+        def add_client_event(self, *_args):
+            return None
+
+        def validate_complete(self):
+            return None
+
+    assert traffic_generator._run_udp_flow(source_host, 3.0, port, 20, Collector()) == "iperf"
+    assert listeners == [port]
+    assert launched == [(
+        source_host,
+        [
+            "iperf3", "-c", "10.0.0.5", "-u", "-b", "3M",
+            "-p", str(port), "-t", "20", "--json-stream",
+        ],
+        traffic_generator.MININET_HOST_INTERFACES[source_host],
+    )]
+
+
+@pytest.mark.parametrize(
+    "source_host,expected_hosts",
+    [
+        ("h1", ["h1"]), ("h2", ["h2"]), ("h3", ["h3"]), ("h4", ["h4"]),
+        ("all", ["h1", "h2", "h3", "h4"]),
+    ],
+)
+def test_congestion_uses_selected_or_all_approved_client_flows(
+    monkeypatch, tmp_path, source_host, expected_hosts
+):
+    launched = []
+    listener_ports = []
+    telemetry = []
+    monitor_hosts = []
+    collector_flows = []
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    class FakeMonitor:
+        def __init__(self, hosts):
+            monitor_hosts.append(hosts)
+
+        def start(self):
+            return self
+
+        def stop(self):
+            return {"latency_ms": None, "queue_size": None, "queue_drops": None}
+
+    class FakeCollector:
+        def __init__(self, host, _scenario, port, _id, _rate, active_flows, _monitor, **_kwargs):
+            self.host = host
+            collector_flows.append((host, port, active_flows))
+
+        def add_receiver_event(self, *_args):
+            return None
+
+        def add_client_event(self, *_args):
+            return None
+
+        def validate_complete(self):
+            return None
+
+    monkeypatch.setattr(traffic_generator, "ScenarioMonitor", FakeMonitor)
+    monkeypatch.setattr(traffic_generator, "IntervalTelemetryCollector", FakeCollector)
+    monkeypatch.setattr(
+        traffic_generator,
+        "start_receiver_listener",
+        lambda port, _callback: listener_ports.append(port) or FakeProcess(),
+    )
+    monkeypatch.setattr(traffic_generator, "stop_receiver_listener", lambda *_args: None)
+    monkeypatch.setattr(traffic_generator, "start_interval_reader", lambda *_args: None)
+    monkeypatch.setattr(traffic_generator, "_stop_process", lambda *_args: None)
+
+    def launch(host, command, *, interface):
+        launched.append((host, command, interface))
+        return FakeProcess()
+
+    monkeypatch.setattr(traffic_generator, "run_on_host", launch)
+    monkeypatch.setattr(traffic_generator, "wait_for_process", lambda *_args, **_kwargs: "iperf")
+    monkeypatch.setattr(
+        traffic_generator,
+        "parse_iperf_output",
+        lambda *_args, **kwargs: {"throughput_mbps": 1, "source": kwargs["source"]},
+    )
+    monkeypatch.setattr(
+        traffic_generator,
+        "save_telemetry",
+        lambda *_args, **kwargs: telemetry.append(kwargs),
+    )
+
+    traffic_generator.congestion(
+        output_directory=tmp_path / f"congestion-{source_host}",
+        rate_mbps=4,
+        duration_seconds=20,
+        source_host=source_host,
+    )
+
+    assert [item[0] for item in launched] == expected_hosts
+    assert monitor_hosts == [expected_hosts]
+    assert listener_ports == [traffic_generator.CLIENT_FLOW_PORTS[host] for host in expected_hosts]
+    assert [item[:2] for item in collector_flows] == [
+        (host, traffic_generator.CLIENT_FLOW_PORTS[host]) for host in expected_hosts
+    ]
+    assert all(item[2] == len(expected_hosts) for item in collector_flows)
+    for host, command, interface in launched:
+        assert interface == traffic_generator.MININET_HOST_INTERFACES[host]
+        assert command[command.index("-c") + 1] == "10.0.0.5"
+        assert command[command.index("-p") + 1] == str(traffic_generator.CLIENT_FLOW_PORTS[host])
+    assert [item["source"] for item in telemetry] == expected_hosts
+    assert all(item["active_flows"] == len(expected_hosts) for item in telemetry)

@@ -81,7 +81,7 @@ describe("dashboard API client", () => {
       .mockResolvedValueOnce(new Response("null"));
     vi.stubGlobal("fetch", fetchMock);
     const id = "0123456789abcdef0123456789abcdef";
-    await startTrafficExecution("congestion", 5, 17);
+    await startTrafficExecution("congestion", 5, 17, "all");
     await getTrafficExecution(id);
     await stopTrafficExecution(id);
     await expect(getActiveTrafficExecution()).resolves.toBeNull();
@@ -91,11 +91,27 @@ describe("dashboard API client", () => {
       `http://127.0.0.1:8000/api/experiments/${id}/stop`,
       "http://127.0.0.1:8000/api/execution/active",
     ]);
-    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST", body: JSON.stringify({ scenario: "congestion", rate_mbps: 5, duration_seconds: 17 }) });
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST", body: JSON.stringify({ scenario: "congestion", source_host: "all", rate_mbps: 5, duration_seconds: 17 }) });
     expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: "POST", body: "{}" });
     expect(() => getTrafficExecution("../bad")).toThrow("Invalid experiment identifier");
     expect(() => stopTrafficExecution("../bad")).toThrow("Invalid experiment identifier");
   });
+
+  it.each(["h1", "h2", "h3", "h4"] as const)(
+    "serializes selected source host %s without changing the fixed endpoint",
+    async (source_host) => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "starting" })));
+      vi.stubGlobal("fetch", fetchMock);
+      await startTrafficExecution("normal", 3, 20, source_host);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8000/api/experiments/start",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ scenario: "normal", source_host, rate_mbps: 3, duration_seconds: 20 }),
+        }),
+      );
+    },
+  );
 
   it("uses the local development API by default instead of fabricating fallback data", async () => {
     Object.defineProperty(backendConnection, "baseUrl", {
@@ -138,12 +154,12 @@ describe("dashboard API client", () => {
     }), { status: 422 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(startTrafficExecution("normal", 5.05, 20)).rejects.toThrow(
+    await expect(startTrafficExecution("normal", 5.05, 20, "h1")).rejects.toThrow(
       "Backend rejected POST /api/experiments/start (422): body.rate_mbps: Value error, Rate must use 0.1 Mbps increments.",
     );
     expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/experiments/start", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ scenario: "normal", rate_mbps: 5.05, duration_seconds: 20 }),
+      body: JSON.stringify({ scenario: "normal", source_host: "h1", rate_mbps: 5.05, duration_seconds: 20 }),
     }));
   });
 

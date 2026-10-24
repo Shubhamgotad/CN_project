@@ -49,11 +49,14 @@ class HealthResponse(APIModel):
 
 class ExperimentStartRequest(APIModel):
     scenario: Literal["normal", "moderate", "congestion", "burst"]
+    source_host: Literal["h1", "h2", "h3", "h4", "all"] | None = None
     rate_mbps: float | None = Field(default=None, ge=0.1, le=10)
     duration_seconds: int | None = Field(default=None, ge=1, le=60)
 
     @model_validator(mode="after")
     def validate_scenario_parameters(self):
+        if self.source_host == "all" and self.scenario != "congestion":
+            raise ValueError("All flows are supported only for the congestion scenario.")
         if self.rate_mbps is not None and abs(self.rate_mbps * 10 - round(self.rate_mbps * 10)) > 1e-8:
             raise ValueError("Rate must use 0.1 Mbps increments.")
         if self.scenario == "burst":
@@ -65,6 +68,7 @@ class ExperimentStartRequest(APIModel):
 class ExperimentResponse(APIModel):
     experiment_id: str
     scenario: Literal["normal", "moderate", "congestion", "burst"]
+    source_host: Literal["h1", "h2", "h3", "h4", "all"] | None = None
     status: Literal["starting", "running", "stopping", "completed", "failed", "stopped"]
     flows: list[str]
     target_rate_mbps: float
@@ -77,6 +81,19 @@ class ExperimentResponse(APIModel):
     can_stop: bool
     process_exit_code: int | None = None
     error: str | None = None
+
+    @model_validator(mode="after")
+    def validate_execution_sources(self):
+        if self.source_host is None:
+            return self
+        expected_flows = (
+            ["h1", "h2", "h3", "h4"]
+            if self.source_host == "all" and self.scenario == "congestion"
+            else [self.source_host]
+        )
+        if self.flows != expected_flows:
+            raise ValueError("Execution source host and planned flows do not match.")
+        return self
 
 
 class ExperimentStartResponse(ExperimentResponse):
@@ -911,7 +928,7 @@ def _public_experiment(state: dict[str, Any]) -> ExperimentResponse:
     # Deliberately omit WSL PIDs, filesystem paths, command arguments, and logs.
     try:
         return ExperimentResponse(
-            experiment_id=state["experiment_id"], scenario=state["scenario"], status=state["status"],
+            experiment_id=state["experiment_id"], scenario=state["scenario"], source_host=state.get("source_host"), status=state["status"],
             flows=state["flows"], target_rate_mbps=state["target_rate_mbps"],
             duration_seconds=state["duration_seconds"], created_at=state["created_at"],
             started_at=state.get("started_at"), finished_at=state.get("finished_at"),
@@ -929,6 +946,7 @@ def _execution_call(
     scenario: str | None = None,
     rate_mbps: float | None = None,
     duration_seconds: int | None = None,
+    source_host: str | None = None,
 ) -> dict[str, Any]:
     from dashboard.backend.execution_manager import (
         ExecutionNotFound, ExecutionUnavailable, TopologyUnavailable, invoke_supervisor,
@@ -936,7 +954,7 @@ def _execution_call(
 
     try:
         if action == "start":
-            return invoke_supervisor(action, experiment_id, scenario, rate_mbps, duration_seconds)
+            return invoke_supervisor(action, experiment_id, scenario, rate_mbps, duration_seconds, source_host)
         return invoke_supervisor(action, experiment_id, scenario)
     except TopologyUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -965,8 +983,9 @@ def start_traffic(request: Request, body: ExperimentStartRequest) -> ExperimentS
     }[body.scenario]
     rate_mbps = defaults[0] if body.rate_mbps is None else body.rate_mbps
     duration_seconds = defaults[1] if body.duration_seconds is None else body.duration_seconds
+    source_host = body.source_host or ("all" if body.scenario == "congestion" else "h1")
     state = _execution_call(
-        "start", uuid4().hex, body.scenario, rate_mbps, duration_seconds
+        "start", uuid4().hex, body.scenario, rate_mbps, duration_seconds, source_host
     )
     return ExperimentStartResponse(**_public_experiment(state).model_dump())
 
