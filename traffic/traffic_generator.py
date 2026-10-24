@@ -12,7 +12,7 @@ import time
 import uuid
 from statistics import fmean
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from telemetry.iperf_parser import (
@@ -293,7 +293,11 @@ def _reuse_output_directory(output_directory):
 
 
 def _isolated_output_file(directory, filename):
-    if not isinstance(filename, str) or Path(filename).name != filename:
+    if (
+        not isinstance(filename, str)
+        or Path(filename).name != filename
+        or PureWindowsPath(filename).name != filename
+    ):
         raise ValueError("output filename must not contain path components")
     output = directory / filename
     if output.is_symlink() or output.resolve().parent != directory.resolve():
