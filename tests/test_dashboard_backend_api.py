@@ -126,6 +126,7 @@ def test_api_has_no_network_changing_http_operations():
         "/api/telemetry/history",
         "/api/reports",
         "/api/experiments/status",
+        "/api/experiments/runs",
     ):
         response = client.post(path)
         assert response.status_code == 405
@@ -134,9 +135,11 @@ def test_api_has_no_network_changing_http_operations():
 def test_latest_telemetry_is_explicitly_unavailable_without_source():
     response = client.get("/api/telemetry/latest")
     assert response.status_code == 200
-    assert response.json()["status"] == "unavailable"
-    assert response.json()["record"] is None
-    assert "ADAPTIVE_QOS_TELEMETRY_FILE" in response.json()["message"]
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["collection_status"] == "no_measurement"
+    assert body["record"] is None
+    assert "ADAPTIVE_QOS_TELEMETRY_FILE" in body["message"]
 
 
 def person1_telemetry(timestamp: str) -> dict:
@@ -196,6 +199,7 @@ def test_stale_and_malformed_telemetry_are_not_reported_as_current(tmp_path, mon
     source.write_text('{"timestamp":"not a telemetry row"}\n', encoding="utf-8")
     body = client.get("/api/telemetry/latest").json()
     assert body["status"] == "unavailable"
+    assert body["collection_status"] == "collection_failed"
     assert body["record"] is None
 
 
@@ -312,6 +316,98 @@ def test_latest_telemetry_filters_completed_run_by_host_before_selecting_newest(
         assert body["record"]["timestamp"] == payload["timestamp"]
         assert body["record"]["throughput_mbps"] == payload["throughput_mbps"]
         assert body["record"]["active_flows"] == 4
+
+
+def test_latest_telemetry_returns_per_flow_records_for_requested_congestion_execution(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "abcdef0123456789abcdef0123456789"
+    rows = []
+    for index, host in enumerate(("h1", "h2", "h3", "h4")):
+        payload = person1_telemetry((datetime.now(timezone.utc) - timedelta(seconds=4 - index)).isoformat())
+        payload.update(
+            experiment_id=run_id,
+            scenario="congestion",
+            source=host,
+            active_flows=4,
+            requested_mbps=4.0,
+            measurement_source="iperf3_receiver_json_stream+tc_qdisc",
+            interface="s1-eth5",
+        )
+        rows.append(json.dumps(payload) + "\n")
+    write_completed_run(run_root, run_id, "congestion", rows, source_host="all")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+    monkeypatch.delenv(api.TELEMETRY_FILE_ENV, raising=False)
+
+    body = client.get("/api/telemetry/latest", params={"experiment_id": run_id}).json()
+
+    assert body["status"] == "available"
+    assert body["collection_status"] == "fresh"
+    assert body["record"]["experiment_id"] == run_id
+    assert {record["source"] for record in body["records"]} == {"h1", "h2", "h3", "h4"}
+    assert {record["experiment_id"] for record in body["records"]} == {run_id}
+    assert all(record["active_flows"] == 4 for record in body["records"])
+    assert all(record["measurement_source"] == "iperf3_receiver_json_stream+tc_qdisc" for record in body["records"])
+
+
+def test_latest_telemetry_reports_pinned_identity_conflict_and_scopes_current_run(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    payload = person1_telemetry(datetime.now(timezone.utc).isoformat())
+    payload.update(experiment_id=run_id, scenario="congestion", active_flows=4)
+    write_completed_run(run_root, run_id, "congestion", [json.dumps(payload) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    pinned = tmp_path / "pinned.jsonl"
+    pinned.write_text(
+        json.dumps(person1_telemetry("2020-01-01T00:00:00+00:00")) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(pinned))
+
+    global_body = client.get("/api/telemetry/latest").json()
+    assert global_body["status"] == "stale"
+    assert global_body["record"]["experiment_id"] == "run-1"
+    assert run_id in global_body["configuration_conflict"]
+    assert "Clear that setting" in global_body["message"]
+
+    execution_body = client.get("/api/telemetry/latest", params={"experiment_id": run_id}).json()
+    assert execution_body["status"] == "available"
+    assert execution_body["source"] == "completed_experiment_person1_jsonl"
+    assert execution_body["record"]["experiment_id"] == run_id
+    assert "run-1" in execution_body["configuration_conflict"]
+
+    mismatch = client.get(
+        "/api/telemetry/latest",
+        params={"experiment_id": "cccccccccccccccccccccccccccccccc"},
+    ).json()
+    assert mismatch["status"] == "unavailable"
+    assert mismatch["collection_status"] == "no_measurement"
+    assert mismatch["record"] is None
+
+
+def test_latest_telemetry_distinguishes_completed_run_collection_failure(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_dir = run_root / ("d" * 32)
+    (run_dir / "output").mkdir(parents=True)
+    (run_dir / "state.json").write_text(json.dumps({
+        "experiment_id": "d" * 32,
+        "scenario": "normal",
+        "source_host": "h1",
+        "flows": ["h1"],
+        "status": "completed",
+        "process_alive": False,
+        "process_exit_code": 0,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    (run_dir / "output" / "normal.jsonl").write_text("{invalid}\n", encoding="utf-8")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+    monkeypatch.delenv(api.TELEMETRY_FILE_ENV, raising=False)
+
+    body = client.get("/api/telemetry/latest").json()
+    assert body["status"] == "unavailable"
+    assert body["collection_status"] == "collection_failed"
+    assert "Telemetry collection failed" in body["message"]
+    assert body["record"] is None
 
 
 def test_latest_telemetry_filters_never_fall_back_to_another_host_or_scenario(tmp_path, monkeypatch):
@@ -551,6 +647,8 @@ def test_fresh_auto_discovery_chooses_newest_metadata_bound_run_and_pinned_stale
     monkeypatch.delenv(api.TELEMETRY_FILE_ENV)
     response = client.get("/api/telemetry/latest").json()
     assert response["status"] == "available"
+    assert response["collection_status"] == "fresh"
+    assert response["source"] == "completed_experiment_person1_jsonl"
     assert response["record"]["experiment_id"] == newer_id
     assert response["record"]["timestamp"] == newer_record["timestamp"]
 
@@ -682,8 +780,14 @@ def test_campaign_completeness_never_implies_alignment_eligibility(tmp_path, mon
         "manifest_path": str(tmp_path / "private-campaign.json"),
         "trials": [{
             "trial_id": "trial-1",
+            "condition": "baseline",
+            "profile": "BASELINE",
+            "repetition_id": "cycle-1",
             "status": "complete",
             "alignment_status": "ineligible",
+            "flows": {"h1": {"status": "complete", "receiver": {"metrics": {
+                "throughput_mbps": 2.5, "queue_size": 4, "queue_drops": 1,
+            }}}},
             "errors": [str(tmp_path / "private-evidence.json")],
         }],
     }
@@ -704,6 +808,141 @@ def test_campaign_completeness_never_implies_alignment_eligibility(tmp_path, mon
     assert detail.json()["campaign_status"] == "complete"
     assert detail.json()["alignment_eligibility"] == "ineligible"
     assert detail.json()["comparison_ready"] is False
+    assert detail.json()["trials"][0]["flows"][0]["metrics"]["queue_size"] == 4
+    assert detail.json()["trials"][0]["flows"][0]["metrics"]["queue_drops"] == 1
+
+
+def test_report_directory_discovers_prediction_and_campaign_types_without_conflating_them(tmp_path, monkeypatch):
+    prediction = runner_report()
+    write_report(tmp_path, "prediction-1", prediction)
+    campaign = {
+        "schema_version": 1,
+        "campaign_id": "campaign-real-contract",
+        "status": "incomplete",
+        "campaign_status": "incomplete",
+        "live_operations_supported": False,
+        "complete_cycle_count": 1,
+        "minimum_complete_cycles": 3,
+        "comparison_ready": True,
+        "measurement_alignment_eligibility": "eligible",
+        "trials": [],
+    }
+    write_report(tmp_path, "campaign-real-contract", campaign)
+    write_report(tmp_path, "analysis-real-contract", {
+        "schema_version": 1,
+        "offline_only": True,
+        "live_operations_supported": False,
+        "status": "incomplete",
+        "trials": [],
+    })
+    monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(tmp_path))
+
+    reports = client.get("/api/reports").json()["reports"]
+    by_id = {item["report_id"]: item for item in reports}
+    assert by_id["prediction-1"]["report_type"] == "experiment-runner"
+    assert by_id["campaign-real-contract"]["report_type"] == "campaign-validation"
+    assert by_id["analysis-real-contract"]["report_type"] == "evidence-analysis"
+    assert by_id["prediction-1"]["comparison_ready"] is False
+    assert by_id["campaign-real-contract"]["comparison_ready"] is False
+    detail = client.get("/api/reports/campaign-real-contract").json()
+    assert detail["comparison_ready"] is False
+    assert detail["complete_cycle_count"] == 1
+    analysis_detail = client.get("/api/reports/analysis-real-contract")
+    assert analysis_detail.status_code == 200
+    assert analysis_detail.json()["report_type"] == "evidence-analysis"
+
+
+def test_traffic_run_history_reports_execution_states_separately_from_campaign_trials(tmp_path, monkeypatch):
+    root = tmp_path / ".adaptive-qos-runs"
+    root.mkdir()
+    now = datetime.now(timezone.utc)
+    runs = [
+        ("a" * 32, "completed", 0, "normal", "h1", ["h1"]),
+        ("b" * 32, "failed", 1, "congestion", "all", ["h1", "h2", "h3", "h4"]),
+        ("c" * 32, "stopped", 0, "moderate", "h2", ["h2"]),
+    ]
+    for index, (run_id, status, exit_code, scenario, host, flows) in enumerate(runs):
+        run_dir = root / run_id
+        run_dir.mkdir()
+        created = now - timedelta(minutes=10 - index)
+        started = created + timedelta(seconds=1)
+        finished = started + timedelta(seconds=20)
+        (run_dir / "state.json").write_text(json.dumps({
+            "experiment_id": run_id,
+            "scenario": scenario,
+            "status": status,
+            "process_alive": False,
+            "process_exit_code": exit_code,
+            "source_host": host,
+            "flows": flows,
+            "target_rate_mbps": 4.0,
+            "duration_seconds": 20,
+            "created_at": created.isoformat(),
+            "started_at": started.isoformat(),
+            "finished_at": finished.isoformat(),
+        }), encoding="utf-8")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", root)
+
+    response = client.get("/api/experiments/runs")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert (body["completed_count"], body["failed_count"], body["stopped_count"]) == (1, 1, 1)
+    assert [run["experiment_id"] for run in body["runs"]] == [run_id for run_id, *_ in reversed(runs)]
+    normal_run = next(run for run in body["runs"] if run["scenario"] == "normal")
+    assert normal_run == {
+        "experiment_id": "a" * 32,
+        "scenario": "normal",
+        "status": "completed",
+        "source_host": "h1",
+        "flows": ["h1"],
+        "target_rate_mbps": 4.0,
+        "duration_seconds": 20,
+        "started_at": (now - timedelta(minutes=10) + timedelta(seconds=1)).isoformat(),
+        "finished_at": (now - timedelta(minutes=10) + timedelta(seconds=21)).isoformat(),
+    }
+    assert "not campaign trials" in body["message"]
+    assert "output_directory" not in response.text
+
+
+def test_traffic_run_history_distinguishes_empty_from_unavailable_directory(tmp_path, monkeypatch):
+    root = tmp_path / ".adaptive-qos-runs"
+    root.mkdir()
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", root)
+
+    empty_response = client.get("/api/experiments/runs")
+    assert empty_response.status_code == 200
+    assert empty_response.json()["status"] == "available"
+    assert empty_response.json()["runs"] == []
+    assert empty_response.json()["completed_count"] == 0
+    assert "No validated Traffic Lab execution records" in empty_response.json()["message"]
+
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", tmp_path / "missing-runs")
+    unavailable_response = client.get("/api/experiments/runs")
+    assert unavailable_response.status_code == 200
+    assert unavailable_response.json()["status"] == "unavailable"
+    assert unavailable_response.json()["runs"] == []
+    assert "directory is unavailable" in unavailable_response.json()["message"]
+
+
+def test_traffic_run_history_rejects_malformed_and_identity_mismatched_state(tmp_path, monkeypatch):
+    root = tmp_path / ".adaptive-qos-runs"
+    root.mkdir()
+    now = datetime.now(timezone.utc)
+    for run_id, state in [
+        ("d" * 32, {"experiment_id": "wrong", "scenario": "normal", "status": "completed"}),
+        ("e" * 32, {"experiment_id": "e" * 32, "scenario": "normal", "status": "completed", "finished_at": "naive"}),
+    ]:
+        run_dir = root / run_id
+        run_dir.mkdir()
+        if run_id.startswith("e"):
+            state.update({"process_alive": False, "process_exit_code": 0, "source_host": "h1", "flows": ["h1"], "target_rate_mbps": 2, "duration_seconds": 20, "created_at": now.isoformat(), "started_at": now.isoformat()})
+        (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", root)
+    response = client.get("/api/experiments/runs")
+    assert response.status_code == 200
+    assert response.json()["runs"] == []
+    assert response.json()["completed_count"] == 0
 
 
 def test_missing_report_directory_is_explicitly_unavailable(tmp_path, monkeypatch):

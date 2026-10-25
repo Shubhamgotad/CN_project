@@ -41,6 +41,10 @@ export interface ApiExecution {
   can_stop: boolean;
   process_exit_code: number | null;
   error: string | null;
+  measurement_status?: "pending" | "available" | "no_measurement" | "collection_failed";
+  measurement_record_count?: number;
+  measurement_hosts?: string[];
+  measurement_finished_at?: string | null;
 }
 
 export interface ApiTopology {
@@ -67,10 +71,16 @@ export interface ApiTopology {
 export interface ApiTelemetry {
   status: "available" | "stale" | "unavailable";
   source: "configured_person1_jsonl" | "completed_experiment_person1_jsonl" | "none";
+  collection_status?: "fresh" | "stale" | "no_measurement" | "collection_failed";
   measurement_age_seconds: number | null;
   stale_after_seconds: number;
   message: string;
-  record: {
+  configuration_conflict?: string | null;
+  record: ApiTelemetryRecord | null;
+  records?: ApiTelemetryRecord[];
+}
+
+export interface ApiTelemetryRecord {
     timestamp: string;
     experiment_id?: string | null;
     source: string;
@@ -86,7 +96,8 @@ export interface ApiTelemetry {
     bandwidth_mbps?: number | null;
     utilization_percent?: number | null;
     active_flows?: number | null;
-  } | null;
+    measurement_source?: string | null;
+    provenance?: string | null;
 }
 
 export type TelemetryHistorySource = "configured_person1_jsonl" | "completed_experiment_person1_jsonl";
@@ -137,6 +148,7 @@ export interface TelemetryHistoryFilters {
 export interface TelemetryLatestFilters {
   host?: "h1" | "h2" | "h3" | "h4";
   scenario?: "normal" | "moderate" | "congestion" | "burst";
+  experiment_id?: string;
 }
 
 export interface ApiQosDryRunDecision {
@@ -148,6 +160,9 @@ export interface ApiQosDryRunDecision {
   application_blockers: Array<"application_disabled" | "exclusive_tc_ownership_unavailable">;
   telemetry_status: ApiTelemetry["status"];
   telemetry_source: ApiTelemetry["source"];
+  telemetry_collection_status?: ApiTelemetry["collection_status"];
+  telemetry_experiment_id?: string | null;
+  configuration_conflict?: string | null;
   measurement_age_seconds: number | null;
   measurement: {
     timestamp: string;
@@ -313,6 +328,27 @@ export interface ApiExperimentsStatus {
   message: string;
 }
 
+export interface ApiTrafficRun {
+  experiment_id: string;
+  scenario: ExecutionScenario;
+  status: "completed" | "failed" | "stopped";
+  source_host: "h1" | "h2" | "h3" | "h4" | "all";
+  flows: Array<"h1" | "h2" | "h3" | "h4">;
+  target_rate_mbps: number;
+  duration_seconds: number;
+  started_at: string;
+  finished_at: string;
+}
+
+export interface ApiTrafficRunHistory {
+  status: "available" | "unavailable";
+  message: string;
+  completed_count: number;
+  failed_count: number;
+  stopped_count: number;
+  runs: ApiTrafficRun[];
+}
+
 async function requestJson<T>(path: string, options: RequestInit = {}, allowNull = false): Promise<T> {
   if (!backendConnection.baseUrl) {
     throw new Error("Backend API URL is not configured. Set VITE_BACKEND_URL to enable API requests.");
@@ -380,6 +416,10 @@ export function getLatestTelemetry(filters: TelemetryLatestFilters = {}): Promis
   const params = new URLSearchParams();
   if (filters.host) params.set("host", filters.host);
   if (filters.scenario) params.set("scenario", filters.scenario);
+  if (filters.experiment_id) {
+    if (!/^[0-9a-f]{32}$/.test(filters.experiment_id)) throw new Error("Invalid experiment identifier.");
+    params.set("experiment_id", filters.experiment_id);
+  }
   const query = params.size ? `?${params.toString()}` : "";
   return requestJson<ApiTelemetry>(`/api/telemetry/latest${query}`);
 }
@@ -429,6 +469,10 @@ export function getReport(reportId: string): Promise<ApiReportDetail> {
 
 export function getExperimentsStatus(): Promise<ApiExperimentsStatus> {
   return requestJson<ApiExperimentsStatus>("/api/experiments/status");
+}
+
+export function getTrafficRunHistory(): Promise<ApiTrafficRunHistory> {
+  return requestJson<ApiTrafficRunHistory>("/api/experiments/runs");
 }
 
 export function startTrafficExecution(
@@ -484,8 +528,8 @@ export function apiReportToEvidenceReport(detail: ApiReportDetail): ImportedEvid
       latencyMs: finiteNumber(flow.metrics.latency_ms),
       jitterMs: finiteNumber(flow.metrics.jitter_ms),
       packetLossPercent: finiteNumber(flow.metrics.packet_loss_percent),
-      queueSize: null,
-      queueDrops: null,
+      queueSize: finiteNumber(flow.metrics.queue_size),
+      queueDrops: finiteNumber(flow.metrics.queue_drops),
     })),
   }));
   return {
@@ -737,11 +781,33 @@ export function parseEvidenceReport(text: string): ImportedEvidenceReport {
     throw new Error("The selected file is not valid JSON.");
   }
   const report = object(parsed, "evidence report");
-  if (report.offline_only !== true && report.live_operations_supported !== false) {
-    throw new Error("This report does not identify itself as an offline analysis artifact.");
+  if (report.schema_version !== 1) {
+    throw new Error("Unsupported evidence report schema_version; expected version 1.");
+  }
+  const isEvidenceAnalysis = report.offline_only === true && report.live_operations_supported === false;
+  const isCampaignValidation = report.live_operations_supported === false
+    && (typeof report.campaign_status === "string" || typeof report.campaign_id === "string");
+  if (!isEvidenceAnalysis && !isCampaignValidation) {
+    throw new Error("Unsupported report type. Choose an evidence-analysis or campaign-validation JSON report; prediction reports are not campaign evidence.");
   }
   if (!Array.isArray(report.trials)) {
     throw new Error("The selected report is missing its trials array.");
+  }
+  for (const [index, value] of report.trials.entries()) {
+    const trial = object(value, `trials[${index}]`);
+    if (typeof trial.status !== "string" || !trial.status.trim()) {
+      throw new Error(`Evidence report trial ${index + 1} is missing its status.`);
+    }
+    if (trial.flows !== undefined && (trial.flows === null || typeof trial.flows !== "object" || Array.isArray(trial.flows))) {
+      throw new Error(`Evidence report trial ${index + 1} has an invalid flows object.`);
+    }
+    if (trial.flows && typeof trial.flows === "object" && !Array.isArray(trial.flows)) {
+      for (const [flowId, flow] of Object.entries(trial.flows)) {
+        if (flow === null || typeof flow !== "object" || Array.isArray(flow)) {
+          throw new Error(`Evidence report trial ${index + 1} flow ${flowId} must be an object.`);
+        }
+      }
+    }
   }
   const trials = report.trials.map(parseTrial);
   const declaredAlignment = optionalString(
@@ -753,7 +819,7 @@ export function parseEvidenceReport(text: string): ImportedEvidenceReport {
     && trials.every((trial) => trial.alignment === "eligible");
   const campaignStatus = optionalString(report.campaign_status);
   return {
-    kind: report.comparison_ready === undefined ? "evidence-analysis" : "campaign-validation",
+    kind: isEvidenceAnalysis ? "evidence-analysis" : "campaign-validation",
     reportStatus: optionalString(report.status) ?? "unknown",
     campaignStatus,
     completeCycleCount: finiteNumber(report.complete_cycle_count),

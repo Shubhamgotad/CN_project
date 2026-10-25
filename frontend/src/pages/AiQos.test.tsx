@@ -53,6 +53,7 @@ function decision(overrides: Partial<ApiQosDryRunDecision> = {}): ApiQosDryRunDe
     application_blockers: ["application_disabled", "exclusive_tc_ownership_unavailable"],
     telemetry_status: "available",
     telemetry_source: "configured_person1_jsonl",
+    telemetry_experiment_id: "b".repeat(32),
     measurement_age_seconds: 2.5,
     measurement: {
       timestamp: "2026-10-20T10:00:00+00:00",
@@ -90,7 +91,24 @@ function decision(overrides: Partial<ApiQosDryRunDecision> = {}): ApiQosDryRunDe
       default_class_id: "1:15",
       filter_priorities: { "5201": 10, "5202": 20, "5203": 30, "5204": 40 },
     },
-    tc_commands: ["tc qdisc replace dev s1-eth5 root handle 1: htb default 15"],
+    tc_commands: [
+      "tc qdisc replace dev s1-eth5 parent 5:1 handle 1: htb default 15",
+      "tc class add dev s1-eth5 parent 1: classid 1:1 htb rate 10mbit ceil 10mbit",
+      "tc class add dev s1-eth5 parent 1:1 classid 1:11 htb rate 2.7mbit ceil 2.7mbit",
+      "tc qdisc add dev s1-eth5 parent 1:11 handle 110: netem limit 1000 delay 10ms",
+      "tc class add dev s1-eth5 parent 1:1 classid 1:12 htb rate 2.7mbit ceil 2.7mbit",
+      "tc qdisc add dev s1-eth5 parent 1:12 handle 120: netem limit 1000 delay 10ms",
+      "tc class add dev s1-eth5 parent 1:1 classid 1:13 htb rate 2.25mbit ceil 2.25mbit",
+      "tc qdisc add dev s1-eth5 parent 1:13 handle 130: netem limit 1000 delay 10ms",
+      "tc class add dev s1-eth5 parent 1:1 classid 1:14 htb rate 1.35mbit ceil 1.35mbit",
+      "tc qdisc add dev s1-eth5 parent 1:14 handle 140: netem limit 1000 delay 10ms",
+      "tc class add dev s1-eth5 parent 1:1 classid 1:15 htb rate 1mbit ceil 1mbit",
+      "tc qdisc add dev s1-eth5 parent 1:15 handle 150: netem limit 1000 delay 10ms",
+      "tc filter add dev s1-eth5 protocol ip parent 1: prio 10 u32 match ip protocol 17 0xff match ip dport 5201 0xffff flowid 1:11",
+      "tc filter add dev s1-eth5 protocol ip parent 1: prio 20 u32 match ip protocol 17 0xff match ip dport 5202 0xffff flowid 1:12",
+      "tc filter add dev s1-eth5 protocol ip parent 1: prio 30 u32 match ip protocol 17 0xff match ip dport 5203 0xffff flowid 1:13",
+      "tc filter add dev s1-eth5 protocol ip parent 1: prio 40 u32 match ip protocol 17 0xff match ip dport 5204 0xffff flowid 1:14",
+    ],
     history: [],
     message: "Policy is a dry-run proposal only; no network configuration was changed.",
     ...overrides,
@@ -144,18 +162,132 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("AI & QoS Decision");
     expect(container.textContent).toContain("LIVE_TC_OWNERSHIP_GUARANTEED=false");
     expect(container.textContent).toContain("Telemetry available");
-    expect(container.textContent).toContain("2.997 Mbps throughput");
+    expect(container.textContent).toContain("3.00 Mbps throughput");
     expect(container.textContent).toContain("Configured bottleneck capacity: 10 Mbps");
-    expect(container.textContent).toContain("20.630 ms latency");
+    expect(container.textContent).toContain("20.63 ms latency");
     expect(container.textContent).toContain("Proposed LOW HTB profile");
-    expect(container.textContent).toContain("Proposed QoS allocation budget: 10.0 Mbps");
-    expect(container.textContent).toContain("remaining 9.0 Mbps is shared by the service classes");
+    expect(container.textContent).toContain("Proposed QoS allocation budget: 10 Mbps");
+    expect(container.textContent).toContain("remaining 9 Mbps is shared by the service classes");
     expect(container.textContent).toContain("unused capacity may not be borrowed by other classes");
     expect(container.textContent).toContain("10 Mbps total incl. unmatched");
-    expect(container.textContent).toContain("9.0 Mbps service pool using its class weights and reserves 1.0 Mbps for unmatched traffic");
-    expect(container.textContent).toContain("tc commands (not executed)");
+    expect(container.textContent).toContain("9 Mbps service pool using its class weights and reserves 1 Mbps for unmatched traffic");
+    expect(container.textContent).toContain("Proposed tc commands — dry run only; not executed");
+    expect(container.textContent).toContain("These commands illustrate the proposed configuration only. This page does not execute them or change network settings.");
     expect(container.textContent).toContain("no network configuration was changed");
+    expect(container.querySelector(".qos-application-state")?.textContent).toBe("dry run");
+    expect(container.textContent).toContain("Proposal only; no application has been confirmed.");
+    expect(container.textContent).not.toContain("controller applied and verified");
     expect(getDecisionMock).toHaveBeenCalledTimes(1);
+
+    const details = container.querySelector("details");
+    const summary = details?.querySelector("summary");
+    await act(async () => summary?.click());
+    expect(details?.open).toBe(true);
+    expect(details?.textContent).toContain("Profile LOW on s1-eth5.");
+    expect(details?.querySelector("pre code")?.textContent).toBe(decision().tc_commands.join("\n"));
+    const applyButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Apply QoS Profile");
+    expect(applyButton?.disabled).toBe(true);
+    expect(applyQosProfileMock).not.toHaveBeenCalled();
+  });
+
+  it("copies only the proposed command strings without calling the apply endpoint", async () => {
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    try {
+      await render();
+      const details = container.querySelector("details");
+      await act(async () => details?.querySelector("summary")?.click());
+      const copyButton = [...container.querySelectorAll("button")]
+        .find((button) => button.textContent === "Copy commands");
+      await act(async () => {
+        copyButton?.click();
+        await Promise.resolve();
+      });
+
+      expect(writeText).toHaveBeenCalledWith(decision().tc_commands.join("\n"));
+      expect(container.textContent).toContain("Proposed commands copied.");
+      expect(applyQosProfileMock).not.toHaveBeenCalled();
+    } finally {
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+    }
+  });
+
+  it.each(["LOW", "MEDIUM", "HIGH"] as const)(
+    "displays the backend-provided %s profile and configured interface",
+    async (profile) => {
+      const gamingRate = { LOW: "2.7", MEDIUM: "3.6", HIGH: "4.5" }[profile];
+      const returnedCommands = [
+        `tc class add dev s1-eth5 parent 1:1 classid 1:11 htb rate ${gamingRate}mbit ceil ${gamingRate}mbit`,
+      ];
+      getDecisionMock.mockResolvedValue(decision({
+        selected_profile: profile,
+        proposed_policy: { ...decision().proposed_policy!, interface: "s1-eth5" },
+        tc_commands: returnedCommands,
+      }));
+      await render();
+      const details = container.querySelector(".qos-dry-run-policy details");
+      await act(async () => details?.querySelector("summary")?.click());
+
+      expect(container.textContent).toContain(`Proposed ${profile} HTB profile`);
+      expect(details?.textContent).toContain(`Profile ${profile} on s1-eth5.`);
+      expect(details?.querySelector("pre code")?.textContent).toBe(returnedCommands.join("\n"));
+      expect(applyQosProfileMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("explains why a command preview is unavailable instead of inventing commands", async () => {
+    getDecisionMock.mockResolvedValue(decision({ tc_commands: [] }));
+    await render();
+    const details = container.querySelector("details");
+    await act(async () => details?.querySelector("summary")?.click());
+
+    expect(details?.textContent).toContain("Command preview unavailable: The backend did not provide proposed commands.");
+    expect(details?.querySelector("pre code")).toBeNull();
+    expect(applyQosProfileMock).not.toHaveBeenCalled();
+  });
+
+  const invalidPreviewCases: Array<{
+    label: string;
+    overrides: Partial<ApiQosDryRunDecision>;
+    explanation: string;
+  }> = [
+    {
+      label: "profile",
+      overrides: { selected_profile: null },
+      explanation: "The proposed profile is unavailable.",
+    },
+    {
+      label: "interface",
+      overrides: {
+        proposed_policy: { ...decision().proposed_policy!, interface: "" },
+      },
+      explanation: "The proposed interface is unavailable.",
+    },
+    {
+      label: "command",
+      overrides: { tc_commands: [" "] },
+      explanation: "The backend command preview contains an incomplete command.",
+    },
+  ];
+
+  it.each(invalidPreviewCases)("does not render incomplete commands when the $label is invalid", async ({ overrides, explanation }) => {
+    getDecisionMock.mockResolvedValue(decision(overrides));
+    await render();
+    const details = container.querySelector("details");
+    await act(async () => details?.querySelector("summary")?.click());
+
+    expect(details?.textContent).toContain(`Command preview unavailable: ${explanation}`);
+    expect(details?.querySelector("pre code")).toBeNull();
   });
 
   it("separates a HIGH rule candidate from the current LOW dry-run profile", async () => {
@@ -185,11 +317,26 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).not.toContain("Prediction generated");
   });
 
+  it("does not show a command preview when telemetry status says stale despite a ready response", async () => {
+    getDecisionMock.mockResolvedValue(decision({
+      telemetry_status: "stale",
+      telemetry_collection_status: "stale",
+      measurement_age_seconds: 420,
+    }));
+    await render();
+
+    expect(container.textContent).toContain("Telemetry is stale");
+    expect(container.textContent).toContain("A fresh validated telemetry decision is unavailable.");
+    expect(container.querySelector("details")).toBeNull();
+    expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+  });
+
   it("shows no policy when telemetry is stale", async () => {
     getDecisionMock.mockResolvedValue(decision({
       status: "stale",
       telemetry_status: "stale",
       measurement_age_seconds: 420,
+      telemetry_experiment_id: "c".repeat(32),
       measurement: null,
       classification: null,
       selected_profile: null,
@@ -199,10 +346,17 @@ describe("AI & QoS dry-run decision panel", () => {
     }));
     await render();
     expect(container.textContent).toContain("No decision · stale");
+    expect(container.textContent).toContain(`experiment ${"c".repeat(32)}`);
     expect(container.textContent).toContain("Telemetry is stale");
     expect(container.textContent).toContain("421159 seconds old");
     expect(container.textContent).toContain("Clear that setting");
+    expect(container.textContent).toContain("To use automatic latest-run discovery");
+    expect(container.textContent).toContain("Remove-Item Env:ADAPTIVE_QOS_TELEMETRY_FILE");
+    expect(container.textContent).toContain("restart the backend");
     expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+    expect(container.querySelector("details")).toBeNull();
+    expect(container.querySelector("pre code")).toBeNull();
+    expect([...container.querySelectorAll("button")].some((button) => button.textContent === "Copy commands")).toBe(false);
     const refresh = [...container.querySelectorAll("button")].find((button) => button.textContent === "Refresh live telemetry");
     await act(async () => {
       refresh?.click();
@@ -229,6 +383,48 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("No safe QoS decision available");
     expect(container.textContent).toContain("No valid telemetry is available.");
     expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+  });
+
+  it("does not label a proposal applied when controller readback reports a different profile", async () => {
+    getQosStatusMock.mockResolvedValue({
+      status: "verified",
+      applied_profile: "HIGH",
+      interface: "s1-eth5",
+      message: "HIGH confirmed by kernel readback.",
+    });
+    await render();
+
+    const summary = container.querySelector(".qos-dry-run-policy details summary");
+    expect(summary?.textContent).toContain("dry run only; not executed");
+    expect(summary?.textContent).not.toContain("controller applied and verified");
+    expect(container.querySelector(".qos-application-state")?.textContent).toBe("dry run");
+  });
+
+  it.each([
+    {
+      name: "application disabled",
+      decisionOverrides: { application_enabled: false },
+      status: { status: "unrecognized" as const, applied_profile: null, interface: "s1-eth5" as const, message: "No recognized managed profile." },
+    },
+    {
+      name: "candidate profile pending",
+      decisionOverrides: { application_enabled: true, candidate_profile: "HIGH" as const },
+      status: { status: "unrecognized" as const, applied_profile: null, interface: "s1-eth5" as const, message: "No recognized managed profile." },
+    },
+    {
+      name: "controller status unavailable",
+      decisionOverrides: { application_enabled: true },
+      status: { status: "unavailable" as const, applied_profile: null, interface: "s1-eth5" as const, message: "Controller readback unavailable." },
+    },
+  ])("keeps Apply disabled when $name", async ({ decisionOverrides, status }) => {
+    getDecisionMock.mockResolvedValue(decision(decisionOverrides));
+    getQosStatusMock.mockResolvedValue(status);
+    await render();
+
+    const applyButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Apply QoS Profile");
+    expect(applyButton?.disabled).toBe(true);
+    expect(applyQosProfileMock).not.toHaveBeenCalled();
   });
 
   it("requires explicit authorization and displays a verified application", async () => {
@@ -295,6 +491,47 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("verification failed");
     expect(container.textContent).toContain("Kernel readback did not match.");
     expect(container.textContent).not.toContain("applied verified");
+    expect(container.querySelector(".qos-dry-run-policy details summary")?.textContent)
+      .toContain("application verification failed");
+    expect(container.querySelector(".qos-dry-run-policy details summary")?.textContent)
+      .not.toContain("dry run only; not executed");
+  });
+
+  it("keeps application wording unconfirmed when post-apply controller status cannot verify the profile", async () => {
+    getDecisionMock.mockResolvedValue(decision({ application_enabled: true }));
+    getQosStatusMock
+      .mockResolvedValueOnce({
+        status: "unrecognized",
+        applied_profile: null,
+        interface: "s1-eth5",
+        message: "No recognized managed profile.",
+      })
+      .mockRejectedValueOnce(new Error("Status read failed."))
+      .mockResolvedValue({
+        status: "unrecognized",
+        applied_profile: null,
+        interface: "s1-eth5",
+        message: "No recognized managed profile.",
+      });
+    await render();
+
+    const applyButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Apply QoS Profile");
+    await act(async () => applyButton?.click());
+    const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    await act(async () => checkbox?.click());
+    const confirmButton = [...container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Confirm Apply QoS Profile");
+    await act(async () => {
+      confirmButton?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".qos-dry-run-policy details summary")?.textContent)
+      .toContain("controller application reported; status unconfirmed");
+    expect(container.textContent).toContain("current controller status does not confirm this proposed profile");
+    expect(container.querySelector(".qos-dry-run-policy details summary")?.textContent)
+      .not.toContain("dry run only; not executed");
   });
 
   it("clears old decision data and explains API failures", async () => {
@@ -450,7 +687,7 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("Confidence 87.0%");
     expect(container.textContent).toContain("different from the live telemetry experiment");
     expect(container.textContent).toContain("importing does not rerun prediction");
-    expect(container.textContent).toContain("Planned budget · 10.00 Mbps total");
+    expect(container.textContent).toContain("Planned budget · 10 Mbps total");
     expect(container.textContent).toContain("Planner rationale: service-pool weights gaming 40%");
     expect(container.textContent).toContain("Rates are planned and not applied.");
   });

@@ -4,6 +4,8 @@ import json
 import signal
 import subprocess
 import os
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +22,22 @@ def test_supervisor_rejects_unsafe_ids_and_output_paths():
         supervisor._experiment_id("../../unsafe")
     with pytest.raises(ValueError, match="scenario"):
         supervisor.start_experiment(ID, "; touch /tmp/not-allowed")
+
+
+def test_supervisor_import_does_not_require_ml_training_dependencies():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['pandas'] = None; "
+            "import dashboard.backend.wsl_experiment_supervisor",
+        ],
+        cwd=supervisor.PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("scenario,rate,duration", [
@@ -262,6 +280,93 @@ def test_worker_reports_actual_nonzero_producer_exit(monkeypatch, tmp_path):
     assert state["process_alive"] is False
     assert writes[-1]["status"] == "failed"
     assert any(row.get("supervisor_ready") is True for row in writes)
+
+
+def telemetry_fixture(experiment_id, scenario, source, active_flows, requested_mbps):
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "experiment_id": experiment_id,
+        "scenario": scenario,
+        "source": source,
+        "destination": "server",
+        "traffic_type": "udp",
+        "requested_mbps": requested_mbps,
+        "throughput_mbps": 2.9,
+        "latency_ms": 20.0,
+        "jitter_ms": 0.5,
+        "packet_loss_percent": 0.0,
+        "lost_packets": 0,
+        "total_packets": 100,
+        "bandwidth_mbps": 10.0,
+        "utilization_percent": 29.0,
+        "active_flows": active_flows,
+        "queue_size": 4,
+        "queue_drops": 0,
+        "interface": "s1-eth5",
+        "measurement_source": "iperf3_receiver_json_stream+tc_qdisc",
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario,flows,rate,record_count",
+    [
+        ("normal", ["h1"], 2.0, 1),
+        ("moderate", ["h1"], 6.0, 1),
+        ("congestion", ["h1", "h2", "h3", "h4"], 4.0, 4),
+        ("burst", ["h1"], 8.0, 5),
+    ],
+)
+def test_completed_telemetry_validation_preserves_each_scenario_flow(
+    monkeypatch, tmp_path, scenario, flows, rate, record_count
+):
+    run_dir = tmp_path / ID
+    output = run_dir / "output"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(supervisor, "_run_dir", lambda _experiment_id: run_dir)
+    rows = [
+        telemetry_fixture(ID, scenario, host, len(flows), rate)
+        for host in flows
+        for _ in range(record_count // len(flows))
+    ]
+    (output / f"{scenario}.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    result = supervisor._validate_completed_telemetry(ID, scenario, flows)
+
+    assert result["measurement_record_count"] == record_count
+    assert result["measurement_hosts"] == flows
+    assert result["measurement_finished_at"]
+
+
+def test_completed_telemetry_validation_rejects_identity_mismatch_and_missing_flow(monkeypatch, tmp_path):
+    run_dir = tmp_path / ID
+    output = run_dir / "output"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(supervisor, "_run_dir", lambda _experiment_id: run_dir)
+    row = telemetry_fixture(ID, "congestion", "h1", 4, 4.0)
+    (output / "congestion.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    row["experiment_id"] = "f" * 32
+    (output / "congestion.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="identity"):
+        supervisor._validate_completed_telemetry(ID, "congestion", ["h1", "h2", "h3", "h4"])
+
+    row["experiment_id"] = ID
+    (output / "congestion.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="h2"):
+        supervisor._validate_completed_telemetry(ID, "congestion", ["h1", "h2", "h3", "h4"])
+
+
+def test_successful_process_without_measurements_reports_collection_failure(monkeypatch, tmp_path):
+    state, _writes, _process = run_worker_with_fake_producer(monkeypatch, tmp_path, exit_code=0)
+
+    supervisor._worker(ID, "normal")
+
+    assert state["status"] == "completed"
+    assert state["measurement_status"] == "collection_failed"
+    assert "did not persist its telemetry file" in state["error"]
 
 
 def test_supervisor_ready_handshake_rejects_process_exit_and_timeout(monkeypatch):

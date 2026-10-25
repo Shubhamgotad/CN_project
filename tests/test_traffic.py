@@ -750,7 +750,15 @@ def test_moderate_saves_distinct_experiment_ids_and_appends(tmp_path, monkeypatc
         "active_flows",
         "queue_size",
         "queue_drops",
+        "interface",
+        "measurement_source",
+        "measurement_direction",
+        "provenance",
     }
+    assert records[0]["interface"] == "s1-eth5"
+    assert records[0]["measurement_source"] == "iperf3_receiver_json_stream+tc_qdisc"
+    assert records[0]["measurement_direction"] == "receiver"
+    assert records[0]["provenance"] == "guarded_traffic_lab_execution"
 
 
 def test_each_moderate_invocation_generates_a_fresh_experiment_id(monkeypatch, tmp_path):

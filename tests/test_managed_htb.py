@@ -13,6 +13,7 @@ from qos.tc_controller import (
     UNMATCHED_NETEM_HANDLE,
     IsolatedHTBTarget,
     ManagedHTBConfig,
+    ShadowHTBTarget,
     TCApplyError,
     TCPreconditionError,
     TCVerificationError,
@@ -255,6 +256,74 @@ def isolated_target(**changes):
     return IsolatedHTBTarget(**values)
 
 
+def shadow_target(**changes):
+    values = {
+        "namespace": "qoso12345678",
+        "interface": "qosp12345678",
+        "namespace_inode": 401,
+        "ifindex": 11,
+        "ingress_interface": "qosi12345678",
+        "ingress_ifindex": 12,
+        "ingress_peer_interface": "qosl12345678",
+        "ingress_peer_ifindex": 21,
+        "egress_peer_interface": "qosr12345678",
+        "egress_peer_ifindex": 22,
+    }
+    values.update(changes)
+    return ShadowHTBTarget(**values)
+
+
+class ShadowMockRunner:
+    def __init__(self):
+        self.tc = MockManagedTC()
+        self.tc_commands = []
+        self.namespace_inode = 401
+        self.target_ifindex = 11
+        self.ingress_ifindex = 12
+        self.attached = False
+
+    def __call__(self, argv, capture_output, text, check):
+        if argv[:5] == ["ip", "netns", "exec", "qoso12345678", "stat"]:
+            return SimpleNamespace(
+                returncode=0, stdout=f"{self.namespace_inode}\n", stderr=""
+            )
+        if argv[:9] == [
+            "ip", "netns", "exec", "qoso12345678", "ip", "-j",
+            "-details", "link", "show",
+        ]:
+            target = {
+                "ifname": "qosp12345678",
+                "ifindex": self.target_ifindex,
+                "link_index": 22,
+                "flags": ["UP"],
+                "linkinfo": {"info_kind": "veth"},
+            }
+            ingress = {
+                "ifname": "qosi12345678",
+                "ifindex": self.ingress_ifindex,
+                "link_index": 21,
+                "flags": ["UP"],
+                "linkinfo": {"info_kind": "veth"},
+            }
+            if self.attached:
+                target["master"] = "qos-right"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"ifname": "lo", "ifindex": 1, "linkinfo": {"info_kind": "loopback"}},
+                    ingress,
+                    target,
+                ]),
+                stderr="",
+            )
+        if argv[:5] == ["ip", "netns", "exec", "qoso12345678", "tc"]:
+            self.tc_commands.append(list(argv))
+            return self.tc(
+                argv[4:], capture_output=capture_output, text=text, check=check
+            )
+        return SimpleNamespace(returncode=2, stdout="", stderr="unexpected command")
+
+
 def test_planner_produces_all_three_exact_ten_mbps_profiles():
     unmatched = 1.0
     expected_totals = {"LOW": 10.0, "MEDIUM": 10.0, "HIGH": 10.0}
@@ -456,6 +525,147 @@ def test_isolated_target_identity_mismatch_fails_before_any_tc_command():
     with pytest.raises(TCPreconditionError, match="namespace identity changed"):
         apply_managed_htb_policy(config, runner)
     assert runner.tc_commands == []
+
+
+def test_shadow_target_uses_only_identity_verified_owner_egress():
+    target = shadow_target()
+    config = ManagedHTBConfig(
+        interface=target.interface,
+        total_bandwidth_mbps=10,
+        service_allocations_mbps=MANAGED_HTB_PROFILES["LOW"],
+        filter_priorities=MANAGED_FILTER_PRIORITIES,
+        isolated_target=target,
+    )
+    runner = ShadowMockRunner()
+
+    assert len(apply_managed_htb_policy(config, runner)) == 16
+    assert runner.tc_commands
+    assert all(
+        command[:5] == ["ip", "netns", "exec", target.namespace, "tc"]
+        and target.interface in command
+        for command in runner.tc_commands
+    )
+    assert not any(
+        interface in " ".join(command)
+        for command in runner.tc_commands
+        for interface in ("s1-eth5", "s2-eth1")
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [("namespace_inode", 999), ("target_ifindex", 99), ("ingress_ifindex", 98)],
+)
+def test_shadow_target_identity_loss_fails_before_next_tc_operation(field, replacement):
+    target = shadow_target()
+    runner = ShadowMockRunner()
+    scoped = tc_controller._IsolatedHTBRunner(target, runner)
+    scoped(
+        ["tc", "-d", "qdisc", "show", "dev", target.interface],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    setattr(runner, field, replacement)
+
+    with pytest.raises(TCPreconditionError):
+        scoped(
+            ["tc", "-d", "qdisc", "show", "dev", target.interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert len(runner.tc_commands) == 1
+
+
+def test_shadow_target_rejects_unexpected_attachment_before_tc_operation():
+    target = shadow_target()
+    runner = ShadowMockRunner()
+    runner.attached = True
+    scoped = tc_controller._IsolatedHTBRunner(target, runner)
+
+    with pytest.raises(TCPreconditionError, match="identity-pinned veth path"):
+        scoped(
+            ["tc", "-d", "qdisc", "show", "dev", target.interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert runner.tc_commands == []
+
+
+def test_shadow_target_rejects_production_or_mismatched_names():
+    values = shadow_target().__dict__
+    with pytest.raises(ValueError, match="generated identity"):
+        ShadowHTBTarget(**{**values, "namespace": "qoso87654321"})
+    with pytest.raises(ValueError, match="generated identity"):
+        ShadowHTBTarget(**{**values, "interface": "s1-eth5"})
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "replacement"),
+    [
+        ("namespace_inode", 999),
+        ("ifindex", 99),
+        ("peer_inode", 999),
+        ("peer_ifindex", 99),
+    ],
+)
+def test_isolated_target_identity_loss_after_acquisition_fails_closed(
+    identity_field, replacement
+):
+    target = isolated_target()
+    runner = IsolatedMockRunner()
+    scoped_runner = tc_controller._IsolatedHTBRunner(target, runner)
+
+    tc_controller._verify_isolated_htb_target(target, runner)
+    setattr(runner, identity_field, replacement)
+
+    with pytest.raises(TCPreconditionError):
+        scoped_runner(
+            ["tc", "-d", "qdisc", "show", "dev", target.interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert runner.tc_commands == []
+
+
+def test_isolated_target_rejects_conflicting_attachment_after_acquisition():
+    target = isolated_target()
+    runner = IsolatedMockRunner()
+    tc_controller._verify_isolated_htb_target(target, runner)
+    original_call = runner.__call__
+
+    def attached_runner(argv, capture_output, text, check):
+        result = original_call(argv, capture_output, text, check)
+        if argv[:5] == ["ip", "netns", "exec", target.namespace, "ip"] and argv[5:9] == [
+            "-j", "-details", "link", "show"
+        ]:
+            rows = json.loads(result.stdout)
+            rows[1]["master"] = "shadow-ovs-bridge"
+            return SimpleNamespace(
+                returncode=result.returncode,
+                stdout=json.dumps(rows),
+                stderr=result.stderr,
+            )
+        return result
+
+    with pytest.raises(TCPreconditionError, match="unbridged veth pair"):
+        tc_controller._verify_isolated_htb_target(target, attached_runner)
+    assert runner.tc_commands == []
+
+
+def test_isolated_target_rejects_unverifiable_namespace_before_tc_command():
+    target = isolated_target()
+
+    def unverifiable_runner(argv, capture_output, text, check):
+        if argv[:5] == ["ip", "netns", "exec", target.namespace, "stat"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="namespace missing")
+        return IsolatedMockRunner()(argv, capture_output, text, check)
+
+    with pytest.raises(TCPreconditionError):
+        tc_controller._verify_isolated_htb_target(target, unverifiable_runner)
 
 
 def test_managed_filter_ownership_ignores_only_valid_counter_lines():

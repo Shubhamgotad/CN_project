@@ -338,6 +338,18 @@ Run the offline campaign validator from the repository root:
 python -m integration.campaign_validation --manifest campaign.json
 ```
 
+Optionally persist the JSON report at a new path in the already-created,
+approved `ADAPTIVE_QOS_REPORT_DIR` so the dashboard API can discover it:
+
+```text
+python -m integration.campaign_validation --manifest campaign.json --json-output <approved-report-directory>/campaign-validation.json
+```
+
+The output path must be outside the repository and the campaign evidence
+directory. The command uses exclusive creation and will fail rather than
+overwrite an existing report. Configure `ADAPTIVE_QOS_REPORT_DIR` in the API
+process environment as well, then use **Refresh reports** in Experiments.
+
 It prints a JSON report with campaign structure/status, per-trial analyzer and
 alignment status, errors, `comparison_ready`, and
 `live_operations_supported: false`; exit status is zero only for computed

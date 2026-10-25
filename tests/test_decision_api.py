@@ -8,6 +8,8 @@ import pytest
 
 from dashboard.backend import api
 from dashboard.backend.decision_loop import DecisionLoop
+from qos.allocator import MANAGED_HTB_PROFILES, plan_managed_htb
+from qos.tc_controller import generate_managed_htb_commands
 
 
 client = TestClient(api.app)
@@ -21,6 +23,7 @@ def telemetry(status="available"):
         message="sample telemetry status",
         record=api.TelemetryRecordResponse(
             timestamp="2026-10-20T10:00:00+00:00",
+            experiment_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             source="h1",
             scenario="normal",
             throughput_mbps=2.997,
@@ -153,6 +156,11 @@ def test_decision_api_filters_each_host_before_classification_and_profile_planni
     monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
     monkeypatch.delenv(api.TELEMETRY_FILE_ENV, raising=False)
     monkeypatch.delenv(api.QOS_APPLICATION_ENV, raising=False)
+    monkeypatch.setattr(
+        api.tc_controller.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("decision preview must not execute subprocesses"),
+    )
 
     for host, (row, classification) in expected.items():
         api._scoped_decision_loops.pop((host, "congestion"), None)
@@ -171,10 +179,47 @@ def test_decision_api_filters_each_host_before_classification_and_profile_planni
         assert body["measurement"]["utilization_percent"] == row["utilization_percent"]
         assert body["classification"] == classification
         assert body["selected_profile"] == classification
-        assert body["proposed_policy"]["service_allocations_mbps"]
+        assert body["proposed_policy"]["service_allocations_mbps"] == dict(
+            MANAGED_HTB_PROFILES[classification]
+        )
+        assert body["tc_commands"] == generate_managed_htb_commands(
+            plan_managed_htb(classification, interface=body["proposed_policy"]["interface"])
+        )
         assert body["dry_run"] is True
         assert body["applied"] is False
         assert body["application_enabled"] is False
+
+
+def test_dashboard_latest_and_ai_decision_share_the_same_measurement_identity(tmp_path, monkeypatch):
+    run_id = "77777777777777777777777777777777"
+    run_root = tmp_path / ".adaptive-qos-runs"
+    row = decision_telemetry(
+        "h2",
+        datetime.now(timezone.utc).isoformat(),
+        utilization=68,
+        latency=54,
+        loss=0.2,
+    )
+    row["experiment_id"] = run_id
+    write_congestion_run(run_root, run_id, [row])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+    monkeypatch.delenv(api.TELEMETRY_FILE_ENV, raising=False)
+    api._scoped_decision_loops.pop(("h2", "congestion"), None)
+
+    dashboard = client.get(
+        "/api/telemetry/latest",
+        params={"host": "h2", "scenario": "congestion"},
+    ).json()
+    decision = client.get(
+        "/api/qos/decision",
+        params={"host": "h2", "scenario": "congestion"},
+    ).json()
+
+    assert dashboard["collection_status"] == "fresh"
+    assert dashboard["record"]["experiment_id"] == run_id
+    assert decision["telemetry_experiment_id"] == dashboard["record"]["experiment_id"]
+    assert decision["measurement"]["experiment_id"] == dashboard["record"]["experiment_id"]
+    assert decision["measurement"]["timestamp"] == dashboard["record"]["timestamp"]
 
 
 def test_decision_api_missing_or_mismatched_host_and_scenario_have_no_proposal(tmp_path, monkeypatch):
@@ -206,6 +251,7 @@ def test_decision_api_rejects_stale_and_missing_telemetry(monkeypatch):
     monkeypatch.setattr(api, "latest_telemetry", lambda host=None, scenario=None: telemetry("stale"))
     stale = client.get("/api/qos/decision").json()
     assert stale["status"] == "stale"
+    assert stale["telemetry_experiment_id"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     assert stale["proposed_policy"] is None and stale["tc_commands"] == []
 
     monkeypatch.setattr(api, "latest_telemetry", lambda host=None, scenario=None: telemetry("unavailable"))

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getActiveTrafficExecution, getLatestTelemetry, getTopology, getTrafficExecution, startTrafficExecution, stopTrafficExecution } from "../api/client";
 import type { ApiExecution, ApiTelemetry, ApiTopology, ExecutionScenario } from "../api/client";
 import { CLIENT_FLOWS } from "../data/demo";
+import { formatMeasurement, formatMbps } from "../utils/format";
 import type { FlowId } from "../types";
 
 type Scenario = "normal" | "moderate" | "congestion" | "burst";
@@ -19,7 +20,7 @@ const EXECUTION_REFRESH_MS = 1_000;
 const TERMINAL_STATES = new Set<ApiExecution["status"]>(["completed", "failed", "stopped"]);
 
 function metric(value: number | null, unit: string) {
-  return value === null ? "Unavailable" : `${value} ${unit}`;
+  return formatMeasurement(value, unit);
 }
 
 function telemetryStatusLabel(value: ApiTelemetry["status"]) {
@@ -49,10 +50,22 @@ export function TrafficLab() {
   useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const isExecutionActive = Boolean(
+      execution && (!TERMINAL_STATES.has(execution.status) || execution.process_alive),
+    );
+
+    if (isExecutionActive) {
+      setTelemetry(null);
+      setTelemetryError("");
+      setTelemetryLoading(false);
+      return () => { active = false; };
+    }
 
     const refreshTelemetry = async () => {
       try {
-        const result = await getLatestTelemetry();
+        const result = await getLatestTelemetry(
+          execution ? { experiment_id: execution.experiment_id } : {},
+        );
         if (active) {
           setTelemetry(result);
           setTelemetryError("");
@@ -76,7 +89,7 @@ export function TrafficLab() {
       active = false;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, []);
+  }, [execution?.experiment_id, execution?.status, execution?.process_alive]);
 
   useEffect(() => {
     let active = true;
@@ -156,6 +169,9 @@ export function TrafficLab() {
           : "";
   const profileValid = validationReason === "";
   const activeExecution = Boolean(execution && (!TERMINAL_STATES.has(execution.status) || execution.process_alive));
+  const telemetryRecords = telemetry?.records?.length
+    ? telemetry.records
+    : telemetry?.record ? [telemetry.record] : [];
   const canStart = apiConnected && !executionLoading && !requestPending && !activeExecution && profileValid;
 
   async function refreshExecution() {
@@ -180,7 +196,7 @@ export function TrafficLab() {
     const totalRate = rate * plannedFlows.length;
     const durationLabel = scenario === "burst" ? "23 seconds total (5 × 3-second bursts, 4 × 2-second gaps)" : `${duration} seconds`;
     const sourceLabel = selectedFlow === "all" ? "All flows (h1–h4)" : selectedSourceHost;
-    const confirmation = `Launch real ${preset.label} traffic after the API confirms the expected Mininet topology is running?\n\nSelected source: ${sourceLabel}\nPlanned execution flows: ${flowNames}\nProtocol: UDP\nRate: ${rate} Mbps per flow\nTotal offered rate: ${totalRate} Mbps across ${plannedFlows.length} flow${plannedFlows.length === 1 ? "" : "s"}\nDuration: ${durationLabel}\nDestination ports: ${ports.join(", ")}\n\nThis sends real UDP traffic. Preview configuration does not launch traffic.`;
+    const confirmation = `Launch real ${preset.label} traffic after the API confirms the expected Mininet topology is running?\n\nSelected source: ${sourceLabel}\nPlanned execution flows: ${flowNames}\nProtocol: UDP\nRate: ${formatMbps(rate)} Mbps per flow\nTotal offered rate: ${formatMbps(totalRate)} Mbps across ${plannedFlows.length} flow${plannedFlows.length === 1 ? "" : "s"}\nDuration: ${durationLabel}\nDestination ports: ${ports.join(", ")}\n\nThis sends real UDP traffic. Preview configuration does not launch traffic.`;
     if (!window.confirm(confirmation)) return;
     setRequestPending("start");
     setExecutionError("");
@@ -256,59 +272,55 @@ export function TrafficLab() {
         <div>
           <div className="eyebrow"><span className="eyebrow-mark" /> TRAFFIC CONFIGURATION</div>
           <h1>Traffic Lab</h1>
-          <p>Preview locally or launch a validated Normal, Moderate, or Congestion configuration, or the fixed Burst schedule, in the expected Mininet topology. This is emulated traffic, not production or physical-network traffic.</p>
+          <p>Preview or run validated UDP scenarios in the configured Mininet emulation.</p>
         </div>
         <span className={`status-pill ${executionLoading ? "status-pill--muted" : apiConnected ? "status-pill--surface" : "status-pill--muted"}`}><ShieldAlert size={14} /> {executionLoading ? "Checking execution API" : apiConnected ? "Execution API available" : "Execution API unavailable"}</span>
       </section>
 
-      <div className="safety-callout card">
-        <div className="callout-icon"><AlertCircle size={18} /></div>
-        <div>
-          <strong>Guarded traffic execution</strong>
-          <p>Start launches only an allowlisted scenario with validated parameters after the backend verifies the required Mininet namespaces, interfaces, and server address. The topology display is configured inventory, not proof that Mininet is currently connected. Traffic is Mininet-emulated; this does not represent production or physical-network traffic. The runner does not change Mininet, OVS, routes, or traffic-control settings.</p>
-        </div>
-      </div>
 
       <section className="card traffic-telemetry" aria-label="Latest telemetry">
         <div className="section-heading">
           <div>
             <h2>Latest measured telemetry</h2>
-            <p>Read-only measurements from the configured telemetry file. This status does not indicate whether traffic is running.</p>
           </div>
           <span
             className={`status-pill ${telemetry?.status === "available" ? "status-pill--surface" : "status-pill--muted"}`}
-            aria-label={`Telemetry freshness: ${telemetry?.status === "available" ? "fresh" : telemetry?.status ?? (telemetryError ? "API error" : "checking")}`}
+            aria-label={`Telemetry freshness: ${telemetry?.collection_status ?? telemetry?.status ?? (telemetryError ? "API error" : "checking")}`}
           >
-            <Radio size={13} /> {telemetry?.status === "available" ? "Fresh · Available" : telemetry ? telemetryStatusLabel(telemetry.status) : telemetryError ? "API error" : "Checking"}
+            <Radio size={13} /> {telemetry?.collection_status === "collection_failed" ? "Collection failed" : telemetry?.collection_status === "no_measurement" ? "No measurement" : telemetry?.status === "available" ? "Fresh · Available" : telemetry ? telemetryStatusLabel(telemetry.status) : telemetryError ? "API error" : "Checking"}
           </span>
         </div>
         {telemetryError ? (
           <p className="api-data-card__message" role="alert">Telemetry request failed: {telemetryError}</p>
         ) : telemetryLoading && !telemetry ? (
           <p className="api-data-card__message" role="status">Loading latest telemetry…</p>
-        ) : telemetry?.status === "unavailable" ? (
+        ) : execution && (!TERMINAL_STATES.has(execution.status) || execution.process_alive) ? (
+          <p className="api-data-card__message" role="status">Waiting for measurements linked to experiment {execution.experiment_id}.</p>
+        ) : telemetry?.collection_status === "collection_failed" && telemetryRecords.length === 0 ? (
+          <p className="api-data-card__message" role="alert">{telemetry.message}</p>
+        ) : telemetry?.status === "unavailable" && telemetryRecords.length === 0 ? (
           <p className="api-data-card__message" role="status">{telemetry.message}</p>
-        ) : telemetry?.record ? (
+        ) : telemetry && telemetryRecords.length > 0 ? (
           <div className="traffic-telemetry__content">
             <div className="traffic-telemetry__meta">
-              <span><strong>Record source:</strong> {telemetry.record.source}</span>
-          <span><strong>Scenario:</strong> {telemetry.record.scenario}</span>
-              <span><strong>Interface:</strong> {telemetry.record.interface}</span>
-              <span><strong>Timestamp:</strong> {telemetry.record.timestamp}</span>
+              <span><strong>Telemetry identity:</strong> {telemetryRecords[0].experiment_id ?? "Unavailable"}</span>
+              <span><strong>Scenario:</strong> {telemetryRecords[0].scenario}</span>
               <span><strong>Age:</strong> {telemetry.measurement_age_seconds === null ? "Unavailable" : `${telemetry.measurement_age_seconds.toFixed(1)} seconds`}</span>
               <span><strong>File source:</strong> {telemetry.source}</span>
+              <span><strong>Provenance:</strong> {telemetryRecords[0].provenance ?? "Not recorded"}</span>
             </div>
-            <div className="traffic-telemetry__metrics" aria-label={`${telemetryStatusLabel(telemetry.status)} measurements`}>
-              <span>Throughput <strong>{metric(telemetry.record.throughput_mbps, "Mbps")}</strong></span>
-              <span>Measured utilization <strong>{metric(telemetry.record.utilization_percent ?? null, "%")}</strong></span>
-              <span>Capacity denominator <strong>{metric(telemetry.record.bandwidth_mbps ?? null, "Mbps")}</strong></span>
-              <span>Latency <strong>{metric(telemetry.record.latency_ms, "ms")}</strong></span>
-              <span>Jitter <strong>{metric(telemetry.record.jitter_ms, "ms")}</strong></span>
-              <span>Packet loss <strong>{metric(telemetry.record.packet_loss_percent, "%")}</strong></span>
-              <span>Queue size <strong>{metric(telemetry.record.queue_size, "packets")}</strong></span>
-              <span>Queue drops <strong>{metric(telemetry.record.queue_drops, "packets")}</strong></span>
-            </div>
-            {telemetry.status === "stale" && <p className="api-data-card__message" role="status">These are stale recorded measurements, not current traffic values. {telemetry.message}</p>}
+            {telemetry.configuration_conflict && <p className="api-data-card__message" role="alert">{telemetry.configuration_conflict}</p>}
+            {telemetry.collection_status === "collection_failed" && <p className="api-data-card__message" role="alert">{telemetry.message}</p>}
+            <div className="table-scroll"><table className="data-table" aria-label="Execution-linked telemetry">
+              <thead><tr><th>Experiment</th><th>Host / flow</th><th>Scenario</th><th>Timestamp</th><th>Interface</th><th>Throughput</th><th>Utilization</th><th>Capacity</th><th>Latency</th><th>Jitter</th><th>Packet loss</th><th>Queue size</th><th>Queue drops</th><th>Measurement source</th></tr></thead>
+              <tbody>{telemetryRecords.map((record) => <tr key={`${record.experiment_id}-${record.source}-${record.timestamp}`}>
+                <td>{record.experiment_id ?? "Unavailable"}</td><td>{record.source}</td><td>{record.scenario}</td><td>{record.timestamp}</td><td>{record.interface}</td>
+                <td>{metric(record.throughput_mbps, "Mbps")}</td><td>{metric(record.utilization_percent ?? null, "%")}</td><td>{metric(record.bandwidth_mbps ?? null, "Mbps")}</td>
+                <td>{metric(record.latency_ms, "ms")}</td><td>{metric(record.jitter_ms, "ms")}</td>
+                <td>{metric(record.packet_loss_percent, "%")}</td><td>{metric(record.queue_size, "packets")}</td><td>{metric(record.queue_drops, "packets")}</td>
+                <td>{record.measurement_source ?? "Not recorded"}</td>
+              </tr>)}</tbody>
+            </table></div>
           </div>
         ) : (
           <p className="api-data-card__message" role="status">No validated telemetry record is available.</p>
@@ -331,7 +343,6 @@ export function TrafficLab() {
             ))}
           </select>
           <p className="field-help">{scenarioDetails.description}</p>
-          <p className="field-help">Client selection sets the source host used by Start. Preview remains local; traffic starts only after you press Start and confirm.</p>
 
           <fieldset className="flow-picker">
             <legend className="field-label">Client selection</legend>
@@ -374,7 +385,7 @@ export function TrafficLab() {
             </label>
           </div>
           <p className="field-help traffic-capacity-note" role="note">
-            Configured s1–s2 bottleneck: {bottleneckCapacity === null ? "unavailable from topology API" : `${bottleneckCapacity} Mbps`}. Selected offered load: {rate} Mbps/flow × {plannedFlows.length} configured flow{plannedFlows.length === 1 ? "" : "s"} = {plannedOfferedLoad.toFixed(1)} Mbps aggregate. This is the sender target, not measured throughput; actual measurements are shown above.
+            Configured s1–s2 bottleneck: {bottleneckCapacity === null ? "unavailable from topology API" : `${formatMbps(bottleneckCapacity)} Mbps`}. Selected offered load: {formatMbps(rate)} Mbps/flow × {plannedFlows.length} configured flow{plannedFlows.length === 1 ? "" : "s"} = {formatMbps(plannedOfferedLoad)} Mbps aggregate. This sender target is separate from measured throughput shown above.
           </p>
           {validationReason && <p className="field-help" role="status">{validationReason}</p>}
 
@@ -394,21 +405,21 @@ export function TrafficLab() {
             <ShieldAlert size={15} aria-hidden="true" />
             <div>
               <strong>Preview and execution</strong>
-              <span>Preview stays in your browser and never launches traffic. Start executes the selected source and planned flow(s) only after confirmation. Limits: 0.1–10 Mbps per flow and 1–60 seconds; Burst is fixed at 8 Mbps and 23 seconds total.</span>
+              <span>Preview is local. Start sends the selected workload only after confirmation. Burst is fixed at 8 Mbps for 23 seconds.</span>
             </div>
           </div>
         </section>
 
         <aside className="card traffic-summary">
           <div className="section-heading">
-            <div><h2>Traffic execution</h2><p>Execution status comes from the guarded process supervisor. Telemetry remains a separate measurement stream.</p></div>
+            <div><h2>Traffic execution</h2></div>
           </div>
           {executionLoading && <p className="api-data-card__message" role="status">Checking for an active guarded experiment…</p>}
           {executionError && <div className="inline-error" role="alert"><AlertCircle size={16} />{executionError}<button type="button" className="text-button" onClick={() => void refreshExecution()}><RefreshCw size={13} /> Retry status check</button></div>}
           {!executionLoading && !execution && !executionError && <p className="api-data-card__message" role="status">No guarded traffic experiment has been started.</p>}
           {execution && <div className={`execution-state execution-state--${execution.status}`} role="status">
             <strong>{execution.status[0].toUpperCase() + execution.status.slice(1)}</strong>
-            <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps offered per flow · {(execution.target_rate_mbps * execution.flows.length).toFixed(1)} Mbps aggregate offered · {execution.duration_seconds}s</span>
+            <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {formatMbps(execution.target_rate_mbps)} Mbps offered per flow · {formatMbps(execution.target_rate_mbps * execution.flows.length)} Mbps aggregate offered · {execution.duration_seconds}s</span>
             <span>Elapsed {execution.elapsed_seconds.toFixed(1)}s{execution.process_exit_code !== null ? ` · Process exit ${execution.process_exit_code}` : ""}</span>
             {!TERMINAL_STATES.has(execution.status) && (
               <div className="execution-progress">
@@ -419,9 +430,7 @@ export function TrafficLab() {
             )}
             {execution.error && <span className="execution-state__error">{execution.error}</span>}
             {executionError && <span className="execution-state__error">Last status refresh failed. Showing the last confirmed process state.</span>}
-            {execution.status === "completed" && (
-              <span>Process completed. This API does not link measured telemetry to the execution, so no execution-specific metrics are inferred here.</span>
-            )}
+            <span>Experiment ID: {execution.experiment_id} · Measurement collection: {execution.measurement_status ?? "not reported"}{execution.measurement_record_count ? ` · ${execution.measurement_record_count} records from ${execution.measurement_hosts?.join(", ") ?? "selected hosts"}` : ""}</span>
           </div>}
           <div className="flow-status-list">
             {CLIENT_FLOWS.map((flow) => {
@@ -444,16 +453,12 @@ export function TrafficLab() {
           {previewed ? (
             <div className="preview-result" role="status">
               <div className="preview-result__title"><Check size={16} /> Local configuration preview</div>
-              <p>{SCENARIOS[scenario].label} · selected source {selectedFlow === "all" ? "All flows" : selectedSourceHost} · planned: {plannedFlows.map((flow) => flow.id).join(", ")} · {rate} Mbps each · {duration}s</p>
+              <p>{SCENARIOS[scenario].label} · selected source {selectedFlow === "all" ? "All flows" : selectedSourceHost} · planned: {plannedFlows.map((flow) => flow.id).join(", ")} · {formatMbps(rate)} Mbps each · {duration}s</p>
               <small>This preview does not launch traffic. Start uses this plan after confirmation.</small>
             </div>
           ) : (
             <div className="summary-empty"><span>01</span><p>Select options, then preview the local configuration.</p></div>
           )}
-          <div className="traffic-config-note">
-            <strong>Backend-supported defaults</strong>
-            <span>Congestion: 4 concurrent UDP flows · 4 Mbps each · 20 seconds.</span>
-          </div>
         </aside>
       </div>
     </div>

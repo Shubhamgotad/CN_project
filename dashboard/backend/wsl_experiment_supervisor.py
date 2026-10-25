@@ -19,6 +19,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.fspath(PROJECT_ROOT))
+from ai.prediction.telemetry import adapt_person1_telemetry
 from traffic.traffic_generator import CLIENT_FLOW_PORTS
 
 RUN_ROOT = PROJECT_ROOT.parent / ".adaptive-qos-runs"
@@ -425,6 +426,9 @@ def _scenario_state(experiment_id: str, scenario: str, rate_mbps=None, duration_
         "can_stop": True,
         "process_exit_code": None,
         "error": None,
+        "measurement_status": "pending",
+        "measurement_record_count": 0,
+        "measurement_hosts": [],
         "supervisor_pid": None,
         "supervisor_start_ticks": None,
         "producer_pid": None,
@@ -564,6 +568,50 @@ def _stop_producer(process: subprocess.Popen[bytes], start_ticks: int) -> bool:
     return stopped
 
 
+def _validate_completed_telemetry(
+    experiment_id: str,
+    scenario: str,
+    expected_flows: list[str],
+) -> dict[str, Any]:
+    """Validate persisted receiver measurements before reporting collection success."""
+    path = _run_dir(experiment_id) / "output" / f"{scenario}.jsonl"
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("The producer exited successfully but did not persist its telemetry file.")
+    records = 0
+    hosts: set[str] = set()
+    latest_timestamp: datetime | None = None
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.endswith("\n"):
+                raise RuntimeError(f"Telemetry line {line_number} is incomplete.")
+            try:
+                payload = json.loads(line)
+                adapted = adapt_person1_telemetry(payload, interface="s1-eth5")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Telemetry line {line_number} failed schema validation: {exc}") from exc
+            if (
+                payload.get("experiment_id") != experiment_id
+                or payload.get("scenario") != scenario
+                or payload.get("source") not in expected_flows
+                or payload.get("interface") != "s1-eth5"
+                or payload.get("measurement_source") != "iperf3_receiver_json_stream+tc_qdisc"
+            ):
+                raise RuntimeError(f"Telemetry line {line_number} does not match the execution identity or measurement source.")
+            timestamp = datetime.fromtimestamp(adapted.record.timestamp, timezone.utc)
+            hosts.add(payload["source"])
+            records += 1
+            latest_timestamp = max(latest_timestamp, timestamp) if latest_timestamp else timestamp
+    missing_hosts = set(expected_flows) - hosts
+    if records == 0 or missing_hosts:
+        missing = ", ".join(sorted(missing_hosts)) or "all selected flows"
+        raise RuntimeError(f"No valid measurement was persisted for: {missing}.")
+    return {
+        "measurement_record_count": records,
+        "measurement_hosts": sorted(hosts),
+        "measurement_finished_at": latest_timestamp.isoformat() if latest_timestamp else None,
+    }
+
+
 def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=None, source_host=None) -> None:
     rate_mbps, duration_seconds = _execution_parameters(scenario, rate_mbps, duration_seconds)
     source_host = _selected_source_host(scenario, source_host)
@@ -682,12 +730,27 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
                 state["error"] = "Producer exited while owned child processes remain; termination is not verified."
             elif producer.returncode == 0:
                 state["status"] = "completed"
-                state["error"] = None
+                try:
+                    measurement_summary = _validate_completed_telemetry(
+                        experiment_id,
+                        scenario,
+                        expected_hosts,
+                    )
+                except (OSError, UnicodeError, RuntimeError, ValueError) as exc:
+                    state["measurement_status"] = "collection_failed"
+                    state["error"] = f"Traffic completed, but telemetry collection failed: {exc}"[:240]
+                else:
+                    state.update(measurement_summary)
+                    state["measurement_status"] = "available"
+                    state["error"] = None
             else:
                 state["status"] = "failed"
+                state["measurement_status"] = "collection_failed"
                 state["error"] = f"Producer exited with code {producer.returncode}. See the local experiment log for details."
     except Exception as exc:
         state["status"] = "failed"
+        if state.get("measurement_status") == "pending":
+            state["measurement_status"] = "collection_failed" if producer is not None else "no_measurement"
         state["process_alive"] = bool(
             producer is not None and producer.poll() is None
         ) or bool(
@@ -713,6 +776,8 @@ def _worker(experiment_id: str, scenario: str, rate_mbps=None, duration_seconds=
         state["elapsed_seconds"] = round(time.monotonic() - started_clock, 3)
         if state.get("status") in {"completed", "stopped", "failed"}:
             state["finished_at"] = _utc_now()
+            if state.get("measurement_status") == "pending":
+                state["measurement_status"] = "no_measurement"
         _write_state(experiment_id, state)
 
 

@@ -2,7 +2,9 @@
 
 ## Data flow and evidence
 
-Traffic Lab starts an allowlisted experiment through the Windows FastAPI service and WSL supervisor. The supervisor records `state.json` in a UUID directory under `.adaptive-qos-runs` beside the repository. The state must identify the same UUID, use execution contract version 3, finish with status `completed`, `process_alive: false`, exit code 0, a timezone-aware finish time, a supported scenario, and validated source-host/flow metadata. The matching `output/<scenario>.jsonl` file is the evidence source. Its records must retain the run ID and scenario, use a source host from the selected run's flows, include the complete Person 1 measurement schema, and contain real timezone-aware timestamps and measured queue fields.
+Traffic Lab starts an allowlisted experiment through the Windows FastAPI service and WSL supervisor. The supervisor records `state.json` in a UUID directory under `.adaptive-qos-runs` beside the repository. The state must identify the same UUID, use execution contract version 3, finish with status `completed`, `process_alive: false`, exit code 0, a timezone-aware finish time, a supported scenario, and validated source-host/flow metadata. Before reporting measurement collection as available, the supervisor validates the persisted `output/<scenario>.jsonl`: every required flow must have a timezone-aware, schema-valid receiver measurement with the same experiment ID and scenario, the bottleneck interface, and the expected iperf/tc measurement source. A zero producer exit code by itself does not prove telemetry was collected.
+
+The producer runs UDP clients in the selected Mininet host namespaces and iperf3 UDP servers on the receiving side. Receiver interval events are matched against sender intervals; the scenario aggregate is persisted once per flow to the run's scenario JSONL. Congestion retains separate rows for h1-h4. Each aggregate carries receiver throughput, latency, jitter, packet loss, measured queue size/drops, the configured 10 Mbps `s1-eth5` capacity denominator, and measurement-source/provenance metadata. The separate interval JSONL retains aligned interval-level sender, receiver, and queue observations.
 
 `python report.py` selects the uniquely newest completed run by timezone-aware `finished_at`, validates lifecycle order and the state `output_directory`, then reads only that run's scenario-named JSONL. If that run's state or any source row is invalid, it fails instead of choosing an older run. All complete records are inputs to inference; every row must match the run ID/scenario/source flows, be no later than `finished_at`, contain valid required measurements and queues, and meet freshness limits (maximum age 300 seconds, future skew 30 seconds). It then invokes the checked-in saved model and existing policy mappings in dry-run mode. It does not modify telemetry, start traffic, run `tc`, or apply QoS. The atomic report records the experiment, scenario, source hosts, row count and latest measurement timestamp, as well as per-record model predictions and planned allocations.
 
@@ -19,6 +21,26 @@ Set these variables in the environment inherited by both the API process and `py
 | `ADAPTIVE_QOS_ENABLE_APPLICATION` | No; leave unset/disabled for this project | Must equal `1` before the backend considers application authorization. It does not override the exclusive ownership gate. |
 
 The configured report folder is an operator-approved location; it must be absolute and existing. Paths inside the repository or Traffic Lab evidence directory, symbolic-link paths, missing paths, and unreadable paths are rejected. Public report API responses expose report identifiers and sanitized report fields, not local directory, telemetry or model paths. The API reads environment configuration at request time; for production, configure variables before starting/restarting the API so all processes have the same settings.
+
+## Experiments page data sources
+
+`GET /api/reports` lists three distinct document kinds. `experiment-runner` files contain offline saved-model predictions and planned allocations; they are shown separately in Experiments and never counted as evidence reports. `evidence-analysis` and `campaign-validation` documents are loaded as campaign evidence. A prediction report cannot be imported as a campaign report. Manual import accepts the documented version 1 evidence JSON and reports schema errors instead of treating arbitrary JSON as validated evidence.
+
+`GET /api/experiments/runs` lists validated Traffic Lab supervisor states. Completed, failed and stopped counts refer only to execution states; they are not campaign trial counts. The required campaign comprises 48 manifested trials across Baseline, QoS LOW, QoS MEDIUM and QoS HIGH (three complete cycles). One or many ordinary single-scenario Traffic Lab executions do not establish those strata or their campaign provenance. Campaign trial counts remain unavailable until a campaign-validation or evidence-analysis report is loaded.
+
+Dashboard and AI & QoS use the validated latest-measurement API (AI & QoS consumes the same result through the dry-run decision endpoint). Traffic Lab scopes the same API to the just-completed experiment ID and displays the returned per-flow records, so a four-flow Congestion execution remains four measurements rather than a single host presented as an aggregate. Responses distinguish `fresh`, `stale`, `no_measurement`, and `collection_failed`; stale, missing, and failed collection never produce a QoS proposal. An explicit `ADAPTIVE_QOS_TELEMETRY_FILE` remains pinned for unscoped latest requests. If its experiment ID conflicts with a newer run, the API reports both identities; the experiment-scoped Traffic Lab request reads only the requested run output and also reports the override conflict rather than silently relabeling the pinned file.
+
+An empty run history is returned as an available response with zero counts. If the Experiments page reports a run-history request error (especially HTTP 404), verify `VITE_BACKEND_URL` and restart the API from this project's root so the frontend reaches the backend that registers `/api/experiments/runs`.
+
+The backend currently reports campaign comparison eligibility as blocked because producer provenance and clock mapping are not independently validated. Campaign completeness and artifact/hash checks do not establish comparable measurement windows; the UI must not enable comparisons or claim improvement until those gates pass.
+
+To persist a campaign validator result into the configured report directory without replacing an existing file:
+
+```powershell
+python -m integration.campaign_validation --manifest C:\path\to\campaign\campaign.json --json-output "$env:ADAPTIVE_QOS_REPORT_DIR\campaign-validation.json"
+```
+
+The report directory and the campaign manifest/evidence must be on distinct paths; the output command refuses existing filenames, repository paths, and paths inside the campaign evidence directory. After the validation command, choose **Refresh reports** on the Experiments page. An incomplete validation report is still inspectable with its failures; its nonzero process status means it did not complete the campaign.
 
 Example PowerShell setup (choose a real absolute directory and create it yourself):
 

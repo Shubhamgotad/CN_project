@@ -9,6 +9,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { formatMeasurement } from "../utils/format";
 const COLORS = ["#35231C", "#704B3A", "#A88970", "#C8AD94"];
 
 export interface TelemetryChartPoint {
@@ -54,11 +55,11 @@ export function TrendChart({
             <Chart data={data} margin={{ top: 10, right: 8, left: -18, bottom: 0 }}>
               <CartesianGrid stroke="#D6BFA9" strokeDasharray="3 5" vertical={false} />
               <XAxis dataKey="time" tickLine={false} axisLine={false} tick={{ fill: "#704B3A", fontSize: 11 }} />
-              <YAxis tickLine={false} axisLine={false} tick={{ fill: "#704B3A", fontSize: 11 }} />
+              <YAxis tickLine={false} axisLine={false} tick={{ fill: "#704B3A", fontSize: 11 }} tickFormatter={(value) => formatMeasurement(Number(value), unit)} />
               <Tooltip
                 contentStyle={{ border: "1px solid #704B3A", borderRadius: 10, background: "#F4EDE4" }}
                 labelStyle={{ color: "#35231C", fontWeight: 700 }}
-                formatter={(value) => [`${value} ${unit}`, ""]}
+                formatter={(value) => [formatMeasurement(Number(value), unit), ""]}
               />
               {series.map((item, index) => area ? (
                 <Area

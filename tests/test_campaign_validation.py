@@ -525,3 +525,28 @@ def test_campaign_validation_does_not_modify_evidence(tmp_path):
     analyze_campaign(campaign_path)
 
     assert evidence_file.read_bytes() == before
+
+
+def test_campaign_cli_persists_unique_json_report_outside_evidence_without_overwrite(tmp_path, capsys):
+    manifest = make_campaign(tmp_path / "campaign", write_evidence=False)
+    campaign_path = write_campaign(tmp_path / "campaign", manifest)
+    output_dir = tmp_path / "approved-reports"
+    output_dir.mkdir()
+    output_path = output_dir / "campaign-report.json"
+
+    result = campaign_validation.main([
+        "--manifest", str(campaign_path), "--json-output", str(output_path),
+    ])
+
+    assert result == 1  # this fixture is intentionally incomplete but produces a valid diagnostic report
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["campaign_id"] == manifest["campaign_id"]
+    assert payload["status"] == "incomplete"
+    assert "Campaign report written" in capsys.readouterr().out
+    output_path.write_text("user data", encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        campaign_validation.main([
+            "--manifest", str(campaign_path), "--json-output", str(output_path),
+        ])
+    assert error.value.code == 2
+    assert output_path.read_text(encoding="utf-8") == "user data"

@@ -3,22 +3,16 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiTelemetry, ApiTelemetryHistory, ApiTelemetryHistoryRecord } from "../api/client";
-import { getActiveTrafficExecution, getBackendHealth, getExperimentsStatus, getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
+import { getLatestTelemetry, getTelemetryHistory, getTopology } from "../api/client";
 import { Dashboard } from "./Dashboard";
 
 vi.mock("../api/client", () => ({
   backendConnection: { baseUrl: "http://127.0.0.1:8000" },
-  getActiveTrafficExecution: vi.fn(),
-  getBackendHealth: vi.fn(),
-  getExperimentsStatus: vi.fn(),
   getLatestTelemetry: vi.fn(),
   getTelemetryHistory: vi.fn(),
   getTopology: vi.fn(),
 }));
 
-const healthMock = vi.mocked(getBackendHealth);
-const activeExecutionMock = vi.mocked(getActiveTrafficExecution);
-const reportsMock = vi.mocked(getExperimentsStatus);
 const telemetryMock = vi.mocked(getLatestTelemetry);
 const historyMock = vi.mocked(getTelemetryHistory);
 const topologyMock = vi.mocked(getTopology);
@@ -101,14 +95,6 @@ beforeEach(() => {
   document.body.appendChild(container);
   root = createRoot(container);
   unmounted = false;
-  healthMock.mockReset().mockResolvedValue({ status: "ok", service: "dashboard", api_version: "0.1.0", live_network_operations: true });
-  activeExecutionMock.mockReset().mockResolvedValue(null);
-  reportsMock.mockReset().mockResolvedValue({
-    status: "unavailable", report_id: null, campaign_completeness: "unavailable", complete_cycle_count: null,
-    minimum_complete_cycles: null, boundary_metadata_status: "unavailable", boundary_evidence_integrity_status: "unavailable",
-    producer_provenance_status: "not_independently_validated", clock_mapping_status: "not_independently_validated",
-    measurement_alignment_eligibility: "ineligible", comparison_ready: false, message: "No report.",
-  });
   topologyMock.mockReset().mockResolvedValue({
     status: "configured", source: "repository topology", live_connectivity_verified: false, bottleneck_interface: "s1-eth5",
     hosts: [
@@ -133,61 +119,38 @@ describe("Dashboard recorded telemetry", () => {
   it("uses actual API measurements and identifies their source, scenario, and timestamp", async () => {
     await renderDashboard();
 
-    expect(container.textContent).toContain("2.997 Mbps");
-    expect(container.textContent).toContain("20.6309 ms");
-    expect(container.textContent).toContain("0.0334 ms");
+    expect(container.textContent).toContain("3.00 Mbps");
+    expect(container.textContent).toContain("20.631 ms");
+    expect(container.textContent).toContain("0.033 ms");
     expect(container.textContent).toContain("0 %");
-    expect(container.textContent).toContain("4 packets");
     expect(container.textContent).toContain("Completed experiment recording");
     expect(container.textContent).toContain("normal");
     expect(container.textContent).toContain("2026-10-20T10:11:12.123+00:00");
     expect(container.textContent).toContain("insufficient history for a trend");
     expect(container.textContent).toContain("Recorded telemetry history");
     expect(container.textContent).toContain("completed experiment JSONL · recorded data, not live");
-    expect(container.textContent).toContain("live connectivity is not verified");
-    expect(container.textContent).toContain("No active traffic execution is reported.");
-    expect(container.textContent).toContain("Historical completed execution status is not available");
-    expect(container.querySelector('a[href="/traffic-lab"]')?.textContent).toContain("Traffic Lab");
-    expect(container.querySelector('a[href="/ai-qos"]')?.textContent).toContain("AI & QoS");
-    expect(container.querySelector('a[href="/experiments"]')?.textContent).toContain("Experiments");
+    expect(container.textContent).toContain("A clearer view of your network.");
+    expect(container.textContent).toContain("Bottleneck capacity10");
+    expect(container.textContent).toContain("Network topology");
+    expect(container.textContent).not.toContain("Configured backend data");
+    expect(container.textContent).not.toContain("API health:");
+    expect(container.textContent).not.toContain("Report status:");
+    expect(container.textContent).not.toContain("Active traffic execution");
+    expect(container.querySelector('a[href="/traffic-lab"]')).toBeNull();
+    expect(container.querySelector('a[href="/ai-qos"]')).toBeNull();
+    expect(container.querySelector('a[href="/experiments"]')).toBeNull();
+    expect(container.querySelectorAll('[aria-label="Read-only API data"], [aria-label="Current execution and workflow navigation"]')).toHaveLength(0);
     expect(container.querySelector('[aria-label="Latency / RTT · h1, validated recorded telemetry at 2026-10-20T10:11:12.123+00:00"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Synthetic sample");
     expect(telemetryMock).toHaveBeenCalledWith({ host: "h1", scenario: undefined });
   });
 
-  it("shows only the active execution returned by the backend, including a failure", async () => {
-    activeExecutionMock.mockResolvedValue({
-      experiment_id: "0123456789abcdef0123456789abcdef",
-      scenario: "burst",
-      source_host: "h2",
-      status: "failed",
-      flows: ["h2"],
-      target_rate_mbps: 8,
-      duration_seconds: 23,
-      created_at: "2026-10-20T10:00:00Z",
-      started_at: "2026-10-20T10:00:00Z",
-      finished_at: "2026-10-20T10:00:04Z",
-      elapsed_seconds: 4,
-      process_alive: false,
-      can_stop: false,
-      process_exit_code: 2,
-      error: "Producer exited with code 2.",
-    });
-    await renderDashboard();
-
-    expect(container.textContent).toContain("burst · failed");
-    expect(container.textContent).toContain("Process exit code 2");
-    expect(container.textContent).toContain("Producer exited with code 2.");
-    expect(activeExecutionMock).toHaveBeenCalledTimes(1);
-  });
-
   it("keeps selected-client values tied to the actual record source", async () => {
     await renderDashboard();
-    const h2Button = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("h2 · Video Streaming"));
+    const h2Button = container.querySelector<HTMLButtonElement>('[aria-label="Select PC 2, host h2"]');
     expect(h2Button).toBeDefined();
     await act(async () => h2Button?.click());
 
-    expect(container.textContent).toContain("Latest row is for h1; no API measurement is available for selected h2.");
     expect(container.textContent).toContain("No fresh measurement is available for h2");
     const selectedMetrics = container.querySelector(".flow-detail__metrics")?.textContent ?? "";
     expect(selectedMetrics).toContain("Unavailable");
@@ -225,11 +188,11 @@ describe("Dashboard recorded telemetry", () => {
     telemetryMock.mockResolvedValue(telemetry("stale"));
     await renderDashboard();
 
-    expect(container.textContent).toContain("Telemetry is stale · values withheld");
+    expect(container.textContent).toContain("Latest measurement is stale; value withheld");
     expect(container.textContent).toContain("420.0 seconds");
     expect(container.textContent).toContain("Measurement statusstale");
     expect(container.textContent).toContain("Recorded telemetry history");
-    expect(container.textContent).not.toContain("2.997 Mbps");
+    expect(container.textContent).not.toContain("3.00 Mbps");
     expect(container.textContent).not.toContain("20.6309 ms");
     expect(container.textContent).toContain("completed experiment JSONL · recorded data, not live");
   });
@@ -251,10 +214,10 @@ describe("Dashboard recorded telemetry", () => {
     })));
     await renderDashboard();
 
-    expect(container.textContent).toContain("2.997 Mbps");
-    expect(container.textContent).toContain("Latency Unavailable");
-    expect(container.textContent).toContain("Jitter Unavailable");
-    expect(container.textContent).toContain("Packet loss Unavailable");
+    expect(container.textContent).toContain("3.00 Mbps");
+    expect(container.textContent).toContain("Latency / RTTUnavailable");
+    expect(container.textContent).toContain("JitterUnavailable");
+    expect(container.textContent).toContain("Packet lossUnavailable");
     expect(container.textContent).toContain("missing: queue size, queue drops");
     expect(container.textContent).toContain("Queue size and queue drops are missing from these recorded rows.");
   });
@@ -263,9 +226,9 @@ describe("Dashboard recorded telemetry", () => {
     historyMock.mockResolvedValue(history([]));
     telemetryMock.mockResolvedValueOnce(telemetry("unavailable"));
     await renderDashboard();
-    expect(container.textContent).toContain("No valid telemetry is available.");
+    expect(container.textContent).toContain("Measurement statusunavailable");
     expect(container.textContent).toContain("No history.");
-    expect(container.textContent).not.toContain("2.997 Mbps");
+    expect(container.textContent).not.toContain("3.00 Mbps");
 
     await act(async () => root.unmount());
     unmounted = true;
@@ -275,8 +238,9 @@ describe("Dashboard recorded telemetry", () => {
     unmounted = false;
     telemetryMock.mockRejectedValueOnce(new Error("connection refused"));
     await renderDashboard();
-    expect(container.textContent).toContain("Telemetry request error: connection refused");
-    expect(container.textContent).not.toContain("2.997 Mbps");
+    expect(container.textContent).toContain("API error");
+    expect(container.textContent).toContain("connection refused");
+    expect(container.textContent).not.toContain("3.00 Mbps");
   });
 
   it("reports history API failures separately from the latest measurement", async () => {
@@ -284,7 +248,7 @@ describe("Dashboard recorded telemetry", () => {
     await renderDashboard();
 
     expect(container.textContent).toContain("History API error: history endpoint unavailable");
-    expect(container.textContent).toContain("2.997 Mbps");
+    expect(container.textContent).toContain("3.00 Mbps");
     expect(container.textContent).not.toContain("2026-10-20T10:11:12.123+00:00 to");
   });
 });

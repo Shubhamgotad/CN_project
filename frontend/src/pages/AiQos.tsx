@@ -26,6 +26,7 @@ import type {
   ApiReportSummary,
 } from "../api/client";
 import { PROFILE_ALLOCATIONS } from "../data/demo";
+import { formatMbps, formatNumber } from "../utils/format";
 import type { CongestionClass, ImportedRunnerReport } from "../types";
 
 const PROFILE_NAMES: CongestionClass[] = ["LOW", "MEDIUM", "HIGH"];
@@ -51,14 +52,65 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
   const [decisionError, setDecisionError] = useState("");
   const [refreshingDecision, setRefreshingDecision] = useState(false);
   const [decisionRefreshCount, setDecisionRefreshCount] = useState(0);
+  const [tcCommandCopyStatus, setTcCommandCopyStatus] = useState("");
   const [qosStatus, setQosStatus] = useState<ApiQosApplicationStatus | null>(null);
   const [applicationState, setApplicationState] = useState<
-    "dry_run" | "pending_authorization" | "applying" | "applied_verified" | "failed" | "verification_failed"
+    "dry_run" | "pending_authorization" | "applying" | "applied_verified" | "status_unconfirmed" | "failed" | "verification_failed"
   >("dry_run");
   const [authorizationChecked, setAuthorizationChecked] = useState(false);
   const [applicationError, setApplicationError] = useState("");
   const record = report?.records[selectedRecord] ?? report?.records[0] ?? null;
   const profileBudgetMbps = dryRunDecision?.proposed_policy?.total_bandwidth_mbps ?? PROFILE_TOTAL_Mbps;
+  const tcPreviewCommands = dryRunDecision?.tc_commands ?? [];
+  const previewTelemetryFresh = dryRunDecision?.status === "ready"
+    && dryRunDecision.telemetry_status === "available"
+    && (dryRunDecision.telemetry_collection_status === undefined
+      || dryRunDecision.telemetry_collection_status === "fresh");
+  const selectedProfileAppliedAndVerified = Boolean(
+    dryRunDecision?.selected_profile
+    && dryRunDecision.proposed_policy?.interface
+    && qosStatus?.status === "verified"
+    && qosStatus.applied_profile === dryRunDecision.selected_profile
+    && qosStatus.interface === dryRunDecision.proposed_policy.interface,
+  );
+  const displayedApplicationState = selectedProfileAppliedAndVerified
+    ? "applied_verified"
+    : applicationState === "applied_verified"
+      ? "status_unconfirmed"
+      : applicationState;
+  const tcPreviewLifecycleLabel = selectedProfileAppliedAndVerified
+    ? "controller applied and verified"
+    : applicationState === "status_unconfirmed"
+      ? "controller application reported; status unconfirmed"
+      : applicationState === "verification_failed"
+        ? "application verification failed"
+        : applicationState === "failed"
+          ? "application failed; state uncertain"
+          : applicationState === "applying"
+            ? "application in progress"
+            : "dry run only; not executed";
+  const tcPreviewNotice = selectedProfileAppliedAndVerified
+    ? "This command preview is read-only; the selected profile is confirmed by backend controller status."
+    : applicationState === "status_unconfirmed"
+      ? "The command preview is read-only. The apply endpoint reported success, but current controller status does not confirm this proposed profile."
+      : applicationState === "verification_failed"
+        ? "The command preview is read-only. An application attempt failed verification; network state may be uncertain."
+        : applicationState === "failed"
+          ? "The command preview is read-only. An application attempt failed; current network state may be uncertain."
+          : applicationState === "applying"
+            ? "The command preview is read-only; a separately authorized application is in progress."
+            : "These commands illustrate the proposed configuration only. This page does not execute them or change network settings.";
+  const tcPreviewUnavailableReason = !previewTelemetryFresh
+    ? "A fresh validated telemetry decision is unavailable."
+    : !dryRunDecision?.selected_profile
+      ? "The proposed profile is unavailable."
+    : !dryRunDecision.proposed_policy?.interface?.trim()
+      ? "The proposed interface is unavailable."
+      : tcPreviewCommands.length === 0
+        ? "The backend did not provide proposed commands."
+        : tcPreviewCommands.some((command) => typeof command !== "string" || !command.trim())
+          ? "The backend command preview contains an incomplete command."
+          : "";
   const allocationServices = record?.serviceAllocationsMbps;
   const budgetTotal = record?.totalBandwidthMbps;
   const policyWeights = record?.policyPercentages;
@@ -91,6 +143,23 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       setApiError(reason instanceof Error ? reason.message : "Could not list API reports.");
     } finally {
       setLoadingReports(false);
+    }
+  }
+
+  async function copyTcCommands() {
+    if (!navigator.clipboard?.writeText) {
+      setTcCommandCopyStatus("Clipboard access is unavailable in this browser. Select the commands to copy them.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(tcPreviewCommands.join("\n"));
+      setTcCommandCopyStatus("Proposed commands copied.");
+    } catch (reason) {
+      setTcCommandCopyStatus(
+        reason instanceof Error
+          ? `Could not copy proposed commands: ${reason.message}`
+          : "Could not copy proposed commands. Select the code block to copy it manually.",
+      );
     }
   }
 
@@ -210,10 +279,19 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
     setApplicationState("applying");
     setApplicationError("");
     try {
-      await applyQosProfile(
+      const applyResult = await applyQosProfile(
         dryRunDecision.selected_profile,
         dryRunDecision.measurement.timestamp,
       );
+      if (
+        applyResult.status !== "applied_verified"
+        || applyResult.applied !== true
+        || applyResult.profile !== dryRunDecision.selected_profile
+        || applyResult.interface !== dryRunDecision.proposed_policy?.interface
+        || applyResult.verification !== "kernel_readback_verified"
+      ) {
+        throw new Error("The controller did not confirm the selected profile with kernel readback.");
+      }
     } catch (reason) {
       setApplicationState(
         reason instanceof ApiRequestError && reason.lifecycleState === "verification_failed"
@@ -237,7 +315,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
         });
       return;
     }
-    setApplicationState("applied_verified");
+    setApplicationState("status_unconfirmed");
     setAuthorizationChecked(false);
     try {
       const [decision, status] = await Promise.all([
@@ -246,6 +324,13 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       ]);
       setDryRunDecision(decision);
       setQosStatus(status);
+      setApplicationState(
+        status.status === "verified"
+          && status.applied_profile === dryRunDecision.selected_profile
+          && status.interface === dryRunDecision.proposed_policy?.interface
+          ? "applied_verified"
+          : "status_unconfirmed",
+      );
     } catch (reason) {
       setApplicationError(
         `Profile was applied and verified, but refreshing its displayed state failed: ${
@@ -320,8 +405,8 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           </div>
           <span className={`status-pill ${dryRunDecision?.status === "ready" ? "status-pill--surface" : "status-pill--muted"}`}>
             {dryRunDecision?.status === "ready"
-              ? `Telemetry ${dryRunDecision.telemetry_status} · ${dryRunDecision.measurement_age_seconds?.toFixed(1) ?? "?"}s old`
-              : decisionError ? "Decision API error" : `No decision · ${dryRunDecision?.telemetry_status ?? "loading"}`}
+              ? `Telemetry ${dryRunDecision.telemetry_status} · ${dryRunDecision.measurement_age_seconds?.toFixed(1) ?? "?"}s old · experiment ${dryRunDecision.telemetry_experiment_id ?? dryRunDecision.measurement?.experiment_id ?? "unknown"}`
+              : decisionError ? "Decision API error" : `No decision · ${dryRunDecision?.telemetry_collection_status ?? dryRunDecision?.telemetry_status ?? "loading"}${dryRunDecision?.telemetry_experiment_id ? ` · experiment ${dryRunDecision.telemetry_experiment_id}` : ""}`}
           </span>
           <button
             className="button button--secondary"
@@ -332,9 +417,17 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
             {refreshingDecision ? "Refreshing live telemetry…" : "Refresh live telemetry"}
           </button>
         </div>
+        {dryRunDecision?.configuration_conflict && <p className="inline-error" role="alert">{dryRunDecision.configuration_conflict}</p>}
+        {dryRunDecision?.telemetry_source === "configured_person1_jsonl"
+          && (dryRunDecision.telemetry_status === "stale"
+            || dryRunDecision.telemetry_collection_status === "collection_failed"
+            || Boolean(dryRunDecision.configuration_conflict))
+          && <p className="qos-dry-run-note">
+            To use automatic latest-run discovery, clear <code>ADAPTIVE_QOS_TELEMETRY_FILE</code> in the shell that starts the backend with <code>Remove-Item Env:ADAPTIVE_QOS_TELEMETRY_FILE -ErrorAction SilentlyContinue</code>, then restart the backend and select <strong>Refresh live telemetry</strong>. To keep an explicit override, point it to the exact scenario JSONL for the intended completed run and restart the backend. The override cannot be cleared from this page.
+          </p>}
         {decisionError ? (
           <p className="inline-error" role="alert">{decisionError}</p>
-        ) : dryRunDecision?.status === "ready" && dryRunDecision.measurement && dryRunDecision.proposed_policy ? (
+        ) : previewTelemetryFresh && dryRunDecision?.measurement && dryRunDecision.proposed_policy ? (
           <>
             <div className="qos-dry-run-summary">
               <div>
@@ -350,14 +443,20 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
               </div>
               <div>
                 <small>Application lifecycle</small>
-                <strong className={`qos-application-state qos-application-state--${applicationState}`}>
-                  {applicationState.replaceAll("_", " ")}
+                <strong className={`qos-application-state qos-application-state--${displayedApplicationState}`}>
+                  {displayedApplicationState.replaceAll("_", " ")}
                 </strong>
-                <span>{applicationState === "applied_verified"
-                  ? "Profile confirmed by WSL kernel readback."
-                  : applicationState === "verification_failed"
-                    ? "Application was not confirmed; current state may be uncertain."
-                    : "Proposal only until explicitly authorized."}</span>
+                <span>{displayedApplicationState === "applied_verified"
+                  ? "Selected profile confirmed by backend controller status readback."
+                  : displayedApplicationState === "status_unconfirmed"
+                    ? "The apply response succeeded, but current controller status does not confirm this proposed profile."
+                    : displayedApplicationState === "verification_failed"
+                      ? "Application was not confirmed; current state may be uncertain."
+                      : displayedApplicationState === "failed"
+                        ? "Application failed; current network state may be uncertain."
+                        : displayedApplicationState === "applying"
+                          ? "An authorized application request is in progress."
+                          : "Proposal only; no application has been confirmed."}</span>
               </div>
             </div>
             <div className="qos-dry-run-summary">
@@ -372,18 +471,37 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
               <span>Record source: {dryRunDecision.telemetry_source}</span>
               <span>Live experiment: {dryRunDecision.measurement.experiment_id ?? "identity unavailable"}</span>
               <span>{dryRunDecision.measurement.source} · {dryRunDecision.measurement.scenario} · {dryRunDecision.measurement.interface}</span>
-              <span>Configured bottleneck capacity: {dryRunDecision.measurement.bandwidth_mbps} Mbps</span>
-              <span>{new Date(dryRunDecision.measurement.timestamp).toLocaleString()} · {dryRunDecision.measurement.throughput_mbps.toFixed(3)} Mbps throughput · {dryRunDecision.measurement.utilization_percent.toFixed(2)}% utilization</span>
-              <span>{dryRunDecision.measurement.latency_ms.toFixed(3)} ms latency · {dryRunDecision.measurement.jitter_ms.toFixed(3)} ms jitter · {dryRunDecision.measurement.packet_loss_percent.toFixed(3)}% loss</span>
+              <span>Configured bottleneck capacity: {formatMbps(dryRunDecision.measurement.bandwidth_mbps)} Mbps</span>
+              <span>{new Date(dryRunDecision.measurement.timestamp).toLocaleString()} · {formatMbps(dryRunDecision.measurement.throughput_mbps)} Mbps throughput · {formatNumber(dryRunDecision.measurement.utilization_percent)}% utilization</span>
+              <span>{formatNumber(dryRunDecision.measurement.latency_ms, 3)} ms latency · {formatNumber(dryRunDecision.measurement.jitter_ms, 3)} ms jitter · {formatNumber(dryRunDecision.measurement.packet_loss_percent)}% loss</span>
             </div>
             <div className="qos-dry-run-policy">
-              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>Proposed QoS allocation budget: {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps · {dryRunDecision.proposed_policy.interface} · currently proposed, not an applied-state claim</span></div>
+              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>Proposed QoS allocation budget: {formatMbps(dryRunDecision.proposed_policy.total_bandwidth_mbps)} Mbps · {dryRunDecision.proposed_policy.interface} · currently proposed, not an applied-state claim</span></div>
               <div className="qos-dry-run-rates">
-                {Object.entries(dryRunDecision.proposed_policy.service_allocations_mbps).map(([service, rate]) => <span key={service}>{service}: {rate.toFixed(2)} Mbps</span>)}
-                <span>unmatched: {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(2)} Mbps</span>
+                {Object.entries(dryRunDecision.proposed_policy.service_allocations_mbps).map(([service, rate]) => <span key={service}>{service}: {formatMbps(rate)} Mbps</span>)}
+                <span>unmatched: {formatMbps(dryRunDecision.proposed_policy.unmatched_rate_mbps)} Mbps</span>
               </div>
-              <p className="field-help">The managed profile reserves {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(1)} Mbps for unmatched traffic; the remaining {Object.values(dryRunDecision.proposed_policy.service_allocations_mbps).reduce((total, rate) => total + rate, 0).toFixed(1)} Mbps is shared by the service classes. Each class ceiling equals its configured rate, so unused capacity may not be borrowed by other classes.</p>
-              <details><summary>Show proposed tc commands ({applicationState === "applied_verified" ? "controller applied and verified" : "not executed"})</summary><pre>{dryRunDecision.tc_commands.join("\n")}</pre></details>
+              <p className="field-help">The managed profile reserves {formatMbps(dryRunDecision.proposed_policy.unmatched_rate_mbps)} Mbps for unmatched traffic; the remaining {formatMbps(Object.values(dryRunDecision.proposed_policy.service_allocations_mbps).reduce((total, rate) => total + rate, 0))} Mbps is shared by the service classes. Each class ceiling equals its configured rate, so unused capacity may not be borrowed by other classes.</p>
+              <details>
+                <summary>
+                  Proposed <code>tc</code> commands — {tcPreviewLifecycleLabel}
+                </summary>
+                <p className="field-help">{tcPreviewNotice}</p>
+                {tcPreviewUnavailableReason ? (
+                  <p className="qos-dry-run-note" role="status">
+                    Command preview unavailable: {tcPreviewUnavailableReason}
+                  </p>
+                ) : (
+                  <>
+                    <p className="field-help">Profile {dryRunDecision.selected_profile} on {dryRunDecision.proposed_policy.interface}.</p>
+                    <button className="button button--secondary" type="button" onClick={() => void copyTcCommands()}>
+                      Copy commands
+                    </button>
+                    {tcCommandCopyStatus && <p className="qos-dry-run-note" role="status">{tcCommandCopyStatus}</p>}
+                    <pre><code>{tcPreviewCommands.join("\n")}</code></pre>
+                  </>
+                )}
+              </details>
             </div>
             <div className="qos-dry-run-explanation"><strong>Why this profile</strong><ul>{dryRunDecision.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
             {applicationError && <p className="inline-error" role="alert">{applicationError}</p>}
@@ -444,8 +562,18 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           </>
         ) : (
           <div className={`qos-dry-run-empty qos-dry-run-empty--${dryRunDecision?.status ?? "loading"}`} role="status">
-            <strong>{dryRunDecision?.status === "stale" ? "Telemetry is stale" : "No safe QoS decision available"}</strong>
+            <strong>{dryRunDecision?.telemetry_collection_status === "collection_failed"
+              ? "Telemetry collection failed"
+              : dryRunDecision?.telemetry_collection_status === "no_measurement"
+                ? "No measurement available"
+                : dryRunDecision?.status === "stale"
+                  || dryRunDecision?.telemetry_status === "stale"
+                  || dryRunDecision?.telemetry_collection_status === "stale"
+                  ? "Telemetry is stale" : "No safe QoS decision available"}</strong>
             <span>{dryRunDecision?.message ?? "Waiting for a validated telemetry response."}</span>
+            {!previewTelemetryFresh && dryRunDecision && (
+              <span>Command preview unavailable: {tcPreviewUnavailableReason}</span>
+            )}
             <span>Stale, unavailable, or unsupported telemetry never produces a policy proposal.</span>
           </div>
         )}
@@ -557,12 +685,12 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           {record?.flowAllocationsMbps ? (
             <>
             {completeBudget ? (
-              <div className="plan-budget" aria-label={`Planned allocation total ${budgetTotal!.toFixed(2)} of ${budgetTotal!.toFixed(2)} megabits per second`}>
-                <div className="plan-budget__heading"><strong>Planned budget · {budgetTotal!.toFixed(2)} Mbps total</strong><span>{(budgetTotal! - record!.unmatchedRateMbps!).toFixed(2)} Mbps services + {record!.unmatchedRateMbps!.toFixed(2)} Mbps unmatched</span></div>
+              <div className="plan-budget" aria-label={`Planned allocation total ${formatMbps(budgetTotal!)} of ${formatMbps(budgetTotal!)} megabits per second`}>
+                <div className="plan-budget__heading"><strong>Planned budget · {formatMbps(budgetTotal!)} Mbps total</strong><span>{formatMbps(budgetTotal! - record!.unmatchedRateMbps!)} Mbps services + {formatMbps(record!.unmatchedRateMbps!)} Mbps unmatched</span></div>
                 <div className="plan-budget__bar" role="img" aria-label="Stacked proposed allocation by traffic class">
                   {(["gaming", "video", "web", "bulk", "unmatched"] as const).map((key) => {
                     const amount = key === "unmatched" ? record!.unmatchedRateMbps! : allocationServices![key];
-                    const title = `${key}: ${amount.toFixed(2)} Mbps`;
+                    const title = `${key}: ${formatMbps(amount)} Mbps`;
                     return <span key={key} title={title} aria-label={title} style={{ width: `${amount / budgetTotal! * 100}%` }} />;
                   })}
                 </div>
@@ -578,9 +706,9 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
                 <tbody>
                   {Object.entries(record.flowAllocationsMbps).map(([port, allocation]) => {
                     const serviceByPort: Record<string, string> = { "5201": "Gaming", "5202": "Video", "5203": "Web", "5204": "Bulk" };
-                    return <tr key={port}><td>UDP {port}</td><td>{serviceByPort[port] ?? "Unmapped"}</td><td>{allocation.toFixed(2)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>;
+                    return <tr key={port}><td>UDP {port}</td><td>{serviceByPort[port] ?? "Unmapped"}</td><td>{formatMbps(allocation)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>;
                   })}
-                  {record.unmatchedRateMbps !== null && <tr><td>Default class 1:15</td><td>Unmatched</td><td>{record.unmatchedRateMbps.toFixed(2)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>}
+                  {record.unmatchedRateMbps !== null && <tr><td>Default class 1:15</td><td>Unmatched</td><td>{formatMbps(record.unmatchedRateMbps)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>}
                 </tbody>
               </table>
             </div>
@@ -595,8 +723,8 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       )}
 
       <section className="section-heading dashboard-section-heading">
-        <div><h2>Available managed profiles</h2><p>Each profile splits a {(PROFILE_TOTAL_Mbps - PROFILE_ALLOCATIONS.LOW.unmatched).toFixed(1)} Mbps service pool using its class weights and reserves {PROFILE_ALLOCATIONS.LOW.unmatched.toFixed(1)} Mbps for unmatched traffic. Class ceilings equal their configured rates, so unused capacity may not be borrowed; these planned rates are not evidence of applied bandwidth.</p></div>
-        <span className="status-pill status-pill--surface">{profileBudgetMbps.toFixed(0)} Mbps total incl. unmatched</span>
+        <div><h2>Available managed profiles</h2><p>Each profile splits a {formatMbps(PROFILE_TOTAL_Mbps - PROFILE_ALLOCATIONS.LOW.unmatched)} Mbps service pool using its class weights and reserves {formatMbps(PROFILE_ALLOCATIONS.LOW.unmatched)} Mbps for unmatched traffic. Class ceilings equal their configured rates, so unused capacity may not be borrowed; these planned rates are not evidence of applied bandwidth.</p></div>
+        <span className="status-pill status-pill--surface">{formatMbps(profileBudgetMbps)} Mbps total incl. unmatched</span>
       </section>
       <div className="profile-grid">
         {PROFILE_NAMES.map((profile) => (
@@ -604,9 +732,9 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
             <div className="profile-card__header"><span>{profile}</span><small>Service rates · Mbps</small></div>
             <div className="profile-allocation">
               {(["gaming", "video", "web", "bulk"] as const).map((service) => (
-                <div key={service}><span>{service}</span><strong>{PROFILE_ALLOCATIONS[profile][service].toFixed(2)}</strong></div>
+                <div key={service}><span>{service}</span><strong>{formatMbps(PROFILE_ALLOCATIONS[profile][service])}</strong></div>
               ))}
-              <div className="profile-allocation__unmatched"><span>Unmatched · 1:15</span><strong>{PROFILE_ALLOCATIONS[profile].unmatched.toFixed(2)}</strong></div>
+              <div className="profile-allocation__unmatched"><span>Unmatched · 1:15</span><strong>{formatMbps(PROFILE_ALLOCATIONS[profile].unmatched)}</strong></div>
             </div>
             <p>{record?.prediction === profile ? "Selected in imported plan" : "Planner profile"}</p>
           </article>

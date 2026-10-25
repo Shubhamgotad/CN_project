@@ -90,6 +90,11 @@ afterEach(async () => {
 });
 
 describe("Traffic Lab telemetry and execution boundary", () => {
+  it("omits the redundant guarded execution banner", async () => {
+    await renderTrafficLab();
+    expect(container.textContent).not.toContain("Guarded traffic execution");
+    expect(container.querySelector(".safety-callout")).toBeNull();
+  });
   it("renders the measurements and source from an available API record", async () => {
     getLatestTelemetryMock.mockResolvedValue(telemetry("available"));
     await renderTrafficLab();
@@ -102,12 +107,12 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(container.textContent).toContain("2026-10-20T10:00:00+00:00");
     expect(container.textContent).toContain("2.5 seconds");
     expect(container.textContent).toContain("Configured s1–s2 bottleneck: 10 Mbps");
-    expect(container.textContent).toContain("Selected offered load: 4 Mbps/flow × 4 configured flows = 16.0 Mbps aggregate");
-    expect(container.textContent).toContain("Measured utilization 29.97 %");
-    expect(container.textContent).toContain("Capacity denominator 10 Mbps");
-    expect(container.textContent).toContain("2.997 Mbps");
-    expect(container.textContent).toContain("20.6309 ms");
-    expect(container.textContent).toContain("0.0334 ms");
+    expect(container.textContent).toContain("Selected offered load: 4 Mbps/flow × 4 configured flows = 16 Mbps aggregate");
+    expect(container.textContent).toContain("29.97 %");
+    expect(container.textContent).toContain("10 Mbps");
+    expect(container.textContent).toContain("3.00 Mbps");
+    expect(container.textContent).toContain("20.631 ms");
+    expect(container.textContent).toContain("0.033 ms");
     expect(container.textContent).toContain("0 %");
     expect(container.textContent).toContain("4 packets");
     expect(container.textContent).toContain("configured_person1_jsonl");
@@ -118,7 +123,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     await renderTrafficLab();
 
     expect(container.textContent).toContain("Stale");
-    expect(container.textContent).toContain("stale recorded measurements, not current traffic values");
+    expect(container.textContent).not.toContain("stale recorded measurements, not current traffic values");
     expect(container.textContent).toContain("420.0 seconds");
   });
 
@@ -128,7 +133,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
 
     expect(container.textContent).toContain("Unavailable");
     expect(container.textContent).toContain("No telemetry file is configured.");
-    expect(container.textContent).not.toContain("2.997 Mbps");
+    expect(container.textContent).not.toContain("3.00 Mbps");
   });
 
   it("keeps traffic controls independent from the telemetry source and labels Mininet emulation", async () => {
@@ -136,8 +141,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     await renderTrafficLab();
 
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Start traffic"]')?.disabled).toBe(false);
-    expect(container.textContent).toContain("This is emulated traffic, not production or physical-network traffic.");
-    expect(container.textContent).toContain("configured inventory, not proof that Mininet is currently connected");
+    expect(container.textContent).toContain("configured Mininet emulation");
     expect(container.textContent).not.toContain("verified Mininet topology");
   });
 
@@ -153,7 +157,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
 
     expect(container.textContent).toContain("API error");
     expect(container.textContent).toContain("Telemetry request failed: connection lost");
-    expect(container.textContent).not.toContain("2.997 Mbps");
+    expect(container.textContent).not.toContain("3.00 Mbps");
   });
 
   it("refreshes periodically and clears its timer on unmount", async () => {
@@ -187,8 +191,8 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(startButton?.disabled).toBe(false);
     expect(stopButton?.disabled).toBe(true);
     expect(notice?.textContent).toContain("Preview and execution");
-    expect(notice?.textContent).toContain("Preview stays in your browser");
-    expect(notice?.textContent).toContain("Start executes the selected source and planned flow(s)");
+    expect(notice?.textContent).toContain("Preview is local");
+    expect(notice?.textContent).toContain("Start sends the selected workload only after confirmation");
     expect(container.textContent).toContain("Planned");
 
     await act(async () => previewButton?.click());
@@ -212,7 +216,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Destination ports: 5201, 5202, 5203, 5204"));
     expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20, "all");
     expect(container.textContent).toContain("Starting");
-    expect(container.textContent).toContain("4 Mbps offered per flow · 16.0 Mbps aggregate offered");
+    expect(container.textContent).toContain("4 Mbps offered per flow · 16 Mbps aggregate offered");
     expect(container.textContent).toContain("Traffic execution");
   });
 
@@ -460,12 +464,45 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     }
   });
 
-  it("does not present telemetry as execution-linked results after completion", async () => {
-    getActiveMock.mockResolvedValue(execution("completed", { process_alive: false, can_stop: false }));
+  it("refreshes and displays telemetry linked to the completed execution", async () => {
+    const completed = execution("completed", {
+      process_alive: false,
+      can_stop: false,
+      measurement_status: "available",
+      measurement_record_count: 4,
+      measurement_hosts: ["h1", "h2", "h3", "h4"],
+    });
+    getActiveMock.mockResolvedValue(completed);
+    const linked = telemetry("available");
+    linked.record = {
+      ...linked.record!,
+      experiment_id: completed.experiment_id,
+      scenario: "congestion",
+      source: "h1",
+      active_flows: 4,
+    };
+    linked.records = ["h1", "h2", "h3", "h4"].map((source) => ({
+      ...linked.record!,
+      source,
+    }));
+    getLatestTelemetryMock.mockResolvedValue(linked);
     await renderTrafficLab();
 
-    expect(container.textContent).toContain("Process completed.");
-    expect(container.textContent).toContain("does not link measured telemetry to the execution");
+    expect(getLatestTelemetryMock).toHaveBeenCalledWith({ experiment_id: completed.experiment_id });
+    expect(container.textContent).toContain(`Experiment ID: ${completed.experiment_id}`);
+    expect(container.textContent).toContain("Measurement collection: available");
+    expect(container.querySelector('[aria-label="Execution-linked telemetry"]')).not.toBeNull();
+    expect(container.textContent).toContain("h1");
+    expect(container.textContent).toContain("h4");
+    expect(container.textContent).not.toContain("does not link measured telemetry");
+  });
+
+  it("does not display the previous global measurement while traffic is running", async () => {
+    getActiveMock.mockResolvedValue(execution("running"));
+    await renderTrafficLab();
+
+    expect(container.textContent).toContain("Waiting for measurements linked to experiment");
+    expect(container.querySelector('[aria-label="Execution-linked telemetry"]')).toBeNull();
   });
 
   it("locks controls while start is pending, then exposes API failure and retry", async () => {

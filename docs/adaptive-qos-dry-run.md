@@ -202,7 +202,19 @@ checks that `s1-eth5` readback is unchanged, and attempts identity-checked
 cleanup. Do not run it during implementation or on a production WSL instance
 where root-level interference is not in the accepted threat model.
 
-For a future explicitly approved controller probe:
+The existing `probe_managed_htb_netns.py` is the isolated controller-only
+probe. Its path is only
+`qosna...:qosp...` to `qosnb...:qosq...`; it does not create OVS bridges or
+connect to Mininet. `network/topology/basic_topology.py` still has the direct
+`s1`-`s2` link, so it is not a shadow enforcement topology and must not be
+modified or used as one for this validation. The automated tests exercise
+target identity acquisition and loss using fake command observations; they do
+not invoke Linux networking commands or prove exclusion of a second privileged
+process.
+
+#### Disposable controller probe
+
+For an explicitly approved controller probe:
 
 1. Use a disposable lab with Mininet already present for the script's
    read-only `s1-eth5` before/after snapshot. Do not start/restart Mininet or
@@ -229,6 +241,209 @@ For a future explicitly approved controller probe:
    establish that a second privileged process cannot enter the target, does
    not demonstrate a persistent service lifecycle, and does not enable the
    UI or production application path.
+
+#### OVS-connected shadow-path probe
+
+`telemetry/probe_ovs_shadow_path.py` builds a separate three-namespace path:
+client namespace -> left OVS bridge -> routed owner namespace -> right OVS
+bridge -> server namespace. The controller target is only the generated
+`qosp<token>` egress inside the generated owner namespace. Unique generated
+names, namespace/interface/peer identity checks, exact OVS ports, secure
+OpenFlow rules, explicit operator approval, and a dedicated OVS database and
+management-socket directory are required. The probe refuses any OVS database
+that already has bridges. It never addresses `s1-eth5` or `s2-eth1`.
+
+The probe is still **not an ownership service or ownership proof**. A same-VM
+root process can generally inspect or mutate a network namespace. The probe's
+result deliberately reports `ownership_proof.status: not_proven`; its successful
+status means only that the packet path/controller/cleanup checks passed.
+Provision the VM and its private OVS database/vswitchd before running. The OVS
+management sockets for each bridge must be in a runtime directory dedicated to
+that OVS instance; the script uses those exact sockets for `ovs-ofctl`, rather
+than falling back to the default system bridge-management sockets.
+
+Prerequisites:
+
+- A disposable Linux VM or isolated lab with root access, `iproute2`, OVS
+  (`ovs-vsctl`, `ovs-ofctl`, a matching `ovsdb-server` and `ovs-vswitchd`),
+  Python 3, `ping` not required, and the project's Python dependencies.
+- Explicit operator confirmation that this VM and its OVS instance may have
+  temporary namespaces, veth devices, bridges, routes, OpenFlow rules, and
+  `tc` state created. Do not use the active Mininet/production VM.
+- A private OVS database socket and its paired vswitchd bridge-management
+  socket directory. The database must list zero bridges before the probe.
+  Management sockets must be created by the vswitchd connected to that same
+  database. If the installation cannot provide a dedicated pair, stop.
+- Operator confirmation that this OVS database and vswitchd are separate from
+  every active Mininet/system OVS instance. The approval's
+  `dedicated_ovs_database` field is an operator attestation, not a fact the
+  script can independently prove. The script checks the approved database
+  socket, its `Open_vSwitch` UUID, an empty bridge set, and a management
+  directory with no pre-existing `*.mgmt` sockets. A matching UUID does not
+  prove that the daemon has no other clients or that the VM is disposable.
+- An approval JSON file outside the repository, mode `0600` or stricter,
+  containing the operator attestation, OVS database UUID, and exact socket
+  paths. Obtain the UUID read-only from the already initialized dedicated OVS
+  database:
+
+```sh
+mkdir -m 700 -p /tmp/cn-adaptive-qos-shadow
+OVS_DB=/run/cn-adaptive-qos-shadow/db.sock
+OVS_RUNTIME=/run/cn-adaptive-qos-shadow
+OVS_UUID="$(ovs-vsctl --db="unix:$OVS_DB" --timeout=3 get Open_vSwitch . _uuid)"
+printf '%s\n' \
+  "{\"version\":1,\"target_kind\":\"disposable_linux_vm\",\"target_id\":\"approved-shadow-vm-01\",\"allow_network_mutations\":true,\"dedicated_ovs_database\":true,\"ovs_instance_uuid\":\"$OVS_UUID\",\"ovs_db_socket\":\"$OVS_DB\",\"ovs_ofctl_dir\":\"$OVS_RUNTIME\"}" \
+  > /tmp/cn-adaptive-qos-shadow/approval.json
+chmod 600 /tmp/cn-adaptive-qos-shadow/approval.json
+```
+
+`ovs-vsctl get Open_vSwitch . _uuid` must succeed and return the identity
+captured in the approval file. The VM owner must independently confirm that
+the database socket and vswitchd management sockets belong only to this
+disposable target. First check the sockets and ensure the database is empty.
+These are read-only checks:
+
+```sh
+test -S "$OVS_DB"
+test -d "$OVS_RUNTIME"
+ovs-vsctl --db="unix:$OVS_DB" --timeout=3 show
+ovs-vsctl --db="unix:$OVS_DB" --timeout=3 list-br
+ovs-vsctl --db="unix:$OVS_DB" --timeout=3 get Open_vSwitch . _uuid
+```
+
+`list-br` must return no bridge names. Do not use the system/default OVS DB
+socket. The runtime directory must be dedicated to the matching vswitchd and
+contain no unrelated bridge-management sockets. Keep `$OVS_DB`, `$OVS_RUNTIME`,
+and `$OVS_UUID` in the shell for the following commands.
+
+#### Read-only preflight
+
+From the repository root in the disposable Linux VM, define an unused,
+out-of-repository evidence path and explicitly opt in. Preflight requires root
+and the same approval file, socket paths, UUID, environment variable, and CLI
+approval flag as the mutation run, but it creates no evidence directory,
+namespace, interface, bridge, flow, route, or qdisc:
+
+```sh
+export ADAPTIVE_QOS_SHADOW_APPROVAL=I_APPROVE_DISPOSABLE_VM_NETWORK_CHANGES
+EVIDENCE="/tmp/cn-adaptive-qos-shadow/evidence-$(date +%Y%m%d-%H%M%S)"
+sudo -E python3 telemetry/probe_ovs_shadow_path.py "$EVIDENCE" \
+  --approval-file /tmp/cn-adaptive-qos-shadow/approval.json \
+  --ovs-db "$OVS_DB" \
+  --ovs-ofctl-dir "$OVS_RUNTIME" \
+  --i-approve-shadow-only-network-mutations \
+  --preflight-only
+```
+
+Require exit code 0 and inspect the JSON target manifest. It names generated
+namespaces, bridges, and interfaces, but kernel namespace inodes and interface
+indices are deliberately unavailable until resources are created. Any
+preflight error is a stop condition; do not proceed by relaxing a check.
+
+#### Explicitly approved packet-path/controller probe
+
+The full probe is privileged and network-mutating. Only after reviewing the
+preflight output and explicitly approving the disposable target, run the same
+command without `--preflight-only`:
+
+```sh
+sudo -E python3 telemetry/probe_ovs_shadow_path.py "$EVIDENCE" \
+  --approval-file /tmp/cn-adaptive-qos-shadow/approval.json \
+  --ovs-db "$OVS_DB" \
+  --ovs-ofctl-dir "$OVS_RUNTIME" \
+  --i-approve-shadow-only-network-mutations
+```
+
+The script refuses non-Linux/non-root execution, missing opt-in, invalid or
+weakly permissioned approval files, an output path in the repository or an
+existing output path, unapproved/mismatched OVS socket or database UUID,
+missing dedicated-database attestation, an unavailable management directory,
+pre-existing management sockets, an OVS database with any bridge, generated
+name collisions, unexpected OVS ports/flows, interface identity changes, or
+a production interface reference. It creates no production-like topology.
+Network changes are limited to generated disposable namespaces, veths, two
+OVS bridges in the approved empty database, static forwarding flows, and
+managed HTB state on the generated owner egress.
+
+The evidence bundle includes `commands.jsonl`, receiver output, target
+namespace/interface identities, OVS bridge/port/interface data, flow dumps,
+port counters, per-profile kernel readback, and rollback/cleanup status. The
+probe sends forty UDP datagrams on each of ports 5201-5204 for each profile.
+It requires exact bridge port sets and OpenFlow rules, positive packet-counter
+deltas on every expected path edge, exact receipt at the server, matching
+LOW/MEDIUM/HIGH allocator readback, and restoration to the disposable baseline.
+The injected installation failure must also restore that baseline. Its final
+exit status explicitly says ownership remains unproven.
+
+#### Operator evidence checklist
+
+Review the generated `result.json` and `commands.jsonl` before declaring the
+path/controller test successful:
+
+1. Confirm the OVS graph has exactly two generated bridges and the expected
+   two ports per bridge; review `ovs_before_traffic` and each profile's
+   `ovs_before`/`ovs_after` interface and flow dumps. Reject any extra port,
+   flow, changed peer, production interface, or ambiguous attachment.
+2. Confirm the profile section records exactly ten received datagrams on each
+   UDP port 5201-5204, and that each expected OVS RX/TX port counter has a
+   positive delta. The script captures counters both before and after each
+   packet roundtrip and fails if a required delta is absent.
+3. Confirm LOW, MEDIUM, and HIGH each have kernel readback matching the
+   authoritative allocator profile; do not infer a profile from command logs
+   alone.
+4. Confirm the injected failed installation reports rollback restored and
+   verified the disposable baseline, then confirm `cleanup.verified` is true.
+   Verify that all logged `tc` commands are scoped to the generated owner
+   namespace and `qosp...` interface.
+5. Preserve the complete output directory as evidence. If any step fails,
+   identity changes, or cleanup is uncertain, stop. Do not remove resources
+   by name or rerun cleanup blindly; preserve the evidence and request
+   operator-reviewed identity-scoped recovery.
+
+If the probe fails or cleanup is not verified, do not delete namespaces,
+interfaces, or bridges by name. Preserve `result.json` and `commands.jsonl`,
+inspect the recorded identities and live OVS graph read-only, and require
+operator-reviewed identity-scoped cleanup. A successful controller/path probe
+is not permission to enable live QoS.
+
+#### Separate privileged-writer ownership test
+
+The OVS path probe cannot establish exclusive ownership. The project has no
+persistent owner service or authenticated request channel, so no automated
+external privileged-writer test can yet be run against an owner boundary. The
+current safe behavior is to leave production ownership false.
+
+Once a separately administered owner service exists, the privileged-writer
+test must run from a second privileged client in a different administrative
+domain, not from the owner process and not through its cooperative lock:
+
+1. Have the owner service return a short-lived, identity-pinned test target
+   descriptor over its authenticated narrow channel. Do not expose namespace
+   file descriptors or invoke arbitrary commands through the service.
+2. From the independent privileged client, attempt namespace entry and a
+   read-only target inspection using the deployment's documented service
+   interface. Record the exact request and expect an explicit authorization
+   denial. If inspection succeeds, ownership is disproven; do not proceed to
+   mutation testing.
+3. Only on a freshly provisioned disposable target with an approved test
+   window, ask the independent client to request one documented, reversible
+   sentinel mutation through the privileged boundary. Require the kernel
+   readback to remain unchanged and an explicit denial. Do not use raw `tc`
+   against a production device. Capture client identity, service decision,
+   audit record, and before/after identity/readback.
+4. Repeat after owner restart, namespace/interface replacement, and ownership
+   loss. Every case must reject; otherwise keep ownership unproven.
+
+For the current shared-root WSL deployment this test is expected to demonstrate
+that equivalent privileged peers can access the namespace, not to produce a
+pass. The shadow probe's operator approval file, a namespace inode, interface
+identity, OVS graph, and Python lock are not substitutes for the independent
+administrative boundary. Do not use an owner-supplied result as proof without
+independent review.
+
+Do not set `LIVE_TC_OWNERSHIP_GUARANTEED`, change
+`ADAPTIVE_QOS_ENABLE_APPLICATION`, or connect this shadow path to production as
+part of either probe.
 
 Before a persistent service or isolated Apply control can be implemented, the
 deployment must provide a separately enforceable administrative boundary

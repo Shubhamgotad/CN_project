@@ -722,6 +722,10 @@ def save_telemetry(
         "active_flows": parsed_record["active_flows"],
         "queue_size": queue_size,
         "queue_drops": queue_drops,
+        "interface": BOTTLENECK_INTERFACE,
+        "measurement_source": "iperf3_receiver_json_stream+tc_qdisc",
+        "measurement_direction": "receiver",
+        "provenance": "guarded_traffic_lab_execution",
     }
 
     filename = _isolated_output_file(output_directory, f"{scenario}.jsonl")

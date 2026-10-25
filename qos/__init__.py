@@ -12,6 +12,7 @@ from .policy import (
 from .tc_controller import (
     IsolatedHTBTarget,
     ManagedHTBConfig,
+    ShadowHTBTarget,
     apply_managed_htb_policy,
     apply_tc_commands,
     apply_tc_policy,
@@ -27,6 +28,7 @@ __all__ = [
     "MANAGED_HTB_PROFILES",
     "IsolatedHTBTarget",
     "ManagedHTBConfig",
+    "ShadowHTBTarget",
     "POLICY_PERCENTAGES",
     "TRAFFIC_CLASSES",
     "allocate_bandwidth",

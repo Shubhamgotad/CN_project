@@ -173,6 +173,57 @@ class IsolatedHTBTarget:
 
 
 @dataclass(frozen=True)
+class ShadowHTBTarget:
+    """Identity-pinned HTB egress in the disposable OVS shadow router."""
+
+    namespace: str
+    interface: str
+    namespace_inode: int
+    ifindex: int
+    ingress_interface: str
+    ingress_ifindex: int
+    ingress_peer_interface: str
+    ingress_peer_ifindex: int
+    egress_peer_interface: str
+    egress_peer_ifindex: int
+
+    def __post_init__(self) -> None:
+        match = (
+            re.fullmatch(r"qoso([0-9a-f]{8})", self.namespace)
+            if isinstance(self.namespace, str)
+            else None
+        )
+        if match is None:
+            raise ValueError("shadow namespace must use a generated qoso identity")
+        token = match.group(1)
+        expected_names = {
+            "interface": f"qosp{token}",
+            "ingress_interface": f"qosi{token}",
+            "ingress_peer_interface": f"qosl{token}",
+            "egress_peer_interface": f"qosr{token}",
+        }
+        if any(
+            getattr(self, field) != expected
+            for field, expected in expected_names.items()
+        ):
+            raise ValueError("shadow target interfaces must share the generated identity")
+        identities = (
+            self.namespace_inode,
+            self.ifindex,
+            self.ingress_ifindex,
+            self.ingress_peer_ifindex,
+            self.egress_peer_ifindex,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in identities
+        ):
+            raise ValueError("shadow namespace and interface identities must be positive integers")
+        if len(set(identities[1:])) != 4:
+            raise ValueError("shadow veth endpoints must have distinct interface indices")
+
+
+@dataclass(frozen=True)
 class ManagedHTBConfig:
     """Validated five-leaf managed hierarchy configuration."""
 
@@ -183,15 +234,15 @@ class ManagedHTBConfig:
     unmatched_rate_mbps: float = 1.0
     unmatched_ceil_mbps: float = 1.0
     default_class_id: str = UNMATCHED_CLASS_ID
-    isolated_target: IsolatedHTBTarget | None = None
+    isolated_target: IsolatedHTBTarget | ShadowHTBTarget | None = None
 
     def __post_init__(self) -> None:
         validate_interface(self.interface)
         if self.isolated_target is None and self.interface != ROOT_INTERFACE:
             raise ValueError(f"managed HTB supports only {ROOT_INTERFACE}")
         if self.isolated_target is not None:
-            if not isinstance(self.isolated_target, IsolatedHTBTarget):
-                raise ValueError("isolated_target must be an identity-pinned IsolatedHTBTarget")
+            if not isinstance(self.isolated_target, (IsolatedHTBTarget, ShadowHTBTarget)):
+                raise ValueError("isolated_target must be an identity-pinned isolated target")
             if self.interface != self.isolated_target.interface or self.interface == ROOT_INTERFACE:
                 raise ValueError("managed HTB interface does not match its isolated target")
         total = validate_total_bandwidth(self.total_bandwidth_mbps)
@@ -454,17 +505,70 @@ def _verify_isolated_htb_target(
             )
 
 
+def _verify_shadow_htb_target(
+    target: ShadowHTBTarget,
+    runner: Callable[..., Any],
+) -> None:
+    """Verify the owner namespace and both OVS-facing veth identities."""
+    inode_text = _run(runner, [
+        "ip", "netns", "exec", target.namespace, "stat", "-Lc", "%i",
+        "/proc/self/ns/net",
+    ]).strip()
+    if inode_text != str(target.namespace_inode):
+        raise TCPreconditionError("shadow target namespace identity changed")
+    links_text = _run(runner, [
+        "ip", "netns", "exec", target.namespace, "ip", "-j", "-details", "link", "show",
+    ])
+    try:
+        links = json.loads(links_text)
+    except (TypeError, ValueError) as exc:
+        raise TCPreconditionError("cannot verify shadow target interfaces") from exc
+    if (
+        not isinstance(links, list)
+        or any(not isinstance(item, dict) for item in links)
+    ):
+        raise TCPreconditionError("shadow target interface data is malformed")
+    by_name = {item.get("ifname"): item for item in links}
+    if set(by_name) != {"lo", target.interface, target.ingress_interface}:
+        raise TCPreconditionError("shadow target namespace contains unexpected interfaces")
+    expected = (
+        (target.interface, target.ifindex, target.egress_peer_ifindex),
+        (target.ingress_interface, target.ingress_ifindex, target.ingress_peer_ifindex),
+    )
+    for name, ifindex, peer_ifindex in expected:
+        endpoint = by_name.get(name)
+        if (
+            not isinstance(endpoint, dict)
+            or endpoint.get("ifindex") != ifindex
+            or endpoint.get("link_index") != peer_ifindex
+            or endpoint.get("master")
+            or "UP" not in endpoint.get("flags", [])
+            or not isinstance(endpoint.get("linkinfo"), dict)
+            or endpoint["linkinfo"].get("info_kind") != "veth"
+        ):
+            raise TCPreconditionError(
+                "shadow target is not the expected identity-pinned veth path"
+            )
+
+
 class _IsolatedHTBRunner:
     """Route all controller tc commands into an identity-verified namespace."""
 
-    def __init__(self, target: IsolatedHTBTarget, runner: Callable[..., Any]):
+    def __init__(
+        self,
+        target: IsolatedHTBTarget | ShadowHTBTarget,
+        runner: Callable[..., Any],
+    ):
         self.target = target
         self.runner = runner
 
     def __call__(self, argv, *, capture_output, text, check):
         if not argv or argv[0] != "tc":
             raise TCPreconditionError("isolated controller runner accepts only tc commands")
-        _verify_isolated_htb_target(self.target, self.runner)
+        if isinstance(self.target, ShadowHTBTarget):
+            _verify_shadow_htb_target(self.target, self.runner)
+        else:
+            _verify_isolated_htb_target(self.target, self.runner)
         return self.runner(
             ["ip", "netns", "exec", self.target.namespace, *argv],
             capture_output=capture_output,
@@ -1045,11 +1149,11 @@ def restore_managed_htb_hierarchy(
 
 
 def restore_isolated_managed_htb_hierarchy(
-    target: IsolatedHTBTarget,
+    target: IsolatedHTBTarget | ShadowHTBTarget,
     runner: Callable[..., Any] | None = None,
 ) -> bool:
-    """Restore only a verified probe namespace's complete managed hierarchy."""
-    if not isinstance(target, IsolatedHTBTarget):
+    """Restore only an identity-pinned disposable namespace hierarchy."""
+    if not isinstance(target, (IsolatedHTBTarget, ShadowHTBTarget)):
         raise TCPreconditionError("isolated restore requires an identity-pinned target")
     raw_runner = runner or subprocess.run
     execute = _IsolatedHTBRunner(target, raw_runner)

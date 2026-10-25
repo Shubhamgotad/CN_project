@@ -19,6 +19,7 @@ from integration.evidence_analysis import (
     _is_finite_number,
     analyze_manifest,
 )
+from integration.safe_outputs import validate_new_output_paths, write_exclusive_text
 
 
 CAMPAIGN_SCHEMA_VERSION = 1
@@ -1022,9 +1023,28 @@ def main(argv: list[str] | None = None) -> int:
         description="Validate an explicitly manifested Adaptive QoS campaign offline."
     )
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        help="Optional new JSON report path outside the repository and campaign evidence directory.",
+    )
     args = parser.parse_args(argv)
     report = analyze_campaign(args.manifest)
-    print(json.dumps(report, indent=2, allow_nan=False))
+    serialized = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    if args.json_output is not None:
+        if args.json_output.suffix.lower() != ".json":
+            parser.error("--json-output must use the .json extension")
+        try:
+            (output_path,) = validate_new_output_paths(
+                (args.json_output,),
+                protected_roots=(Path(args.manifest).expanduser().resolve().parent,),
+            )
+            write_exclusive_text(output_path, serialized)
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot persist campaign report: {exc}")
+        print(f"Campaign report written: {output_path.name}")
+    else:
+        print(serialized, end="")
     return 0 if report["status"] == "complete" else 1
 
 

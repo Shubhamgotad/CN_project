@@ -95,6 +95,30 @@ describe("dashboard API client", () => {
     );
   });
 
+  it("requests latest telemetry for a specific validated execution identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      status: "available",
+      source: "completed_experiment_person1_jsonl",
+      collection_status: "fresh",
+      measurement_age_seconds: 2,
+      stale_after_seconds: 300,
+      message: "Execution-linked measurements.",
+      record: { timestamp: "2026-10-25T18:00:00+05:30", experiment_id: "a".repeat(32), source: "h1", scenario: "normal" },
+      records: [],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getLatestTelemetry({ experiment_id: "a".repeat(32) })).resolves.toMatchObject({
+      collection_status: "fresh",
+      record: { experiment_id: "a".repeat(32) },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8000/api/telemetry/latest?experiment_id=${"a".repeat(32)}`,
+      { headers: { Accept: "application/json" } },
+    );
+    expect(() => getLatestTelemetry({ experiment_id: "../invalid" })).toThrow("Invalid experiment identifier");
+  });
+
   it("uses only fixed execution endpoints and validates IDs", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ status: "starting" })))
@@ -216,7 +240,7 @@ describe("dashboard API client", () => {
         flows: [{
           flow_id: "h1",
           status: "complete",
-          metrics: { throughput_mbps: 3.1, latency_ms: null, jitter_ms: null, packet_loss_percent: null },
+          metrics: { throughput_mbps: 3.1, latency_ms: null, jitter_ms: null, packet_loss_percent: null, queue_size: 4, queue_drops: 1 },
         }],
       }],
     });
@@ -230,8 +254,8 @@ describe("dashboard API client", () => {
     expect(normalized.clockMappingStatus).toBe("not_independently_validated");
     expect(normalized.trials[0].flows[0].throughputMbps).toBe(3.1);
     expect(normalized.trials[0].flows[0].latencyMs).toBeNull();
-    expect(normalized.trials[0].flows[0].queueSize).toBeNull();
-    expect(normalized.trials[0].flows[0].queueDrops).toBeNull();
+    expect(normalized.trials[0].flows[0].queueSize).toBe(4);
+    expect(normalized.trials[0].flows[0].queueDrops).toBe(1);
   });
 
   it("requires report-level and every trial's explicit eligibility before enabling API comparisons", () => {
@@ -384,6 +408,8 @@ describe("offline artifact client", () => {
 
   it("keeps a structurally complete but unaligned campaign blocked", () => {
     const report = parseEvidenceReport(JSON.stringify({
+      schema_version: 1,
+      campaign_id: "campaign-1",
       status: "complete",
       live_operations_supported: false,
       comparison_ready: false,
@@ -401,7 +427,9 @@ describe("offline artifact client", () => {
 
   it("preserves offline campaign metadata, reported issues and queue metrics", () => {
     const report = parseEvidenceReport(JSON.stringify({
+      schema_version: 1,
       offline_only: true,
+      live_operations_supported: false,
       status: "complete",
       campaign_status: "complete",
       complete_cycle_count: 2,
@@ -447,11 +475,34 @@ describe("offline artifact client", () => {
 
   it("does not treat a completion flag as enough without explicit eligible alignment", () => {
     const report = parseEvidenceReport(JSON.stringify({
+      schema_version: 1,
+      campaign_status: "complete",
       status: "complete",
       live_operations_supported: false,
       comparison_ready: true,
       trials: [{ trial_id: "t1", status: "complete", alignment_status: "eligible" }],
     }));
     expect(report.comparisonReady).toBe(false);
+  });
+
+  it("accepts the evidence analyzer schema but rejects prediction and malformed evidence reports", () => {
+    const accepted = parseEvidenceReport(JSON.stringify({
+      schema_version: 1,
+      offline_only: true,
+      live_operations_supported: false,
+      status: "incomplete",
+      trials: [{
+        trial_id: "trial-1", condition: "baseline", profile: "BASELINE", repetition_id: "cycle-1", status: "failed",
+        flows: { h1: { status: "failed", receiver: { metrics: {} } } },
+      }],
+    }));
+    expect(accepted.kind).toBe("evidence-analysis");
+    expect(accepted.trials[0].trialId).toBe("trial-1");
+    expect(() => parseEvidenceReport(JSON.stringify({ schema_version: 1, mode: "adaptive", planning_only: true, results: [] })))
+      .toThrow("Unsupported report type");
+    expect(() => parseEvidenceReport(JSON.stringify({ schema_version: 2, live_operations_supported: false, campaign_id: "x", trials: [] })))
+      .toThrow("schema_version");
+    expect(() => parseEvidenceReport(JSON.stringify({ schema_version: 1, live_operations_supported: false, campaign_id: "x", trials: [{ status: "complete", flows: [] }] })))
+      .toThrow("invalid flows object");
   });
 });
