@@ -72,6 +72,7 @@ export interface ApiTelemetry {
   message: string;
   record: {
     timestamp: string;
+    experiment_id?: string | null;
     source: string;
     scenario: string;
     throughput_mbps: number;
@@ -131,6 +132,11 @@ export interface TelemetryHistoryFilters {
   host?: "h1" | "h2" | "h3" | "h4";
   scenario?: "normal" | "moderate" | "congestion" | "burst";
   limit?: number;
+}
+
+export interface TelemetryLatestFilters {
+  host?: "h1" | "h2" | "h3" | "h4";
+  scenario?: "normal" | "moderate" | "congestion" | "burst";
 }
 
 export interface ApiQosDryRunDecision {
@@ -361,8 +367,12 @@ export function getTopology(): Promise<ApiTopology> {
   return requestJson<ApiTopology>("/api/topology");
 }
 
-export function getLatestTelemetry(): Promise<ApiTelemetry> {
-  return requestJson<ApiTelemetry>("/api/telemetry/latest");
+export function getLatestTelemetry(filters: TelemetryLatestFilters = {}): Promise<ApiTelemetry> {
+  const params = new URLSearchParams();
+  if (filters.host) params.set("host", filters.host);
+  if (filters.scenario) params.set("scenario", filters.scenario);
+  const query = params.size ? `?${params.toString()}` : "";
+  return requestJson<ApiTelemetry>(`/api/telemetry/latest${query}`);
 }
 
 export function getTelemetryHistory(filters: TelemetryHistoryFilters = {}): Promise<ApiTelemetryHistory> {

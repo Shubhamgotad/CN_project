@@ -152,6 +152,7 @@ describe("Dashboard recorded telemetry", () => {
     expect(container.querySelector('a[href="/experiments"]')?.textContent).toContain("Experiments");
     expect(container.querySelector('[aria-label="Latency / RTT · h1, validated recorded telemetry at 2026-10-20T10:11:12.123+00:00"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Synthetic sample");
+    expect(telemetryMock).toHaveBeenCalledWith({ host: "h1", scenario: undefined });
   });
 
   it("shows only the active execution returned by the backend, including a failure", async () => {
@@ -191,6 +192,7 @@ describe("Dashboard recorded telemetry", () => {
     const selectedMetrics = container.querySelector(".flow-detail__metrics")?.textContent ?? "";
     expect(selectedMetrics).toContain("Unavailable");
     expect(selectedMetrics).not.toContain("2.997");
+    expect(telemetryMock).toHaveBeenLastCalledWith({ host: "h2", scenario: undefined });
     expect(historyMock).toHaveBeenLastCalledWith({ host: "h2", limit: 200 });
   });
 

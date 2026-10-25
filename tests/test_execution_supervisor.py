@@ -363,6 +363,34 @@ def test_wsl_qos_apply_runs_topology_guard_and_kernel_verification(monkeypatch):
     assert calls == ["topology", ("apply", 2.7), ("verify", "s1-eth5")]
 
 
+def test_qos_status_returns_single_read_only_kernel_snapshot(monkeypatch):
+    from qos import tc_controller
+
+    state = tc_controller.TCState(
+        qdiscs="qdisc htb 5: root\nqdisc netem 110: parent 1:11\n",
+        classes="class htb 5:1 root rate 10Mbit ceil 10Mbit\n",
+        filters="filter protocol ip pref 10 u32\n",
+    )
+    calls = []
+    monkeypatch.setattr(supervisor, "verify_topology", lambda: calls.append("topology"))
+    monkeypatch.setattr(
+        tc_controller,
+        "read_managed_htb_snapshot",
+        lambda interface: calls.append(("snapshot", interface)) or ("LOW", state),
+    )
+
+    result = supervisor.inspect_qos_profile()
+
+    assert result["status"] == "verified"
+    assert result["profile"] == "LOW"
+    assert result["interface"] == "s1-eth5"
+    assert result["readback_at"]
+    assert result["qdiscs"] == ["qdisc htb 5: root", "qdisc netem 110: parent 1:11"]
+    assert result["classes"] == ["class htb 5:1 root rate 10Mbit ceil 10Mbit"]
+    assert result["filters"] == ["filter protocol ip pref 10 u32"]
+    assert calls == ["topology", ("snapshot", "s1-eth5")]
+
+
 def test_wsl_qos_apply_rejects_unsupported_profile_before_preflight(monkeypatch):
     monkeypatch.setattr(
         supervisor,

@@ -4,6 +4,7 @@ import {
   apiReportToRunnerReport,
   backendConnection,
   getBackendHealth,
+  getLatestTelemetry,
   getTelemetryHistory,
   getActiveTrafficExecution,
   getTrafficExecution,
@@ -69,6 +70,27 @@ describe("dashboard API client", () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/api/telemetry/history?host=h2&scenario=congestion&limit=50",
+      { headers: { Accept: "application/json" } },
+    );
+  });
+
+  it("requests latest telemetry through selected host and scenario filters", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      status: "available",
+      source: "completed_experiment_person1_jsonl",
+      measurement_age_seconds: 2,
+      stale_after_seconds: 300,
+      message: "Latest validated record.",
+      record: { timestamp: "2026-10-24T20:16:29Z", experiment_id: "run-1", source: "h2", scenario: "congestion" },
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getLatestTelemetry({ host: "h2", scenario: "congestion" })).resolves.toMatchObject({
+      status: "available",
+      record: { source: "h2", scenario: "congestion" },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/telemetry/latest?host=h2&scenario=congestion",
       { headers: { Accept: "application/json" } },
     );
   });

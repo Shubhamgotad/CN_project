@@ -206,6 +206,68 @@ def test_latest_telemetry_discovers_fresh_completed_run_output(tmp_path, monkeyp
     assert 0 <= body["measurement_age_seconds"] <= api.MAX_TELEMETRY_AGE_SECONDS
 
 
+def test_latest_telemetry_filters_completed_run_by_host_before_selecting_newest(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "44444444444444444444444444444444"
+    now = time.time()
+    hosts = ("h1", "h2", "h3", "h4")
+    rows = []
+    expected = {}
+    for index, host in enumerate(hosts):
+        timestamp = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(now - len(hosts) + index),
+        )
+        payload = person1_telemetry(timestamp)
+        payload.update(
+            experiment_id=run_id,
+            scenario="congestion",
+            source=host,
+            throughput_mbps=1.25 + index,
+            active_flows=4,
+        )
+        expected[host] = payload
+        rows.append(json.dumps(payload) + "\n")
+    write_completed_run(run_root, run_id, "congestion", rows)
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    for host, payload in expected.items():
+        response = client.get(
+            "/api/telemetry/latest",
+            params={"host": host, "scenario": "congestion"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "available"
+        assert body["source"] == "completed_experiment_person1_jsonl"
+        assert body["record"]["experiment_id"] == run_id
+        assert body["record"]["source"] == host
+        assert body["record"]["scenario"] == "congestion"
+        assert body["record"]["timestamp"] == payload["timestamp"]
+        assert body["record"]["throughput_mbps"] == payload["throughput_mbps"]
+        assert body["record"]["active_flows"] == 4
+
+
+def test_latest_telemetry_filters_never_fall_back_to_another_host_or_scenario(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "55555555555555555555555555555555"
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = person1_telemetry(timestamp)
+    payload.update(experiment_id=run_id, scenario="congestion", source="h1")
+    write_completed_run(run_root, run_id, "congestion", [json.dumps(payload) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    for filters in (
+        {"host": "h2", "scenario": "congestion"},
+        {"host": "h1", "scenario": "burst"},
+    ):
+        response = client.get("/api/telemetry/latest", params=filters)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "unavailable"
+        assert body["record"] is None
+
+
 def test_telemetry_history_returns_chronological_filtered_records_with_provenance(tmp_path, monkeypatch):
     source = tmp_path / "selected-person1.jsonl"
     rows = []

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import qos.tc_controller as tc_controller
 from qos.allocator import MANAGED_HTB_PROFILES, plan_managed_htb
 from qos.tc_controller import (
     FLOW_PORTS,
@@ -24,6 +25,11 @@ from qos.tc_controller import (
     restore_original_hierarchy,
     verify_managed_htb_policy,
 )
+
+
+@pytest.fixture(autouse=True)
+def allow_mocked_controller_mutations(monkeypatch):
+    monkeypatch.setattr(tc_controller, "require_live_tc_ownership", lambda: None)
 
 
 def baseline_state():

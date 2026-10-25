@@ -50,6 +50,7 @@ UNMATCHED_CLASS_ID = "1:15"
 UNMATCHED_NETEM_HANDLE = "150:"
 MANAGED_FILTER_PRIORITIES = dict(zip(FLOW_PORTS, (10, 20, 30, 40)))
 _APPLY_LOCK = threading.RLock()
+LIVE_TC_OWNERSHIP_GUARANTEED = False
 
 
 @contextmanager
@@ -104,6 +105,15 @@ def _interface_lock(interface: str):
 
 class TCPreconditionError(RuntimeError):
     """The live state does not match the one hierarchy this controller owns."""
+
+
+def require_live_tc_ownership() -> None:
+    """Reject Mininet-interface mutations until exclusive tc ownership is established."""
+    if not LIVE_TC_OWNERSHIP_GUARANTEED:
+        raise TCPreconditionError(
+            "live QoS is disabled: this process cannot exclude arbitrary "
+            "external tc writers on s1-eth5"
+        )
 
 
 class TCApplyError(RuntimeError):
@@ -927,6 +937,14 @@ def read_managed_htb_profile(
     runner: Callable[..., Any] | None = None,
 ) -> str | None:
     """Return the recognized managed profile, or None if no profile matches."""
+    return read_managed_htb_snapshot(interface, runner)[0]
+
+
+def read_managed_htb_snapshot(
+    interface: str = ROOT_INTERFACE,
+    runner: Callable[..., Any] | None = None,
+) -> tuple[str | None, TCState]:
+    """Return one read-only kernel snapshot and the profile it matches, if any."""
     if interface != ROOT_INTERFACE:
         raise TCPreconditionError(f"refusing inspection outside {ROOT_INTERFACE}")
     from .allocator import MANAGED_HTB_PROFILES, plan_managed_htb
@@ -936,8 +954,8 @@ def read_managed_htb_profile(
         state = inspect_tc_state(interface, execute)
         for profile in MANAGED_HTB_PROFILES:
             if _managed_htb_matches(state, plan_managed_htb(profile, interface=interface)):
-                return profile
-        return None
+                return profile, state
+        return None, state
 
 
 def _mutate(runner: Callable[..., Any], command: str):
@@ -953,6 +971,8 @@ def _mutate(runner: Callable[..., Any], command: str):
 def _restore_baseline(
     interface: str, runner: Callable[..., Any], expected_state: TCState
 ) -> None:
+    if interface == ROOT_INTERFACE:
+        require_live_tc_ownership()
     current = inspect_tc_state(interface, runner)
     if current != expected_state:
         raise TCApplyError(
@@ -978,6 +998,8 @@ def restore_original_hierarchy(
     allow_disposable_veth: bool = False,
 ) -> bool:
     """Restore only the known controller-owned child subtree to the original netem leaf."""
+    if not allow_disposable_veth:
+        require_live_tc_ownership()
     if interface != ROOT_INTERFACE and not allow_disposable_veth:
         raise TCPreconditionError(f"refusing cleanup outside {ROOT_INTERFACE}")
     execute = runner or subprocess.run
@@ -1006,6 +1028,7 @@ def restore_managed_htb_hierarchy(
     runner: Callable[..., Any] | None = None,
 ) -> bool:
     """Restore the original leaf only when the complete managed HTB tree is owned."""
+    require_live_tc_ownership()
     if interface != ROOT_INTERFACE:
         raise TCPreconditionError(f"refusing cleanup outside {ROOT_INTERFACE}")
     execute = runner or subprocess.run
@@ -1053,6 +1076,8 @@ def apply_tc_policy(
     allow_disposable_veth: bool = False,
 ) -> list[Any]:
     """Apply or update only the nested policy subtree after strict preflight."""
+    if not allow_disposable_veth:
+        require_live_tc_ownership()
     allocations = _validate_flow_settings(
         interface, total_bandwidth_mbps, allocations_mbps,
         filter_priorities, default_port, allow_disposable_veth,
@@ -1158,6 +1183,8 @@ def apply_managed_htb_policy(
     """Apply or update the validated five-leaf hierarchy with guarded rollback."""
     if not isinstance(config, ManagedHTBConfig):
         raise ValueError("config must be a validated ManagedHTBConfig")
+    if config.isolated_target is None:
+        require_live_tc_ownership()
     raw_runner = runner or subprocess.run
     execute = (
         _IsolatedHTBRunner(config.isolated_target, raw_runner)

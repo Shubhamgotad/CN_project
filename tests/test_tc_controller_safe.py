@@ -22,6 +22,11 @@ from qos.tc_controller import (
 )
 
 
+@pytest.fixture(autouse=True)
+def allow_mocked_controller_mutations(monkeypatch):
+    monkeypatch.setattr(tc_controller, "require_live_tc_ownership", lambda: None)
+
+
 PRIORITIES = {port: index + 11 for index, port in enumerate(FLOW_PORTS)}
 DEFAULT_PORT = 5204
 RATES = {port: 2.5 for port in FLOW_PORTS}

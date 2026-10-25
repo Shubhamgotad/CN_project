@@ -11,7 +11,15 @@ from typing import Any
 from ai.prediction.labeling import DEFAULT_THRESHOLDS, congestion_score, label_congestion
 from ai.prediction.telemetry import TelemetryRecord, validate_telemetry
 from qos.allocator import plan_managed_htb
-from qos.tc_controller import generate_managed_htb_commands
+from qos.tc_controller import (
+    FLOW_PORTS,
+    NETEM_DELAY,
+    NETEM_LIMIT,
+    SERVICE_CLASS_IDS,
+    UNMATCHED_CLASS_ID,
+    UNMATCHED_NETEM_HANDLE,
+    generate_managed_htb_commands,
+)
 
 
 HYSTERESIS_SAMPLES = 2
@@ -121,6 +129,7 @@ class DecisionLoop:
                 "measurement_age_seconds": telemetry.measurement_age_seconds,
                 "measurement": {
                     "timestamp": record_data["timestamp"],
+                    "experiment_id": record_data.get("experiment_id"),
                     "source": record_data["source"],
                     "scenario": record_data["scenario"],
                     "interface": record.interface,
@@ -145,14 +154,37 @@ class DecisionLoop:
                 "cooldown_seconds": COOLDOWN_SECONDS,
                 "cooldown_remaining_seconds": round(cooldown_remaining, 3),
                 "reasons": reasons,
+                "thresholds": {
+                    "utilization_medium_percent": DEFAULT_THRESHOLDS.utilization_medium,
+                    "utilization_high_percent": DEFAULT_THRESHOLDS.utilization_high,
+                    "latency_medium_ms": DEFAULT_THRESHOLDS.latency_medium_ms,
+                    "latency_high_ms": DEFAULT_THRESHOLDS.latency_high_ms,
+                    "packet_loss_medium_percent": DEFAULT_THRESHOLDS.packet_loss_medium_pct,
+                    "packet_loss_high_percent": DEFAULT_THRESHOLDS.packet_loss_high_pct,
+                },
                 "proposed_policy": {
                     "interface": config.interface,
                     "total_bandwidth_mbps": config.total_bandwidth_mbps,
                     "service_allocations_mbps": dict(config.service_allocations_mbps),
+                    "service_ceilings_mbps": dict(config.service_allocations_mbps),
+                    "service_class_ids": dict(SERVICE_CLASS_IDS),
+                    "flow_mappings": [
+                        {
+                            "port": port,
+                            "service": service,
+                            "class_id": SERVICE_CLASS_IDS[service],
+                            "priority": config.filter_priorities[port],
+                        }
+                        for port, service in zip(FLOW_PORTS, SERVICE_CLASS_IDS)
+                    ],
                     "unmatched_rate_mbps": config.unmatched_rate_mbps,
                     "unmatched_ceil_mbps": config.unmatched_ceil_mbps,
                     "default_class_id": config.default_class_id,
+                    "unmatched_class_id": UNMATCHED_CLASS_ID,
                     "filter_priorities": dict(config.filter_priorities),
+                    "netem_delay": NETEM_DELAY,
+                    "netem_limit": NETEM_LIMIT,
+                    "unmatched_netem_handle": UNMATCHED_NETEM_HANDLE,
                 },
                 "tc_commands": commands,
                 "history": list(self._history),

@@ -96,7 +96,10 @@ export function Dashboard() {
       setTelemetryError("");
       setTelemetryLoading(true);
       try {
-        const value = await getLatestTelemetry();
+        const value = await getLatestTelemetry({
+          host: selected,
+          scenario: historyScenario === "all" ? undefined : historyScenario,
+        });
         if (active) setTelemetry(value);
       } catch (reason: unknown) {
         if (active) setTelemetryError(reason instanceof Error ? reason.message : "Telemetry API request failed.");
@@ -114,7 +117,7 @@ export function Dashboard() {
       active = false;
       if (telemetryTimer !== undefined) window.clearTimeout(telemetryTimer);
     };
-  }, []);
+  }, [selected, historyScenario]);
 
   useEffect(() => {
     if (!backendConnection.baseUrl) {

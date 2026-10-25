@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from threading import RLock
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -17,7 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai.prediction.telemetry import adapt_person1_telemetry
-from dashboard.backend.decision_loop import decision_loop
+from dashboard.backend.decision_loop import DecisionLoop, decision_loop
+from qos import tc_controller
 
 
 API_VERSION = "0.1.0"
@@ -35,6 +37,23 @@ TELEMETRY_FILE_ENV = "ADAPTIVE_QOS_TELEMETRY_FILE"
 QOS_APPLICATION_ENV = "ADAPTIVE_QOS_ENABLE_APPLICATION"
 REPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 EXPERIMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_scoped_decision_loops: dict[tuple[str | None, str | None], DecisionLoop] = {}
+_scoped_decision_loops_lock = RLock()
+
+
+def _decision_loop_for(
+    host: str | None,
+    scenario: str | None,
+) -> DecisionLoop:
+    if host is None and scenario is None:
+        return decision_loop
+    key = (host, scenario)
+    with _scoped_decision_loops_lock:
+        loop = _scoped_decision_loops.get(key)
+        if loop is None:
+            loop = DecisionLoop()
+            _scoped_decision_loops[key] = loop
+        return loop
 
 
 class APIModel(BaseModel):
@@ -128,6 +147,7 @@ class TopologyResponse(APIModel):
 
 class TelemetryRecordResponse(APIModel):
     timestamp: str
+    experiment_id: str | None = None
     source: str
     scenario: str
     throughput_mbps: float
@@ -210,6 +230,7 @@ class DryRunDecisionResponse(APIModel):
     cooldown_seconds: float
     cooldown_remaining_seconds: float
     reasons: list[str]
+    thresholds: dict[str, float] = Field(default_factory=dict)
     proposed_policy: dict[str, Any] | None = None
     tc_commands: list[str]
     history: list[dict[str, Any]]
@@ -237,6 +258,19 @@ class QosApplicationStatusResponse(APIModel):
     status: Literal["verified", "unrecognized", "unavailable"]
     applied_profile: Literal["LOW", "MEDIUM", "HIGH"] | None = None
     interface: Literal["s1-eth5"] = "s1-eth5"
+    readback_at: str | None = None
+    qdiscs: list[str] = Field(default_factory=list)
+    classes: list[str] = Field(default_factory=list)
+    filters: list[str] = Field(default_factory=list)
+    message: str
+
+
+class IsolatedQosServiceStatusResponse(APIModel):
+    status: Literal["unavailable"] = "unavailable"
+    target_kind: Literal["disposable_namespace_veth"] = "disposable_namespace_veth"
+    owner_service: Literal["not_provisioned"] = "not_provisioned"
+    target_interface: str | None = None
+    mutation_enabled: Literal[False] = False
     message: str
 
 
@@ -1062,43 +1096,61 @@ def topology() -> TopologyResponse:
 
 
 @app.get("/api/telemetry/latest", response_model=LatestTelemetryResponse)
-def latest_telemetry() -> LatestTelemetryResponse:
+def latest_telemetry(
+    request: Request = None,  # type: ignore[assignment]
+    host: Literal["h1", "h2", "h3", "h4"] | None = None,
+    scenario: Literal["normal", "moderate", "congestion", "burst"] | None = None,
+) -> LatestTelemetryResponse:
+    if request is not None:
+        unsupported_parameters = set(request.query_params) - {"host", "scenario"}
+        if unsupported_parameters:
+            raise HTTPException(status_code=422, detail="Telemetry latest accepts only host and scenario filters.")
+
+    return _latest_telemetry(host=host, scenario=scenario)
+
+
+def _latest_telemetry(
+    *,
+    host: str | None = None,
+    scenario: str | None = None,
+) -> LatestTelemetryResponse:
     configured = os.environ.get(TELEMETRY_FILE_ENV)
     candidates: list[tuple[datetime, dict[str, Any], str]] = []
     if configured and configured.strip():
         try:
             content = _read_configured_telemetry_text(Path(configured).expanduser())
-            record_data: dict[str, Any] | None = None
-            for line in content.splitlines():
-                if not line.strip():
+            rows, _ = _complete_jsonl_records(content)
+            for timestamp, payload in rows:
+                if host is not None and payload.get("source") != host:
                     continue
-                payload = json.loads(line, parse_constant=_json_constant)
-                _telemetry_timestamp(payload)
-                record_data = payload
-            if record_data is None:
-                raise ValueError("configured telemetry has no complete rows")
-            candidates.append((
-                _telemetry_timestamp(record_data),
-                record_data,
-                "configured_person1_jsonl",
-            ))
+                if scenario is not None and payload.get("scenario") != scenario:
+                    continue
+                candidates.append((timestamp, payload, "configured_person1_jsonl"))
         except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             pass
 
-    candidates.extend(
-        (timestamp, payload, "completed_experiment_person1_jsonl")
-        for timestamp, payload in _completed_experiment_telemetry()
-    )
+    for timestamp, payload in _completed_experiment_telemetry():
+        if host is not None and payload.get("source") != host:
+            continue
+        if scenario is not None and payload.get("scenario") != scenario:
+            continue
+        candidates.append((timestamp, payload, "completed_experiment_person1_jsonl"))
     if not candidates:
         if configured and configured.strip():
             source = "configured_person1_jsonl"
-            message = "The configured telemetry file is missing, unsafe, empty, or invalid; no valid completed experiment measurement was found."
+            message = (
+                "No valid telemetry record matches the requested host and scenario filters."
+                if host is not None or scenario is not None
+                else "The configured telemetry file is missing, unsafe, empty, or invalid; no valid completed experiment measurement was found."
+            )
         else:
             source = "none"
-            message = (
-                "No telemetry file is configured and no valid measurement from a completed experiment was found. "
-                "Set ADAPTIVE_QOS_TELEMETRY_FILE to an explicitly selected Person-1 JSONL file."
-            )
+            message = "No valid telemetry record matches the requested host and scenario filters."
+            if host is None and scenario is None:
+                message = (
+                    "No telemetry file is configured and no valid measurement from a completed experiment was found. "
+                    "Set ADAPTIVE_QOS_TELEMETRY_FILE to an explicitly selected Person-1 JSONL file."
+                )
         return LatestTelemetryResponse(status="unavailable", source=source, message=message)
 
     parsed_time, record_data, source = max(candidates, key=lambda candidate: candidate[0])
@@ -1125,6 +1177,7 @@ def latest_telemetry() -> LatestTelemetryResponse:
         message=message,
         record=TelemetryRecordResponse(
             timestamp=record_data["timestamp"],
+            experiment_id=record_data.get("experiment_id"),
             source=record_data["source"],
             scenario=record_data["scenario"],
             throughput_mbps=record_data["throughput_mbps"],
@@ -1229,10 +1282,22 @@ def telemetry_history(
 
 
 @app.get("/api/qos/decision", response_model=DryRunDecisionResponse)
-def qos_dry_run_decision() -> DryRunDecisionResponse:
+def qos_dry_run_decision(
+    request: Request = None,  # type: ignore[assignment]
+    host: Literal["h1", "h2", "h3", "h4"] | None = None,
+    scenario: Literal["normal", "moderate", "congestion", "burst"] | None = None,
+) -> DryRunDecisionResponse:
     """Return a validated, rule-based QoS proposal without applying it."""
-    result = decision_loop.evaluate(latest_telemetry())
-    result["application_enabled"] = os.environ.get(QOS_APPLICATION_ENV) == "1"
+    if request is not None:
+        unsupported_parameters = set(request.query_params) - {"host", "scenario"}
+        if unsupported_parameters:
+            raise HTTPException(status_code=422, detail="QoS decision accepts only host and scenario filters.")
+    telemetry = latest_telemetry(host=host, scenario=scenario)
+    result = _decision_loop_for(host, scenario).evaluate(telemetry)
+    result["application_enabled"] = (
+        os.environ.get(QOS_APPLICATION_ENV) == "1"
+        and tc_controller.LIVE_TC_OWNERSHIP_GUARANTEED
+    )
     return DryRunDecisionResponse(**result)
 
 
@@ -1262,9 +1327,27 @@ def qos_application_status() -> QosApplicationStatusResponse:
         raise HTTPException(status_code=502, detail="The QoS supervisor returned an unsupported profile.")
     if (result["status"] == "verified") != (profile is not None):
         raise HTTPException(status_code=502, detail="The QoS supervisor returned inconsistent profile state.")
+    readback_at = result.get("readback_at")
+    if readback_at is not None and (
+        not isinstance(readback_at, str)
+        or len(readback_at) > 64
+        or not readback_at.strip()
+    ):
+        raise HTTPException(status_code=502, detail="The QoS supervisor returned an invalid readback timestamp.")
+    state_lines: dict[str, list[str]] = {}
+    for field in ("qdiscs", "classes", "filters"):
+        values = result.get(field, [])
+        if (
+            not isinstance(values, list)
+            or any(not isinstance(line, str) or len(line) > 2048 for line in values)
+        ):
+            raise HTTPException(status_code=502, detail="The QoS supervisor returned invalid kernel readback details.")
+        state_lines[field] = values
     return QosApplicationStatusResponse(
         status=result["status"],
         applied_profile=profile,
+        readback_at=readback_at,
+        **state_lines,
         message=(
             "Current managed QoS profile confirmed by kernel readback."
             if profile is not None
@@ -1273,9 +1356,32 @@ def qos_application_status() -> QosApplicationStatusResponse:
     )
 
 
+@app.get(
+    "/api/qos/isolated/status",
+    response_model=IsolatedQosServiceStatusResponse,
+)
+def isolated_qos_service_status() -> IsolatedQosServiceStatusResponse:
+    """Report the isolated target as unavailable until an owner service exists."""
+    return IsolatedQosServiceStatusResponse(
+        message=(
+            "No isolated QoS owner service or disposable target is provisioned. "
+            "WSL host-root processes can enter or alter network namespaces, so "
+            "exclusive ownership is not established and isolated mutation is disabled."
+        )
+    )
+
+
 @app.post("/api/qos/apply", response_model=QosApplyResponse)
 def apply_qos_profile(request: Request, body: QosApplyRequest) -> QosApplyResponse:
     _require_local_mutation(request)
+    if not tc_controller.LIVE_TC_OWNERSHIP_GUARANTEED:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "QoS application is fail-closed because exclusive ownership of "
+                "s1-eth5 cannot be guaranteed against external tc writers."
+            ),
+        )
     if os.environ.get(QOS_APPLICATION_ENV) != "1":
         raise HTTPException(
             status_code=403,

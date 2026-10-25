@@ -389,13 +389,17 @@ def apply_qos_profile(profile: str) -> dict[str, Any]:
 
 def inspect_qos_profile() -> dict[str, Any]:
     verify_topology()
-    from qos.tc_controller import read_managed_htb_profile
+    from qos.tc_controller import read_managed_htb_snapshot
 
-    profile = read_managed_htb_profile("s1-eth5")
+    profile, state = read_managed_htb_snapshot("s1-eth5")
     return {
         "status": "verified" if profile is not None else "unrecognized",
         "profile": profile,
         "interface": "s1-eth5",
+        "readback_at": _utc_now(),
+        "qdiscs": [line.strip() for line in state.qdiscs.splitlines() if line.strip()],
+        "classes": [line.strip() for line in state.classes.splitlines() if line.strip()],
+        "filters": [line.strip() for line in state.filters.splitlines() if line.strip()],
     }
 
 
