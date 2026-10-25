@@ -2,9 +2,12 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiQosDryRunDecision } from "../api/client";
+import type { ImportedRunnerReport } from "../types";
 import {
+  apiReportToRunnerReport,
   ApiRequestError,
   applyQosProfile,
+  getReport,
   getQosApplicationStatus,
   getQosDryRunDecision,
   getReports,
@@ -33,6 +36,8 @@ vi.mock("../api/client", () => ({
 
 const getDecisionMock = vi.mocked(getQosDryRunDecision);
 const getReportsMock = vi.mocked(getReports);
+const getReportMock = vi.mocked(getReport);
+const apiReportToRunnerReportMock = vi.mocked(apiReportToRunnerReport);
 const getQosStatusMock = vi.mocked(getQosApplicationStatus);
 const applyQosProfileMock = vi.mocked(applyQosProfile);
 let root: Root;
@@ -45,11 +50,13 @@ function decision(overrides: Partial<ApiQosDryRunDecision> = {}): ApiQosDryRunDe
     applied: false,
     execution_state: "dry_run",
     application_enabled: false,
+    application_blockers: ["application_disabled", "exclusive_tc_ownership_unavailable"],
     telemetry_status: "available",
     telemetry_source: "configured_person1_jsonl",
     measurement_age_seconds: 2.5,
     measurement: {
       timestamp: "2026-10-20T10:00:00+00:00",
+      experiment_id: "b".repeat(32),
       source: "h1",
       scenario: "normal",
       interface: "s1-eth5",
@@ -90,9 +97,9 @@ function decision(overrides: Partial<ApiQosDryRunDecision> = {}): ApiQosDryRunDe
   };
 }
 
-async function render() {
+async function render(report: ImportedRunnerReport | null = null) {
   await act(async () => {
-    root.render(<AiQos report={null} reportSource="api" onReport={vi.fn()} />);
+    root.render(<AiQos report={report} reportSource="api" onReport={vi.fn()} />);
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -103,7 +110,9 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
-  getReportsMock.mockReset().mockResolvedValue({ status: "available", message: "No reports", reports: [] });
+  getReportsMock.mockReset().mockResolvedValue({ status: "available", directory_status: "valid", message: "No reports", reports: [] });
+  getReportMock.mockReset();
+  apiReportToRunnerReportMock.mockReset();
   getDecisionMock.mockReset().mockResolvedValue(decision());
   getQosStatusMock.mockReset().mockResolvedValue({
     status: "unrecognized",
@@ -133,11 +142,17 @@ describe("AI & QoS dry-run decision panel", () => {
   it("displays the returned telemetry and proposed policy as not applied", async () => {
     await render();
     expect(container.textContent).toContain("AI & QoS Decision");
-    expect(container.textContent).toContain("Application is disabled by default");
+    expect(container.textContent).toContain("LIVE_TC_OWNERSHIP_GUARANTEED=false");
     expect(container.textContent).toContain("Telemetry available");
     expect(container.textContent).toContain("2.997 Mbps throughput");
+    expect(container.textContent).toContain("Configured bottleneck capacity: 10 Mbps");
     expect(container.textContent).toContain("20.630 ms latency");
     expect(container.textContent).toContain("Proposed LOW HTB profile");
+    expect(container.textContent).toContain("Proposed QoS allocation budget: 10.0 Mbps");
+    expect(container.textContent).toContain("remaining 9.0 Mbps is shared by the service classes");
+    expect(container.textContent).toContain("unused capacity may not be borrowed by other classes");
+    expect(container.textContent).toContain("10 Mbps total incl. unmatched");
+    expect(container.textContent).toContain("9.0 Mbps service pool using its class weights and reserves 1.0 Mbps for unmatched traffic");
     expect(container.textContent).toContain("tc commands (not executed)");
     expect(container.textContent).toContain("no network configuration was changed");
     expect(getDecisionMock).toHaveBeenCalledTimes(1);
@@ -180,12 +195,21 @@ describe("AI & QoS dry-run decision panel", () => {
       selected_profile: null,
       proposed_policy: null,
       tc_commands: [],
-      message: "Latest telemetry is stale.",
+      message: "The explicitly configured ADAPTIVE_QOS_TELEMETRY_FILE measurement is stale: 421159 seconds old; the freshness limit is 300 seconds. Automatic completed-run discovery is not mixed with an explicit file override. Clear that setting to use the newest eligible completed-run measurement.",
     }));
     await render();
     expect(container.textContent).toContain("No decision · stale");
     expect(container.textContent).toContain("Telemetry is stale");
+    expect(container.textContent).toContain("421159 seconds old");
+    expect(container.textContent).toContain("Clear that setting");
     expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+    const refresh = [...container.querySelectorAll("button")].find((button) => button.textContent === "Refresh live telemetry");
+    await act(async () => {
+      refresh?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getDecisionMock).toHaveBeenCalledTimes(2);
   });
 
   it("shows an explicit unavailable state without a proposed policy", async () => {
@@ -279,5 +303,155 @@ describe("AI & QoS dry-run decision panel", () => {
     expect(container.textContent).toContain("Decision API error");
     expect(container.textContent).toContain("Backend unavailable");
     expect(container.textContent).not.toContain("Proposed LOW HTB profile");
+  });
+
+  it("shows the report-list loading state until the request resolves", async () => {
+    getReportsMock.mockReturnValue(new Promise(() => {}));
+    await render();
+    expect(container.textContent).toContain("Loading configured reports");
+    const refresh = [...container.querySelectorAll("button")].find((button) => button.textContent === "Refreshing…");
+    expect(refresh?.disabled).toBe(true);
+  });
+
+  it("distinguishes an unset report directory from a valid empty directory", async () => {
+    getReportsMock.mockResolvedValue({ status: "unavailable", directory_status: "unset", message: "ADAPTIVE_QOS_REPORT_DIR is unset.", reports: [] });
+    await render();
+    expect(container.textContent).toContain("Report directory status: unset");
+    expect(container.textContent).toContain("ADAPTIVE_QOS_REPORT_DIR is unset.");
+
+    getReportsMock.mockResolvedValue({ status: "available", directory_status: "valid", message: "Configured report directory is valid and contains no compatible reports.", reports: [] });
+    const refresh = [...container.querySelectorAll("button")].find((button) => button.textContent === "Refresh reports");
+    await act(async () => {
+      refresh?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("No compatible reports in the valid configured directory.");
+  });
+
+  it("offers retry after report-list request errors", async () => {
+    getReportsMock.mockRejectedValueOnce(new Error("Backend unavailable"));
+    await render();
+    expect(container.textContent).toContain("Backend unavailable");
+    getReportsMock.mockResolvedValueOnce({ status: "available", directory_status: "valid", message: "No reports", reports: [] });
+    const retry = [...container.querySelectorAll("button")].find((button) => button.textContent === "Retry report list");
+    expect(retry).toBeDefined();
+    await act(async () => {
+      retry?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("No compatible reports in the valid configured directory.");
+  });
+
+  it("loads a discovered report from the configured API without manual import", async () => {
+    const discovered: ImportedRunnerReport = {
+      kind: "experiment-runner",
+      runId: "discovered-runner-report",
+      createdAt: "2026-10-25T10:01:00+00:00",
+      mode: "adaptive",
+      status: "planned",
+      records: [{
+        line: 1,
+        status: "planned",
+        experimentId: "c".repeat(32),
+        scenario: "normal",
+        source: "h1",
+        timestamp: "2026-10-25T10:00:00+00:00",
+        freshnessStatus: "fresh",
+        freshnessAgeSeconds: 2,
+        prediction: "LOW",
+        confidence: 0.91,
+        totalBandwidthMbps: null,
+        policyPercentages: null,
+        flowAllocationsMbps: { "5201": 2.7 },
+        unmatchedRateMbps: 1,
+        serviceAllocationsMbps: { gaming: 2.7 },
+        inputFeatures: { utilization: 30 },
+        measured: { throughput_mbps: 3, latency_ms: 10, jitter_ms: 1, packet_loss_percent: 0 },
+        planningOnly: true,
+      }],
+    };
+    getReportsMock.mockResolvedValue({
+      status: "available",
+      directory_status: "valid",
+      message: "Compatible reports available.",
+      reports: [{
+        report_id: "report-id",
+        created_at: discovered.createdAt,
+        input_record_count: 1,
+        freshness_status: "fresh",
+        report_type: "experiment-runner",
+        status: "planned",
+        campaign_status: null,
+        alignment_eligibility: "ineligible",
+        comparison_ready: false,
+      }],
+    });
+    getReportMock.mockResolvedValue({} as Awaited<ReturnType<typeof getReport>>);
+    apiReportToRunnerReportMock.mockReturnValue(discovered);
+    let loaded: ImportedRunnerReport | null = null;
+    const onReport = (value: ImportedRunnerReport) => { loaded = value; };
+    await act(async () => {
+      root.render(<AiQos report={null} reportSource="api" onReport={onReport} />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("1 input records");
+    const load = [...container.querySelectorAll("button")].find((button) => button.textContent === "Load plan");
+    await act(async () => {
+      load?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getReportMock).toHaveBeenCalledWith("report-id");
+    expect(loaded).toEqual(discovered);
+    await act(async () => {
+      root.render(<AiQos report={loaded} reportSource="api" onReport={onReport} />);
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Discovered offline plan details");
+    expect(container.textContent).toContain("c".repeat(32));
+  });
+
+  it("shows offline experiment evidence and distinguishes it from live telemetry", async () => {
+    const offline: ImportedRunnerReport = {
+      kind: "experiment-runner",
+      runId: "runner-report-1",
+      createdAt: "2026-10-20T10:01:00+00:00",
+      mode: "adaptive",
+      status: "planned",
+      records: [{
+        line: 1,
+        status: "planned",
+        experimentId: "a".repeat(32),
+        scenario: "congestion",
+        source: "h2",
+        timestamp: "2026-10-20T10:00:00+00:00",
+        freshnessStatus: "fresh",
+        freshnessAgeSeconds: 2,
+        prediction: "HIGH",
+        confidence: 0.87,
+        totalBandwidthMbps: 10,
+        policyPercentages: { gaming: 40, video: 30, web: 20, bulk: 10 },
+        flowAllocationsMbps: { "5201": 3.6, "5202": 2.7, "5203": 1.8, "5204": 0.9 },
+        unmatchedRateMbps: 1,
+        serviceAllocationsMbps: { gaming: 3.6, video: 2.7, web: 1.8, bulk: 0.9 },
+        inputFeatures: { utilization: 90 },
+        measured: { throughput_mbps: 8, latency_ms: 40, jitter_ms: 2, packet_loss_percent: 1 },
+        planningOnly: true,
+      }],
+    };
+    await render(offline);
+    expect(container.textContent).toContain("a".repeat(32));
+    expect(container.textContent).toContain("congestion");
+    expect(container.textContent).toContain("Report source host: h2");
+    expect(container.textContent).toContain("Freshness: fresh");
+    expect(container.textContent).toContain("Confidence 87.0%");
+    expect(container.textContent).toContain("different from the live telemetry experiment");
+    expect(container.textContent).toContain("importing does not rerun prediction");
+    expect(container.textContent).toContain("Planned budget · 10.00 Mbps total");
+    expect(container.textContent).toContain("Planner rationale: service-pool weights gaming 40%");
+    expect(container.textContent).toContain("Rates are planned and not applied.");
   });
 });

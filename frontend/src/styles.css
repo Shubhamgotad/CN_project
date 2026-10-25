@@ -371,6 +371,15 @@ h1 { margin: 9px 0 7px; font-size: clamp(28px, 3vw, 36px); line-height: 1.12; le
 .record-select { display: flex; align-items: center; gap: 8px; color: var(--color-secondary); font-size: 12px; }
 .record-select select { width: auto; min-width: 190px; }
 .plan-card { padding: 17px; }
+.plan-budget { margin-top: 14px; padding: 13px; border: 1px solid var(--border, #dbe3ed); border-radius: 10px; }
+.plan-budget__heading { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.plan-budget__heading span, .plan-budget p { color: var(--muted, #64748b); font-size: 0.9rem; }
+.plan-budget__bar { display: flex; overflow: hidden; height: 15px; margin-top: 10px; border-radius: 999px; background: #e2e8f0; }
+.plan-budget__bar span:nth-child(1) { background: #4f46e5; }
+.plan-budget__bar span:nth-child(2) { background: #0891b2; }
+.plan-budget__bar span:nth-child(3) { background: #16a34a; }
+.plan-budget__bar span:nth-child(4) { background: #d97706; }
+.plan-budget__bar span:nth-child(5) { background: #94a3b8; }
 .allocation-table-wrap { overflow-x: auto; margin-top: 14px; }
 .data-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
 .data-table th { padding: 11px 10px; border-bottom: 1px solid rgba(112, 75, 58, .26); color: var(--color-secondary); background: var(--color-background); font-size: 11px; font-weight: 800; white-space: nowrap; }

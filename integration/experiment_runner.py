@@ -22,7 +22,7 @@ from integration.telemetry_qos import (
     adapt_person1_telemetry,
     build_qos_integration,
 )
-from integration.safe_outputs import open_exclusive_text, validate_new_output_paths
+from integration.safe_outputs import validate_new_output_paths, write_exclusive_text
 
 
 BASELINE_POLICY = {
@@ -282,6 +282,7 @@ def _adaptive_result(
         "status": "planned",
         "prediction": dict(integration_result["prediction"]),
         "input_features": dict(input_features),
+        "total_bandwidth_mbps": float(integration_result["total_bandwidth_mbps"]),
         "policy_percentages": dict(decision["policy"]),
         "service_class_allocation_mbps": dict(managed["service_allocations_mbps"]),
         "unmatched_leaf": {
@@ -310,6 +311,7 @@ def run_experiment(
     enforce_freshness: bool = False,
     require_queue_measurements: bool = False,
     now: datetime | None = None,
+    experiment_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create offline plans from Person 1 JSONL without applying QoS or measuring.
 
@@ -346,6 +348,8 @@ def run_experiment(
         raise ValueError("enforce_freshness must be a boolean")
     if not isinstance(require_queue_measurements, bool):
         raise ValueError("require_queue_measurements must be a boolean")
+    if experiment_metadata is not None and not isinstance(experiment_metadata, Mapping):
+        raise ValueError("experiment_metadata must be a mapping")
     if enforce_freshness and now is not None and (
         now.tzinfo is None or now.utcoffset() is None
     ):
@@ -623,6 +627,7 @@ def run_experiment(
             "permissive_missing_values_allowed": not require_queue_measurements,
         },
         "input_source": str(source),
+        "experiment": dict(experiment_metadata) if experiment_metadata is not None else None,
         "model_path": str(Path(model_path).expanduser().resolve()) if model_path else None,
         "counts": {
             "records": records_processed,
@@ -638,9 +643,7 @@ def run_experiment(
         },
         "results": records,
     }
-    with open_exclusive_text(destination) as output:
-        json.dump(report, output, indent=2, allow_nan=False)
-        output.write("\n")
+    write_exclusive_text(destination, json.dumps(report, indent=2, allow_nan=False) + "\n")
     return report
 
 

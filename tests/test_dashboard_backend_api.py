@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 import time
@@ -33,14 +34,16 @@ def runner_report() -> dict:
         "live_qos_applied": False,
         "tc_commands_executed": False,
         "model_path": r"D:\private\model.joblib",
+        "counts": {"records_processed": 1},
         "results": [{
             "line": 1,
             "status": "planned",
-            "experiment_id": "exp-1",
+            "experiment_id": "a" * 32,
             "scenario": "congestion",
             "source": "h1",
             "window": {"timestamp": "2026-10-20T10:00:00+00:00"},
             "freshness": {"status": "fresh", "age_seconds": 12},
+            "queue_measurement_quality": {"status": "ready"},
             "measured": {
                 "throughput_mbps": 3.2,
                 "latency_ms": 20.0,
@@ -53,11 +56,34 @@ def runner_report() -> dict:
                     "prediction": {"congestion": "MEDIUM", "confidence": 0.8},
                     "input_features": {"utilization": 32.0},
                     "service_class_allocation_mbps": {"gaming": 3.6},
-                    "flow_allocations_mbps": {"5201": 3.6},
+                    "flow_allocations_mbps": {"5201": 3.6, "5202": 2.7, "5203": 1.8, "5204": 0.9},
+                    "unmatched_leaf": {"rate_mbps": 1.0},
                 }
             },
         }],
     }
+
+
+def test_report_budget_provenance_is_exposed_and_inconsistent_budget_rejected(tmp_path, monkeypatch):
+    report = runner_report()
+    adaptive = report["results"][0]["modes"]["adaptive"]
+    adaptive.update(
+        total_bandwidth_mbps=10.0,
+        policy_percentages={"gaming": 40, "video": 30, "web": 20, "bulk": 10},
+        service_class_allocation_mbps={"gaming": 3.6, "video": 2.7, "web": 1.8, "bulk": 0.9},
+    )
+    directory = tmp_path / "reports"
+    directory.mkdir()
+    monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(directory))
+    path = write_report(directory, "budget-report", report)
+    assert api._classify_report(report) == "experiment-runner"
+    records = api._runner_records(report)
+    assert records[0].total_bandwidth_mbps == 10
+    assert records[0].policy_percentages["gaming"] == 40
+
+    adaptive["total_bandwidth_mbps"] = 11
+    assert api._classify_report(report) is None
+    assert path.exists()
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +190,8 @@ def test_stale_and_malformed_telemetry_are_not_reported_as_current(tmp_path, mon
     assert stale["status"] == "stale"
     assert stale["record"]["source"] == "h1"
     assert stale["measurement_age_seconds"] > api.MAX_TELEMETRY_AGE_SECONDS
+    assert "ADAPTIVE_QOS_TELEMETRY_FILE" in stale["message"]
+    assert "not mixed" in stale["message"]
 
     source.write_text('{"timestamp":"not a telemetry row"}\n', encoding="utf-8")
     body = client.get("/api/telemetry/latest").json()
@@ -171,19 +199,56 @@ def test_stale_and_malformed_telemetry_are_not_reported_as_current(tmp_path, mon
     assert body["record"] is None
 
 
-def write_completed_run(root: Path, run_id: str, scenario: str, rows: list[str], *, status="completed", exit_code=0, alive=False):
+def write_completed_run(root: Path, run_id: str, scenario: str, rows: list[str], *, status="completed", exit_code=0, alive=False, source_host=None):
     run_dir = root / run_id
     output = run_dir / "output"
     output.mkdir(parents=True)
+    fixture_sources = set()
+    for line in rows:
+        try:
+            row = json.loads(line)
+            if row.get("source") in {"h1", "h2", "h3", "h4"}:
+                fixture_sources.add(row["source"])
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    if source_host is None:
+        source_host = (next(iter(fixture_sources)) if len(fixture_sources) == 1 else "all") if scenario == "congestion" else (next(iter(fixture_sources)) if len(fixture_sources) == 1 else "h1")
+    finished_at = None
+    for line in rows:
+        try:
+            value = json.loads(line).get("timestamp")
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and (finished_at is None or parsed > finished_at):
+                finished_at = parsed
+        except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            continue
+    if finished_at is None:
+        finished_at = datetime.now(timezone.utc)
     (run_dir / "state.json").write_text(json.dumps({
         "experiment_id": run_id,
         "scenario": scenario,
+        "source_host": source_host,
+        "flows": sorted(fixture_sources) if source_host == "all" else [source_host],
         "status": status,
         "process_alive": alive,
         "process_exit_code": exit_code,
+        "finished_at": finished_at.isoformat(),
         "output_directory": "/ignored/WSL/path/output",
     }), encoding="utf-8")
-    (output / f"{scenario}.jsonl").write_text("".join(rows), encoding="utf-8")
+    fixture_rows = []
+    for line in rows:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            fixture_rows.append(line)
+            continue
+        # person1_telemetry() is a shared schema fixture; bind its default
+        # metadata to the run represented by this completed-run fixture.
+        if payload.get("experiment_id") == "run-1":
+            payload["experiment_id"] = run_id
+            payload["scenario"] = scenario
+        fixture_rows.append(json.dumps(payload) + "\n")
+    (output / f"{scenario}.jsonl").write_text("".join(fixture_rows), encoding="utf-8")
     return run_dir
 
 
@@ -191,7 +256,7 @@ def test_latest_telemetry_discovers_fresh_completed_run_output(tmp_path, monkeyp
     run_root = tmp_path / ".adaptive-qos-runs"
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     record = person1_telemetry(timestamp)
-    record["experiment_id"] = "producer-generated-id"
+    record["experiment_id"] = "d535edb82d3d4e3aa6ab19ac919cb205"
     record["throughput_mbps"] = 2.997
     write_completed_run(run_root, "d535edb82d3d4e3aa6ab19ac919cb205", "normal", [json.dumps(record) + "\n"])
     monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
@@ -201,6 +266,7 @@ def test_latest_telemetry_discovers_fresh_completed_run_output(tmp_path, monkeyp
     body = response.json()
     assert body["status"] == "available"
     assert body["source"] == "completed_experiment_person1_jsonl"
+    assert body["record"]["experiment_id"] == "d535edb82d3d4e3aa6ab19ac919cb205"
     assert body["record"]["throughput_mbps"] == 2.997
     assert body["record"]["scenario"] == "normal"
     assert 0 <= body["measurement_age_seconds"] <= api.MAX_TELEMETRY_AGE_SECONDS
@@ -327,12 +393,13 @@ def test_telemetry_history_preserves_nullable_measurements_and_rejects_malformed
 def test_telemetry_history_discovers_only_successfully_completed_experiment_outputs(tmp_path, monkeypatch):
     run_root = tmp_path / ".adaptive-qos-runs"
     payload = person1_telemetry("2026-01-01T10:00:00Z")
-    payload.update(experiment_id="producer-id", source="h3", scenario="moderate")
+    payload.update(experiment_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", source="h3", scenario="moderate")
     write_completed_run(
         run_root,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "moderate",
         [json.dumps(payload) + "\n"],
+        source_host="h3",
     )
     write_completed_run(
         run_root,
@@ -417,6 +484,32 @@ def test_missing_and_malformed_completed_run_output_is_unavailable(tmp_path, mon
     assert body["record"] is None
 
 
+def test_completed_run_telemetry_identity_must_match_authoritative_state(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "77777777777777777777777777777777"
+    payload = person1_telemetry(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    payload["experiment_id"] = "88888888888888888888888888888888"
+    write_completed_run(run_root, run_id, "normal", [json.dumps(payload) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "unavailable"
+    assert response["record"] is None
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-10-25T09:00:00"])
+def test_completed_run_rejects_invalid_or_timezone_naive_measurement_timestamps(tmp_path, monkeypatch, timestamp):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "9" * 32
+    payload = person1_telemetry(timestamp)
+    payload["experiment_id"] = run_id
+    write_completed_run(run_root, run_id, "normal", [json.dumps(payload) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "unavailable"
+    assert response["record"] is None
+
+
 def test_multiple_runs_choose_newest_valid_complete_measurement(tmp_path, monkeypatch):
     run_root = tmp_path / ".adaptive-qos-runs"
     older = json.dumps(person1_telemetry("2020-01-01T10:00:00Z")) + "\n"
@@ -432,6 +525,51 @@ def test_multiple_runs_choose_newest_valid_complete_measurement(tmp_path, monkey
     assert body["status"] == "stale"  # historical fixture timestamps are never made fresh
     assert body["record"]["throughput_mbps"] == 2.997
     assert body["record"]["timestamp"] == "2020-01-01T10:01:00Z"
+
+
+def test_fresh_auto_discovery_chooses_newest_metadata_bound_run_and_pinned_stale_file_is_not_mixed(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    now = datetime.now(timezone.utc)
+    older_id = "a" * 32
+    newer_id = "b" * 32
+    older_record = person1_telemetry((now - timedelta(seconds=90)).isoformat())
+    older_record["experiment_id"] = older_id
+    newer_record = person1_telemetry((now - timedelta(seconds=10)).isoformat())
+    newer_record.update(experiment_id=newer_id, throughput_mbps=2.997)
+    write_completed_run(run_root, older_id, "normal", [json.dumps(older_record) + "\n"])
+    write_completed_run(run_root, newer_id, "normal", [json.dumps(newer_record) + "\n"])
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    pinned = tmp_path / "pinned.jsonl"
+    pinned.write_text(json.dumps(person1_telemetry("2026-10-20T12:47:37.243232+00:00")) + "\n", encoding="utf-8")
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(pinned))
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "stale"
+    assert response["record"]["experiment_id"] == "run-1"
+    assert "Clear that setting" in response["message"]
+
+    monkeypatch.delenv(api.TELEMETRY_FILE_ENV)
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "available"
+    assert response["record"]["experiment_id"] == newer_id
+    assert response["record"]["timestamp"] == newer_record["timestamp"]
+
+
+def test_completed_run_rejects_measurement_after_authoritative_finish(tmp_path, monkeypatch):
+    run_root = tmp_path / ".adaptive-qos-runs"
+    run_id = "c" * 32
+    payload = person1_telemetry(datetime.now(timezone.utc).isoformat())
+    payload["experiment_id"] = run_id
+    run_dir = write_completed_run(run_root, run_id, "normal", [json.dumps(payload) + "\n"])
+    state_path = run_dir / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["finished_at"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(api, "EXPERIMENT_RUN_ROOT", run_root)
+
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "unavailable"
+    assert response["record"] is None
 
 
 def test_telemetry_symlink_is_rejected(tmp_path, monkeypatch):
@@ -466,7 +604,9 @@ def test_report_listing_and_detail_return_sanitized_runner_projection(tmp_path, 
     body = response.json()
     assert body["runner_records"][0]["prediction"] == "MEDIUM"
     assert body["runner_records"][0]["confidence"] == 0.8
-    assert body["runner_records"][0]["flow_allocations_mbps"] == {"5201": 3.6}
+    assert body["runner_records"][0]["freshness_status"] == "stale"
+    assert body["runner_records"][0]["flow_allocations_mbps"] == {"5201": 3.6, "5202": 2.7, "5203": 1.8, "5204": 0.9}
+    assert body["runner_records"][0]["unmatched_rate_mbps"] == 1.0
     assert body["comparison_ready"] is False
     assert "model_path" not in response.text
     assert "D:\\private" not in response.text
@@ -515,6 +655,9 @@ def test_report_symlink_escape_is_not_listed_or_opened(tmp_path, monkeypatch):
     listed = client.get("/api/reports").json()["reports"]
     assert listed == [{
         "report_id": "escaped",
+        "created_at": None,
+        "input_record_count": None,
+        "freshness_status": "unknown",
         "report_type": "unknown",
         "status": "invalid",
         "campaign_status": None,
@@ -565,8 +708,58 @@ def test_campaign_completeness_never_implies_alignment_eligibility(tmp_path, mon
 
 def test_missing_report_directory_is_explicitly_unavailable(tmp_path, monkeypatch):
     monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(tmp_path / "missing"))
-    assert client.get("/api/reports").status_code == 503
-    assert client.get("/api/experiments/status").status_code == 503
+    body = client.get("/api/reports").json()
+    assert body["status"] == "unavailable"
+    assert body["directory_status"] == "invalid"
+    assert "does not exist" in body["message"]
+
+
+def test_report_directory_states_are_explicit_and_env_is_read_per_request(tmp_path, monkeypatch):
+    monkeypatch.delenv(api.REPORT_DIRECTORY_ENV, raising=False)
+    unset = client.get("/api/reports").json()
+    assert unset["directory_status"] == "unset"
+    assert "unset" in unset["message"]
+
+    directory = tmp_path / "approved"
+    directory.mkdir()
+    monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(directory))
+    empty = client.get("/api/reports").json()
+    assert empty["directory_status"] == "valid"
+    assert empty["reports"] == []
+    assert "contains no compatible reports" in empty["message"]
+
+    monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(api.Path(__file__).resolve().parents[1]))
+    rejected = client.get("/api/reports").json()
+    assert rejected["directory_status"] == "invalid"
+    assert "outside the repository" in rejected["message"]
+    assert str(api.Path(__file__).resolve().parents[1]) not in rejected["message"]
+
+
+def test_inaccessible_report_directory_has_distinct_status(tmp_path, monkeypatch):
+    directory = tmp_path / "no-read"
+    directory.mkdir()
+    monkeypatch.setenv(api.REPORT_DIRECTORY_ENV, str(directory))
+    original_access = api.os.access
+    monkeypatch.setattr(api.os, "access", lambda path, mode: False if Path(path) == directory else original_access(path, mode))
+    response = client.get("/api/reports").json()
+    assert response["directory_status"] == "inaccessible"
+    assert response["reports"] == []
+
+
+def test_invalid_configured_telemetry_does_not_mix_completed_run_discovery(tmp_path, monkeypatch):
+    configured = tmp_path / "broken.jsonl"
+    configured.write_text("{broken\n", encoding="utf-8")
+    monkeypatch.setenv(api.TELEMETRY_FILE_ENV, str(configured))
+    monkeypatch.setattr(api, "_completed_experiment_telemetry", lambda **_kwargs: [
+        (api.datetime.now(api.timezone.utc), {
+            "timestamp": api.datetime.now(api.timezone.utc).isoformat(),
+            "experiment_id": "a" * 32, "scenario": "normal", "source": "h1",
+        })
+    ])
+    response = client.get("/api/telemetry/latest").json()
+    assert response["status"] == "unavailable"
+    assert response["source"] == "configured_person1_jsonl"
+    assert "not mixed" in response["message"]
 
 
 def test_listing_never_exposes_json_payload_or_absolute_paths(tmp_path, monkeypatch):

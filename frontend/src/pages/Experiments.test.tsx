@@ -70,6 +70,7 @@ beforeEach(() => {
   root = createRoot(container);
   reportsMock.mockReset().mockResolvedValue({
     status: "available",
+    directory_status: "valid",
     message: "Configured reports.",
     reports: [],
   });

@@ -106,6 +106,9 @@ def test_adaptive_runner_uses_existing_prediction_and_allocation_path(
     }
     assert report["status"] == "planned"
     assert adaptive["status"] == "planned"
+    assert adaptive["total_bandwidth_mbps"] == 10.0
+    assert sum(adaptive["policy_percentages"].values()) == 100.0
+    assert set(adaptive["policy_percentages"]) == {"gaming", "video", "web", "bulk"}
     assert adaptive["prediction"]["congestion"] in {"LOW", "MEDIUM", "HIGH"}
     assert 0 <= adaptive["prediction"]["confidence"] <= 1
     assert set(adaptive["input_features"]) == {
@@ -698,13 +701,13 @@ def test_runner_exclusive_creation_rejects_concurrent_output_creation(
     source = tmp_path / "input.jsonl"
     write_jsonl(source, [telemetry_record()])
     output = tmp_path / "report.json"
-    original_open = safe_outputs.open_exclusive_text
+    original_write = safe_outputs.write_exclusive_text
 
-    def concurrent_create(path, *, newline=None):
+    def concurrent_create(path, content):
         output.write_text("created concurrently", encoding="utf-8")
-        return original_open(path, newline=newline)
+        return original_write(path, content)
 
-    monkeypatch.setattr(experiment_runner, "open_exclusive_text", concurrent_create)
+    monkeypatch.setattr(experiment_runner, "write_exclusive_text", concurrent_create)
     with pytest.raises(FileExistsError):
         experiment_runner.run_experiment(source, output, mode="baseline")
     assert output.read_text(encoding="utf-8") == "created concurrently"

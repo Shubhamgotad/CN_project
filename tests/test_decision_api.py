@@ -42,12 +42,14 @@ def write_congestion_run(root: Path, run_id: str, rows: list[dict]) -> Path:
     run_dir = root / run_id
     output = run_dir / "output"
     output.mkdir(parents=True)
+    finished_at = max(datetime.fromisoformat(row["timestamp"]) for row in rows)
     (run_dir / "state.json").write_text(json.dumps({
         "experiment_id": run_id,
         "scenario": "congestion",
         "status": "completed",
         "process_alive": False,
         "process_exit_code": 0,
+        "finished_at": finished_at.isoformat(),
     }), encoding="utf-8")
     (output / "congestion.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),

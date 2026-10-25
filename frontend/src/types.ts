@@ -32,7 +32,10 @@ export interface ImportedPlanRecord {
   freshnessAgeSeconds: number | null;
   prediction: CongestionClass | null;
   confidence: number | null;
+  totalBandwidthMbps: number | null;
+  policyPercentages: Record<string, number> | null;
   flowAllocationsMbps: Record<string, number> | null;
+  unmatchedRateMbps: number | null;
   serviceAllocationsMbps: Record<string, number> | null;
   inputFeatures: Record<string, number> | null;
   measured: Record<string, MetricValue>;

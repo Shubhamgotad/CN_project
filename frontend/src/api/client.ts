@@ -145,11 +145,13 @@ export interface ApiQosDryRunDecision {
   applied: false;
   execution_state: "dry_run";
   application_enabled: boolean;
+  application_blockers: Array<"application_disabled" | "exclusive_tc_ownership_unavailable">;
   telemetry_status: ApiTelemetry["status"];
   telemetry_source: ApiTelemetry["source"];
   measurement_age_seconds: number | null;
   measurement: {
     timestamp: string;
+    experiment_id?: string | null;
     source: string;
     scenario: string;
     interface: string;
@@ -225,6 +227,9 @@ export class ApiRequestError extends Error {
 
 export interface ApiReportSummary {
   report_id: string;
+  created_at: string | null;
+  input_record_count: number | null;
+  freshness_status: "fresh" | "stale" | "future" | "unknown";
   report_type: "experiment-runner" | "evidence-analysis" | "campaign-validation" | "unknown";
   status: string;
   campaign_status: string | null;
@@ -234,6 +239,7 @@ export interface ApiReportSummary {
 
 export interface ApiReports {
   status: "available" | "unavailable";
+  directory_status: "unset" | "invalid" | "inaccessible" | "valid";
   message: string;
   reports: ApiReportSummary[];
 }
@@ -266,8 +272,11 @@ export interface ApiReportDetail {
     confidence: number | null;
     input_features: Record<string, number>;
     measured: Record<string, number | null>;
+    total_bandwidth_mbps: number | null;
+    policy_percentages: Record<string, number>;
     service_allocations_mbps: Record<string, number>;
     flow_allocations_mbps: Record<string, number>;
+    unmatched_rate_mbps: number | null;
     planning_only: true;
   }>;
   trials: Array<{
@@ -522,7 +531,10 @@ export function apiReportToRunnerReport(detail: ApiReportDetail): ImportedRunner
       freshnessAgeSeconds: item.freshness_age_seconds,
       prediction: item.prediction,
       confidence: item.confidence,
+      totalBandwidthMbps: item.total_bandwidth_mbps,
+      policyPercentages: item.policy_percentages,
       flowAllocationsMbps: item.flow_allocations_mbps,
+      unmatchedRateMbps: item.unmatched_rate_mbps,
       serviceAllocationsMbps: item.service_allocations_mbps,
       inputFeatures: item.input_features,
       measured: item.measured,
@@ -579,7 +591,7 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
-function parsePlanRecord(value: unknown, index: number): ImportedPlanRecord {
+function parsePlanRecord(value: unknown, index: number, nowMs: number): ImportedPlanRecord {
   const result = object(value, `results[${index}]`);
   const modes = result.modes !== null && typeof result.modes === "object"
     && !Array.isArray(result.modes)
@@ -594,7 +606,18 @@ function parsePlanRecord(value: unknown, index: number): ImportedPlanRecord {
     : object(adaptive.prediction, `results[${index}].modes.adaptive.prediction`);
   const confidence = prediction ? finiteNumber(prediction.confidence) : null;
   const window = object(result.window ?? {}, `results[${index}].window`);
-  const freshness = object(result.freshness ?? {}, `results[${index}].freshness`);
+  const timestamp = optionalString(window.timestamp);
+  let freshnessStatus = "unknown";
+  let freshnessAgeSeconds: number | null = null;
+  if (timestamp) {
+    const measuredAt = Date.parse(timestamp);
+    if (Number.isFinite(measuredAt) && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp)) {
+      freshnessAgeSeconds = (nowMs - measuredAt) / 1000;
+      freshnessStatus = freshnessAgeSeconds > 300
+        ? "stale"
+        : freshnessAgeSeconds < -30 ? "future" : "fresh";
+    }
+  }
 
   return {
     line: finiteNumber(result.line) ?? index + 1,
@@ -602,12 +625,15 @@ function parsePlanRecord(value: unknown, index: number): ImportedPlanRecord {
     experimentId: optionalString(result.experiment_id),
     scenario: optionalString(result.scenario),
     source: optionalString(result.source),
-    timestamp: optionalString(window.timestamp),
-    freshnessStatus: optionalString(freshness.status) ?? "not evaluated",
-    freshnessAgeSeconds: finiteNumber(freshness.age_seconds),
+    timestamp,
+    freshnessStatus,
+    freshnessAgeSeconds,
     prediction: className(prediction?.congestion),
     confidence: confidence !== null && confidence >= 0 && confidence <= 1 ? confidence : null,
+    totalBandwidthMbps: finiteNumber(adaptive.total_bandwidth_mbps),
+    policyPercentages: numberMap(adaptive.policy_percentages),
     flowAllocationsMbps: numberMap(adaptive.flow_allocations_mbps),
+    unmatchedRateMbps: finiteNumber(object(adaptive.unmatched_leaf ?? {}, `results[${index}].modes.adaptive.unmatched_leaf`).rate_mbps),
     serviceAllocationsMbps: numberMap(adaptive.service_class_allocation_mbps),
     inputFeatures: numberMap(adaptive.input_features),
     measured: metricMap(result.measured),
@@ -615,7 +641,7 @@ function parsePlanRecord(value: unknown, index: number): ImportedPlanRecord {
   };
 }
 
-export function parseRunnerReport(text: string): ImportedRunnerReport {
+export function parseRunnerReport(text: string, nowMs = Date.now()): ImportedRunnerReport {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text) as unknown;
@@ -640,7 +666,7 @@ export function parseRunnerReport(text: string): ImportedRunnerReport {
   if (!Array.isArray(report.results)) {
     throw new Error("The runner report is missing its results array.");
   }
-  const records = report.results.map(parsePlanRecord);
+  const records = report.results.map((record, index) => parsePlanRecord(record, index, nowMs));
   if (!records.length) {
     throw new Error("The runner report contains no records to display.");
   }

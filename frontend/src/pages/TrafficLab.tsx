@@ -1,7 +1,7 @@
 import { AlertCircle, Check, CircleStop, FlaskConical, Play, Radio, ShieldAlert, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { getActiveTrafficExecution, getLatestTelemetry, getTrafficExecution, startTrafficExecution, stopTrafficExecution } from "../api/client";
-import type { ApiExecution, ApiTelemetry, ExecutionScenario } from "../api/client";
+import { getActiveTrafficExecution, getLatestTelemetry, getTopology, getTrafficExecution, startTrafficExecution, stopTrafficExecution } from "../api/client";
+import type { ApiExecution, ApiTelemetry, ApiTopology, ExecutionScenario } from "../api/client";
 import { CLIENT_FLOWS } from "../data/demo";
 import type { FlowId } from "../types";
 
@@ -39,6 +39,7 @@ export function TrafficLab() {
   const [telemetryError, setTelemetryError] = useState("");
   const [telemetryLoading, setTelemetryLoading] = useState(true);
   const [telemetryCheckedAt, setTelemetryCheckedAt] = useState<string | null>(null);
+  const [topology, setTopology] = useState<ApiTopology | null>(null);
   const [execution, setExecution] = useState<ApiExecution | null>(null);
   const [executionError, setExecutionError] = useState("");
   const [executionLoading, setExecutionLoading] = useState(true);
@@ -75,6 +76,16 @@ export function TrafficLab() {
       active = false;
       if (timer !== undefined) clearTimeout(timer);
     };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void getTopology().then((result) => {
+      if (active) setTopology(result);
+    }).catch(() => {
+      if (active) setTopology(null);
+    });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -128,6 +139,10 @@ export function TrafficLab() {
       : CLIENT_FLOWS.filter((flow) => flow.id === selectedFlow),
     [scenario, selectedFlow],
   );
+  const bottleneckCapacity = topology?.links.find((link) =>
+    link.source === "s1" && link.target === "s2",
+  )?.bandwidth_mbps ?? null;
+  const plannedOfferedLoad = rate * plannedFlows.length;
   const selectedSourceHost = scenario === "congestion" ? selectedFlow : selectedFlow === "all" ? "h1" : selectedFlow;
   const executionPlanHelp = scenario === "congestion" && selectedFlow === "all"
     ? "All flows plans four concurrent UDP flows: h1–h4 on UDP 5201–5204."
@@ -285,6 +300,8 @@ export function TrafficLab() {
             </div>
             <div className="traffic-telemetry__metrics" aria-label={`${telemetryStatusLabel(telemetry.status)} measurements`}>
               <span>Throughput <strong>{metric(telemetry.record.throughput_mbps, "Mbps")}</strong></span>
+              <span>Measured utilization <strong>{metric(telemetry.record.utilization_percent ?? null, "%")}</strong></span>
+              <span>Capacity denominator <strong>{metric(telemetry.record.bandwidth_mbps ?? null, "Mbps")}</strong></span>
               <span>Latency <strong>{metric(telemetry.record.latency_ms, "ms")}</strong></span>
               <span>Jitter <strong>{metric(telemetry.record.jitter_ms, "ms")}</strong></span>
               <span>Packet loss <strong>{metric(telemetry.record.packet_loss_percent, "%")}</strong></span>
@@ -356,6 +373,9 @@ export function TrafficLab() {
               <span className="input-with-unit"><input type="number" min="1" max="60" step="1" value={duration} disabled={scenario === "burst"} onChange={(event) => { setDuration(Number(event.target.value)); setPreviewed(false); }} /><span>sec</span></span>
             </label>
           </div>
+          <p className="field-help traffic-capacity-note" role="note">
+            Configured s1–s2 bottleneck: {bottleneckCapacity === null ? "unavailable from topology API" : `${bottleneckCapacity} Mbps`}. Selected offered load: {rate} Mbps/flow × {plannedFlows.length} configured flow{plannedFlows.length === 1 ? "" : "s"} = {plannedOfferedLoad.toFixed(1)} Mbps aggregate. This is the sender target, not measured throughput; actual measurements are shown above.
+          </p>
           {validationReason && <p className="field-help" role="status">{validationReason}</p>}
 
           {error && <div className="inline-error" role="alert"><AlertCircle size={16} />{error}</div>}
@@ -388,7 +408,7 @@ export function TrafficLab() {
           {!executionLoading && !execution && !executionError && <p className="api-data-card__message" role="status">No guarded traffic experiment has been started.</p>}
           {execution && <div className={`execution-state execution-state--${execution.status}`} role="status">
             <strong>{execution.status[0].toUpperCase() + execution.status.slice(1)}</strong>
-            <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps per flow · {execution.duration_seconds}s</span>
+            <span>{SCENARIOS[execution.scenario].label} · API-reported source: {execution.source_host === null ? "Not recorded" : execution.source_host === "all" ? "All flows" : execution.source_host} · Actual flows: {execution.flows.join(", ")} · {execution.target_rate_mbps} Mbps offered per flow · {(execution.target_rate_mbps * execution.flows.length).toFixed(1)} Mbps aggregate offered · {execution.duration_seconds}s</span>
             <span>Elapsed {execution.elapsed_seconds.toFixed(1)}s{execution.process_exit_code !== null ? ` · Process exit ${execution.process_exit_code}` : ""}</span>
             {!TERMINAL_STATES.has(execution.status) && (
               <div className="execution-progress">

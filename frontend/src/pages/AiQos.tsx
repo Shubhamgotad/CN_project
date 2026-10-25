@@ -29,6 +29,7 @@ import { PROFILE_ALLOCATIONS } from "../data/demo";
 import type { CongestionClass, ImportedRunnerReport } from "../types";
 
 const PROFILE_NAMES: CongestionClass[] = ["LOW", "MEDIUM", "HIGH"];
+const PROFILE_TOTAL_Mbps = Object.values(PROFILE_ALLOCATIONS.LOW).reduce((total, rate) => total + rate, 0);
 
 interface AiQosProps {
   report: ImportedRunnerReport | null;
@@ -43,9 +44,13 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
   const [apiReports, setApiReports] = useState<ApiReportSummary[]>([]);
   const [apiReportMessage, setApiReportMessage] = useState("");
   const [apiError, setApiError] = useState("");
+  const [apiDirectoryStatus, setApiDirectoryStatus] = useState<"unset" | "invalid" | "inaccessible" | "valid" | null>(null);
+  const [loadingReports, setLoadingReports] = useState(true);
   const [loadingReport, setLoadingReport] = useState("");
   const [dryRunDecision, setDryRunDecision] = useState<ApiQosDryRunDecision | null>(null);
   const [decisionError, setDecisionError] = useState("");
+  const [refreshingDecision, setRefreshingDecision] = useState(false);
+  const [decisionRefreshCount, setDecisionRefreshCount] = useState(0);
   const [qosStatus, setQosStatus] = useState<ApiQosApplicationStatus | null>(null);
   const [applicationState, setApplicationState] = useState<
     "dry_run" | "pending_authorization" | "applying" | "applied_verified" | "failed" | "verification_failed"
@@ -53,6 +58,41 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
   const [authorizationChecked, setAuthorizationChecked] = useState(false);
   const [applicationError, setApplicationError] = useState("");
   const record = report?.records[selectedRecord] ?? report?.records[0] ?? null;
+  const profileBudgetMbps = dryRunDecision?.proposed_policy?.total_bandwidth_mbps ?? PROFILE_TOTAL_Mbps;
+  const allocationServices = record?.serviceAllocationsMbps;
+  const budgetTotal = record?.totalBandwidthMbps;
+  const policyWeights = record?.policyPercentages;
+  const validPolicyWeights = Boolean(
+    policyWeights
+    && ["gaming", "video", "web", "bulk"].every((key) => Number.isFinite(policyWeights[key]) && policyWeights[key] >= 0)
+    && Math.abs(Object.values(policyWeights).reduce((sum, value) => sum + value, 0) - 100) < 0.011
+    && allocationServices && record?.unmatchedRateMbps !== null && record?.unmatchedRateMbps !== undefined
+    && ["gaming", "video", "web", "bulk"].every((key) =>
+      Math.abs(allocationServices[key] - (budgetTotal! - record!.unmatchedRateMbps!) * policyWeights[key] / 100) < 0.011),
+  );
+  const completeBudget = Boolean(
+    allocationServices && budgetTotal !== null && budgetTotal !== undefined && budgetTotal > 0
+    && record?.unmatchedRateMbps !== null && record?.unmatchedRateMbps !== undefined
+    && ["gaming", "video", "web", "bulk"].every((key) => Number.isFinite(allocationServices[key]))
+    && Math.abs(Object.values(allocationServices).reduce((sum, value) => sum + value, 0)
+      + record!.unmatchedRateMbps! - budgetTotal) < 0.011,
+  );
+
+  async function refreshReports() {
+    setLoadingReports(true);
+    setApiError("");
+    try {
+      const response = await getReports();
+      setApiReports(response.reports.filter((item) => item.report_type === "experiment-runner"));
+      setApiReportMessage(response.message);
+      setApiDirectoryStatus(response.directory_status);
+    } catch (reason) {
+      setApiReports([]);
+      setApiError(reason instanceof Error ? reason.message : "Could not list API reports.");
+    } finally {
+      setLoadingReports(false);
+    }
+  }
 
   useEffect(() => {
     if (!backendConnection.baseUrl) return;
@@ -61,9 +101,14 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       if (active) {
         setApiReports(response.reports.filter((item) => item.report_type === "experiment-runner"));
         setApiReportMessage(response.message);
+        setApiDirectoryStatus(response.directory_status);
+        setLoadingReports(false);
       }
     }).catch((reason: unknown) => {
-      if (active) setApiError(reason instanceof Error ? reason.message : "Could not list API reports.");
+      if (active) {
+        setApiError(reason instanceof Error ? reason.message : "Could not list API reports.");
+        setLoadingReports(false);
+      }
     });
     return () => {
       active = false;
@@ -97,6 +142,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
     const refreshDecision = async () => {
       if (pending) return;
       pending = true;
+      setRefreshingDecision(true);
       try {
         const response = await getQosDryRunDecision();
         if (active) {
@@ -110,6 +156,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
         }
       } finally {
         pending = false;
+        if (active) setRefreshingDecision(false);
       }
     };
     void refreshDecision();
@@ -118,7 +165,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [decisionRefreshCount]);
 
   async function importReport(file?: File) {
     if (!file) return;
@@ -224,21 +271,23 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           <h1>AI & QoS</h1>
           <p>Inspect real offline runner output separately from policy execution status.</p>
         </div>
-        <span className="status-pill status-pill--muted"><ShieldCheck size={14} /> Planning · authorized application</span>
+        <span className="status-pill status-pill--muted"><ShieldCheck size={14} /> Planning · application safety-gated</span>
       </section>
 
       {backendConnection.baseUrl && (
         <section className="card api-report-card">
           <div className="section-heading">
-            <div><h2>Configured prediction reports</h2><p>Read-only sanitized runner plans from the configured report directory.</p></div>
-            <span className="status-pill status-pill--muted">Read-only API</span>
+            <div><h2>Configured prediction reports</h2><p>Validated offline saved-model plans discovered by the backend. Import JSON below remains available as a manual alternative.</p></div>
+            <button className="button button--secondary" type="button" onClick={() => void refreshReports()} disabled={loadingReports}>
+              {loadingReports ? "Refreshing…" : "Refresh reports"}
+            </button>
           </div>
           {apiError && <div className="inline-error" role="alert">{apiError}</div>}
           {apiReports.length ? (
             <div className="api-report-list">
               {apiReports.map((item) => (
                 <div className="api-report-row" key={item.report_id}>
-                  <span><strong>{item.report_id}</strong><small>experiment-runner · {item.status} · planning only</small></span>
+                    <span><strong>{item.report_id}</strong><small>experiment-runner · {item.status} · freshness {item.freshness_status} · {item.input_record_count ?? "?"} input records · {item.created_at ?? "creation time unavailable"} · planning only</small></span>
                   <button
                     className="button button--secondary"
                     type="button"
@@ -250,10 +299,15 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
                 </div>
               ))}
             </div>
+          ) : loadingReports ? (
+            <p className="api-report-empty" role="status">Loading configured reports…</p>
           ) : (
-            <p className="api-report-empty">
-              {apiError || apiReportMessage || "No experiment-runner reports are available through the configured API."}
-            </p>
+            <div className="api-report-empty" role={apiError || apiDirectoryStatus !== "valid" ? "alert" : "status"}>
+              <p>{apiError || apiReportMessage || "No experiment-runner reports are available."}</p>
+              {apiError && <button className="button button--secondary" type="button" onClick={() => void refreshReports()} disabled={loadingReports}>Retry report list</button>}
+              {apiDirectoryStatus && apiDirectoryStatus !== "valid" && <strong>Report directory status: {apiDirectoryStatus}</strong>}
+              {apiDirectoryStatus === "valid" && !apiError && apiReports.length === 0 && <strong>No compatible reports in the valid configured directory.</strong>}
+            </div>
           )}
         </section>
       )}
@@ -269,6 +323,14 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
               ? `Telemetry ${dryRunDecision.telemetry_status} · ${dryRunDecision.measurement_age_seconds?.toFixed(1) ?? "?"}s old`
               : decisionError ? "Decision API error" : `No decision · ${dryRunDecision?.telemetry_status ?? "loading"}`}
           </span>
+          <button
+            className="button button--secondary"
+            type="button"
+            disabled={refreshingDecision}
+            onClick={() => setDecisionRefreshCount((count) => count + 1)}
+          >
+            {refreshingDecision ? "Refreshing live telemetry…" : "Refresh live telemetry"}
+          </button>
         </div>
         {decisionError ? (
           <p className="inline-error" role="alert">{decisionError}</p>
@@ -308,16 +370,19 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
             <div className="qos-dry-run-measurement">
               <strong>Validated measurement</strong>
               <span>Record source: {dryRunDecision.telemetry_source}</span>
+              <span>Live experiment: {dryRunDecision.measurement.experiment_id ?? "identity unavailable"}</span>
               <span>{dryRunDecision.measurement.source} · {dryRunDecision.measurement.scenario} · {dryRunDecision.measurement.interface}</span>
+              <span>Configured bottleneck capacity: {dryRunDecision.measurement.bandwidth_mbps} Mbps</span>
               <span>{new Date(dryRunDecision.measurement.timestamp).toLocaleString()} · {dryRunDecision.measurement.throughput_mbps.toFixed(3)} Mbps throughput · {dryRunDecision.measurement.utilization_percent.toFixed(2)}% utilization</span>
               <span>{dryRunDecision.measurement.latency_ms.toFixed(3)} ms latency · {dryRunDecision.measurement.jitter_ms.toFixed(3)} ms jitter · {dryRunDecision.measurement.packet_loss_percent.toFixed(3)}% loss</span>
             </div>
             <div className="qos-dry-run-policy">
-              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>{dryRunDecision.proposed_policy.interface} · {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps root · currently proposed, not an applied-state claim</span></div>
+              <div><strong>Proposed {dryRunDecision.selected_profile} HTB profile</strong><span>Proposed QoS allocation budget: {dryRunDecision.proposed_policy.total_bandwidth_mbps.toFixed(1)} Mbps · {dryRunDecision.proposed_policy.interface} · currently proposed, not an applied-state claim</span></div>
               <div className="qos-dry-run-rates">
                 {Object.entries(dryRunDecision.proposed_policy.service_allocations_mbps).map(([service, rate]) => <span key={service}>{service}: {rate.toFixed(2)} Mbps</span>)}
                 <span>unmatched: {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(2)} Mbps</span>
               </div>
+              <p className="field-help">The managed profile reserves {dryRunDecision.proposed_policy.unmatched_rate_mbps.toFixed(1)} Mbps for unmatched traffic; the remaining {Object.values(dryRunDecision.proposed_policy.service_allocations_mbps).reduce((total, rate) => total + rate, 0).toFixed(1)} Mbps is shared by the service classes. Each class ceiling equals its configured rate, so unused capacity may not be borrowed by other classes.</p>
               <details><summary>Show proposed tc commands ({applicationState === "applied_verified" ? "controller applied and verified" : "not executed"})</summary><pre>{dryRunDecision.tc_commands.join("\n")}</pre></details>
             </div>
             <div className="qos-dry-run-explanation"><strong>Why this profile</strong><ul>{dryRunDecision.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
@@ -363,12 +428,14 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
                   || applicationState === "applying"
                 }
                 onClick={requestApplicationAuthorization}
+                aria-describedby={!dryRunDecision.application_enabled ? "apply-qos-disabled-reason" : undefined}
+                title={!dryRunDecision.application_enabled ? dryRunDecision.application_blockers.join(", ") : undefined}
               >
                 {applicationState === "applying" ? "Applying…" : "Apply QoS Profile"}
               </button>
             )}
             {!dryRunDecision.application_enabled && (
-              <p className="qos-dry-run-note">Application is disabled by default. Set ADAPTIVE_QOS_ENABLE_APPLICATION=1 only for a trusted local lab.</p>
+              <p className="qos-dry-run-note" id="apply-qos-disabled-reason">Apply is disabled: {dryRunDecision.application_blockers.map((blocker) => blocker === "application_disabled" ? "ADAPTIVE_QOS_ENABLE_APPLICATION is not enabled. " : "The backend does not guarantee exclusive tc ownership (LIVE_TC_OWNERSHIP_GUARANTEED=false). ").join("") || "The backend has not confirmed all application safety gates."} Exclusive ownership, verified preflight/readback, and reliable restoration are required before live application is safe.</p>
             )}
             {dryRunDecision.candidate_profile && (
               <p className="qos-dry-run-note">Application is disabled while the candidate profile awaits hysteresis and cooldown stabilization.</p>
@@ -418,7 +485,13 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
           {record ? (
             <>
               <strong className="state-main-value">{record.source ?? "Source unavailable"}</strong>
-              <p>{record.scenario ?? "Scenario unavailable"} · {record.timestamp ?? "Timestamp unavailable"}</p>
+              <p>Experiment {record.experimentId ?? "unavailable"} · {record.scenario ?? "Scenario unavailable"}</p>
+              <p>Measurement {record.timestamp ?? "Timestamp unavailable"}</p>
+              <p>Report source host: {record.source ?? "unknown"}{dryRunDecision?.measurement?.experiment_id && record.experimentId !== dryRunDecision.measurement.experiment_id
+                ? " · different from the live telemetry experiment"
+                : dryRunDecision?.measurement?.experiment_id && record.experimentId === dryRunDecision.measurement.experiment_id
+                  ? " · matches the live telemetry experiment ID"
+                  : " · live experiment identity unavailable for comparison"}</p>
               <span className={`status-pill ${record.freshnessStatus === "fresh" ? "status-pill--surface" : "status-pill--muted"}`}>
                 Freshness: {record.freshnessStatus}
                 {record.freshnessAgeSeconds !== null ? ` · ${record.freshnessAgeSeconds.toFixed(0)}s` : ""}
@@ -472,7 +545,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       {report && (
         <section className="card plan-card">
           <div className="section-heading">
-            <div><h2>Imported plan details</h2><p>Run {report.runId} · {report.status} · mode {report.mode}</p></div>
+            <div><h2>{reportSource === "api" ? "Discovered offline plan details" : "Imported offline plan details"}</h2><p>Report {report.runId} · {report.status} · mode {report.mode} · {report.records.length} input records · importing does not rerun prediction</p></div>
             {report.records.length > 1 && (
               <label className="record-select">Record
                 <select value={selectedRecord} onChange={(event) => setSelectedRecord(Number(event.target.value))}>
@@ -482,6 +555,23 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
             )}
           </div>
           {record?.flowAllocationsMbps ? (
+            <>
+            {completeBudget ? (
+              <div className="plan-budget" aria-label={`Planned allocation total ${budgetTotal!.toFixed(2)} of ${budgetTotal!.toFixed(2)} megabits per second`}>
+                <div className="plan-budget__heading"><strong>Planned budget · {budgetTotal!.toFixed(2)} Mbps total</strong><span>{(budgetTotal! - record!.unmatchedRateMbps!).toFixed(2)} Mbps services + {record!.unmatchedRateMbps!.toFixed(2)} Mbps unmatched</span></div>
+                <div className="plan-budget__bar" role="img" aria-label="Stacked proposed allocation by traffic class">
+                  {(["gaming", "video", "web", "bulk", "unmatched"] as const).map((key) => {
+                    const amount = key === "unmatched" ? record!.unmatchedRateMbps! : allocationServices![key];
+                    const title = `${key}: ${amount.toFixed(2)} Mbps`;
+                    return <span key={key} title={title} aria-label={title} style={{ width: `${amount / budgetTotal! * 100}%` }} />;
+                  })}
+                </div>
+                <p>{validPolicyWeights && policyWeights
+                  ? `Planner rationale: service-pool weights gaming ${policyWeights.gaming}%, video ${policyWeights.video}%, web ${policyWeights.web}%, bulk ${policyWeights.bulk}%. Rates are planned and not applied.`
+                  : "Budget is balanced; policy weighting rationale was not included in this report."}</p>
+                <p>The unmatched reserve is separate from the service pool. Each class ceiling equals its configured rate, so unused capacity may not be borrowed by another class.</p>
+              </div>
+            ) : <p className="empty-inline">Total budget and allocation rationale are unavailable or inconsistent in this report.</p>}
             <div className="allocation-table-wrap">
               <table className="data-table">
                 <thead><tr><th>Flow / port</th><th>Service</th><th>Planned allocation</th><th>Execution</th></tr></thead>
@@ -490,10 +580,11 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
                     const serviceByPort: Record<string, string> = { "5201": "Gaming", "5202": "Video", "5203": "Web", "5204": "Bulk" };
                     return <tr key={port}><td>UDP {port}</td><td>{serviceByPort[port] ?? "Unmapped"}</td><td>{allocation.toFixed(2)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>;
                   })}
-                  <tr><td>Default class 1:15</td><td>Unmatched</td><td>{record.prediction ? PROFILE_ALLOCATIONS[record.prediction].unmatched.toFixed(2) : "1.00"} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>
+                  {record.unmatchedRateMbps !== null && <tr><td>Default class 1:15</td><td>Unmatched</td><td>{record.unmatchedRateMbps.toFixed(2)} Mbps</td><td><span className="status-pill status-pill--muted">Not applied</span></td></tr>}
                 </tbody>
               </table>
             </div>
+            </>
           ) : (
             <div className="empty-inline"><CircleHelp size={18} /><span>This record has no adaptive flow allocation plan.</span></div>
           )}
@@ -504,8 +595,8 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
       )}
 
       <section className="section-heading dashboard-section-heading">
-        <div><h2>Available managed profiles</h2><p>Allocations from the existing planner; rates are not evidence of applied bandwidth.</p></div>
-        <span className="status-pill status-pill--surface">10 Mbps total incl. unmatched</span>
+        <div><h2>Available managed profiles</h2><p>Each profile splits a {(PROFILE_TOTAL_Mbps - PROFILE_ALLOCATIONS.LOW.unmatched).toFixed(1)} Mbps service pool using its class weights and reserves {PROFILE_ALLOCATIONS.LOW.unmatched.toFixed(1)} Mbps for unmatched traffic. Class ceilings equal their configured rates, so unused capacity may not be borrowed; these planned rates are not evidence of applied bandwidth.</p></div>
+        <span className="status-pill status-pill--surface">{profileBudgetMbps.toFixed(0)} Mbps total incl. unmatched</span>
       </section>
       <div className="profile-grid">
         {PROFILE_NAMES.map((profile) => (

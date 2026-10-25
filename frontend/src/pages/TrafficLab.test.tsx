@@ -1,19 +1,21 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ApiTelemetry } from "../api/client";
-import { getActiveTrafficExecution, getLatestTelemetry, getTrafficExecution, startTrafficExecution, stopTrafficExecution } from "../api/client";
+import type { ApiTelemetry, ApiTopology } from "../api/client";
+import { getActiveTrafficExecution, getLatestTelemetry, getTopology, getTrafficExecution, startTrafficExecution, stopTrafficExecution } from "../api/client";
 import { TrafficLab } from "./TrafficLab";
 
 vi.mock("../api/client", () => ({
   getActiveTrafficExecution: vi.fn(),
   getLatestTelemetry: vi.fn(),
+  getTopology: vi.fn(),
   getTrafficExecution: vi.fn(),
   startTrafficExecution: vi.fn(),
   stopTrafficExecution: vi.fn(),
 }));
 
 const getLatestTelemetryMock = vi.mocked(getLatestTelemetry);
+const getTopologyMock = vi.mocked(getTopology);
 const getActiveMock = vi.mocked(getActiveTrafficExecution);
 const getExecutionMock = vi.mocked(getTrafficExecution);
 const startExecutionMock = vi.mocked(startTrafficExecution);
@@ -36,6 +38,8 @@ function telemetry(status: ApiTelemetry["status"]): ApiTelemetry {
       source: "h1",
       scenario: "normal",
       throughput_mbps: 2.997,
+      bandwidth_mbps: 10,
+      utilization_percent: 29.97,
       latency_ms: 20.6309,
       jitter_ms: 0.0334,
       packet_loss_percent: 0,
@@ -63,6 +67,15 @@ beforeEach(() => {
   rootUnmounted = false;
   getLatestTelemetryMock.mockReset();
   getLatestTelemetryMock.mockResolvedValue(telemetry("available"));
+  getTopologyMock.mockReset().mockResolvedValue({
+    status: "configured",
+    source: "configured_topology",
+    live_connectivity_verified: false,
+    bottleneck_interface: "s1-eth5",
+    hosts: [],
+    switches: ["s1", "s2"],
+    links: [{ source: "s1", target: "s2", bandwidth_mbps: 10, delay: "10ms" }],
+  } satisfies ApiTopology);
   getActiveMock.mockReset().mockResolvedValue(null);
   getExecutionMock.mockReset();
   startExecutionMock.mockReset();
@@ -88,6 +101,10 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(container.textContent).toContain("s1-eth5");
     expect(container.textContent).toContain("2026-10-20T10:00:00+00:00");
     expect(container.textContent).toContain("2.5 seconds");
+    expect(container.textContent).toContain("Configured s1–s2 bottleneck: 10 Mbps");
+    expect(container.textContent).toContain("Selected offered load: 4 Mbps/flow × 4 configured flows = 16.0 Mbps aggregate");
+    expect(container.textContent).toContain("Measured utilization 29.97 %");
+    expect(container.textContent).toContain("Capacity denominator 10 Mbps");
     expect(container.textContent).toContain("2.997 Mbps");
     expect(container.textContent).toContain("20.6309 ms");
     expect(container.textContent).toContain("0.0334 ms");
@@ -195,6 +212,7 @@ describe("Traffic Lab telemetry and execution boundary", () => {
     expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining("Destination ports: 5201, 5202, 5203, 5204"));
     expect(startExecutionMock).toHaveBeenCalledWith("congestion", 4, 20, "all");
     expect(container.textContent).toContain("Starting");
+    expect(container.textContent).toContain("4 Mbps offered per flow · 16.0 Mbps aggregate offered");
     expect(container.textContent).toContain("Traffic execution");
   });
 

@@ -304,10 +304,13 @@ describe("dashboard API client", () => {
         freshness_age_seconds: 5,
         prediction: "LOW",
         confidence: 0.7,
+        total_bandwidth_mbps: null,
+        policy_percentages: {},
         input_features: { utilization: 25 },
         measured: { throughput_mbps: 2.9, latency_ms: null, jitter_ms: null, packet_loss_percent: null },
         service_allocations_mbps: { gaming: 2.7 },
         flow_allocations_mbps: { "5201": 2.7 },
+        unmatched_rate_mbps: 1.0,
         planning_only: true,
       }],
       trials: [],
@@ -315,6 +318,7 @@ describe("dashboard API client", () => {
     expect(normalized.kind).toBe("experiment-runner");
     expect(normalized.records[0].prediction).toBe("LOW");
     expect(normalized.records[0].flowAllocationsMbps?.["5201"]).toBe(2.7);
+    expect(normalized.records[0].unmatchedRateMbps).toBe(1.0);
     expect(normalized.records[0].planningOnly).toBe(true);
   });
 });
@@ -352,7 +356,7 @@ describe("offline artifact client", () => {
           },
         },
       }],
-    }));
+    }), Date.parse("2026-10-20T00:00:12Z"));
 
     expect(report.records[0].prediction).toBe("MEDIUM");
     expect(report.records[0].confidence).toBe(0.8);

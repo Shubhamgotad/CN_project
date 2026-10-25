@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import ipaddress
 import json
 import math
@@ -215,6 +215,7 @@ class DryRunDecisionResponse(APIModel):
     applied: Literal[False] = False
     execution_state: Literal["dry_run"] = "dry_run"
     application_enabled: bool = False
+    application_blockers: list[Literal["application_disabled", "exclusive_tc_ownership_unavailable"]] = Field(default_factory=list)
     telemetry_status: Literal["available", "stale", "unavailable"]
     telemetry_source: Literal["configured_person1_jsonl", "completed_experiment_person1_jsonl", "none"]
     measurement_age_seconds: float | None = None
@@ -276,6 +277,9 @@ class IsolatedQosServiceStatusResponse(APIModel):
 
 class ReportSummary(APIModel):
     report_id: str
+    created_at: str | None = None
+    input_record_count: int | None = None
+    freshness_status: Literal["fresh", "stale", "future", "unknown"] = "unknown"
     report_type: Literal[
         "experiment-runner", "evidence-analysis", "campaign-validation", "unknown"
     ]
@@ -287,6 +291,7 @@ class ReportSummary(APIModel):
 
 class ReportsResponse(APIModel):
     status: Literal["available", "unavailable"]
+    directory_status: Literal["unset", "invalid", "inaccessible", "valid"]
     message: str
     reports: list[ReportSummary] = Field(default_factory=list)
 
@@ -311,8 +316,11 @@ class RunnerPlanRecord(APIModel):
     confidence: float | None = None
     input_features: dict[str, float] = Field(default_factory=dict)
     measured: MetricSummary
+    total_bandwidth_mbps: float | None = None
+    policy_percentages: dict[str, float] = Field(default_factory=dict)
     service_allocations_mbps: dict[str, float] = Field(default_factory=dict)
     flow_allocations_mbps: dict[str, float] = Field(default_factory=dict)
+    unmatched_rate_mbps: float | None = None
     planning_only: Literal[True] = True
 
 
@@ -543,6 +551,37 @@ def _completed_experiment_telemetry(
                 or not output_dir.is_dir()
             ):
                 continue
+            # Completed-run timestamps are authoritative provenance. Without a
+            # timezone-aware completion time we cannot prove that an otherwise
+            # recent-looking row belongs to a finished run.
+            finished_value = state.get("finished_at")
+            if not isinstance(finished_value, str):
+                continue
+            try:
+                finished_at = datetime.fromisoformat(finished_value.replace("Z", "+00:00"))
+                if finished_at.tzinfo is None or finished_at.utcoffset() is None:
+                    continue
+                finished_at = finished_at.astimezone(timezone.utc)
+            except ValueError:
+                continue
+            source_host = state.get("source_host")
+            flows = state.get("flows")
+            if isinstance(flows, list) and flows and all(item in {"h1", "h2", "h3", "h4"} for item in flows):
+                allowed_sources = set(flows)
+                expected_flows = (
+                    {"h1", "h2", "h3", "h4"}
+                    if source_host == "all" and state.get("scenario") == "congestion"
+                    else {source_host}
+                )
+                if allowed_sources != expected_flows or (source_host == "all" and state.get("scenario") != "congestion"):
+                    continue
+            else:
+                allowed_sources = (
+                    {"h1", "h2", "h3", "h4"}
+                    if state.get("scenario") == "congestion" else {source_host}
+                ) if source_host in {"h1", "h2", "h3", "h4", "all"} else (
+                    {"h1", "h2", "h3", "h4"} if state.get("scenario") == "congestion" else {"h1"}
+                )
             telemetry_path = output_dir / f"{state['scenario']}.jsonl"
             if telemetry_path.is_symlink() or not telemetry_path.is_file():
                 continue
@@ -562,6 +601,12 @@ def _completed_experiment_telemetry(
             try:
                 payload = json.loads(line, parse_constant=_json_constant)
                 timestamp = _telemetry_timestamp(payload)
+                if (payload.get("experiment_id") != state["experiment_id"]
+                        or payload.get("scenario") != state["scenario"]
+                        or payload.get("source") not in allowed_sources):
+                    raise ValueError("telemetry identity or source host does not match completed run state")
+                if timestamp > finished_at + timedelta(seconds=MAX_FUTURE_SKEW_SECONDS):
+                    raise ValueError("telemetry timestamp is later than the authoritative run completion time")
             except (ValueError, TypeError, KeyError, json.JSONDecodeError):
                 if rejected_record_counter is not None:
                     rejected_record_counter[0] += 1
@@ -626,13 +671,50 @@ def _configured_report_root() -> Path | None:
     configured = os.environ.get(REPORT_DIRECTORY_ENV)
     if not configured or not configured.strip():
         return None
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR must be an absolute path to an existing approved directory.")
     try:
-        root = Path(configured).expanduser().resolve(strict=True)
+        if any(component.is_symlink() for component in (candidate, *candidate.parents)):
+            raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is invalid; symbolic-link paths are not approved.")
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is invalid; configure an existing directory outside the repository.")
+        root = candidate.resolve(strict=True)
+    except HTTPException:
+        raise
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR does not exist; create and approve the directory before starting the workflow.") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is inaccessible to the API process.") from exc
     except (OSError, RuntimeError) as exc:
-        raise HTTPException(status_code=503, detail="Configured report directory is unavailable.") from exc
-    if not root.is_dir():
-        raise HTTPException(status_code=503, detail="Configured report directory is unavailable.")
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is invalid or inaccessible.") from exc
+    repository = Path(__file__).resolve().parents[2]
+    if root == repository or repository in root.parents:
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR must be outside the repository.")
+    evidence_root = EXPERIMENT_RUN_ROOT.resolve(strict=False)
+    if root == evidence_root or evidence_root in root.parents:
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR must be outside the Traffic Lab evidence directory.")
+    try:
+        mode = root.stat().st_mode
+        if not (mode & 0o444 and mode & 0o111) or not os.access(root, os.R_OK | os.X_OK):
+            raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is inaccessible; read and directory access are required.")
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="ADAPTIVE_QOS_REPORT_DIR is inaccessible.") from exc
     return root
+
+
+def _report_directory_status() -> tuple[str, str, Path | None]:
+    configured = os.environ.get(REPORT_DIRECTORY_ENV)
+    if not configured or not configured.strip():
+        return "unset", f"{REPORT_DIRECTORY_ENV} is unset. Set it to an existing approved directory outside the repository.", None
+    try:
+        root = _configured_report_root()
+    except HTTPException as exc:
+        message = exc.detail if isinstance(exc.detail, str) else "Configured report directory is unavailable."
+        category = "inaccessible" if "inaccessible" in message else "invalid"
+        return category, message, None
+    return "valid", "Configured report directory is ready.", root
 
 
 def _classify_report(report: Any) -> str | None:
@@ -646,9 +728,108 @@ def _classify_report(report: Any) -> str | None:
         and report.get("measurements_collected") is False
         and report.get("live_qos_applied") is False
         and report.get("tc_commands_executed") is False
-        and report.get("mode") in {"adaptive", "both", "baseline"}
+        and report.get("mode") in {"adaptive", "both"}
+        and report.get("status") == "planned"
         and isinstance(report.get("results"), list)
+        and len(report["results"]) > 0
     ):
+        counts = report.get("counts")
+        if (not isinstance(counts, dict)
+                or counts.get("records_processed") != len(report["results"])
+                or not isinstance(report.get("run_id"), str)
+                or not report.get("run_id")
+                or not isinstance(report.get("created_at"), str)):
+            return None
+        try:
+            created = datetime.fromisoformat(report["created_at"].replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if created.tzinfo is None or created.utcoffset() is None:
+            return None
+        expected_scenarios = {"normal", "moderate", "congestion", "burst"}
+        for row in report["results"]:
+            if not isinstance(row, dict):
+                return None
+            experiment_id = row.get("experiment_id")
+            scenario = row.get("scenario")
+            source = row.get("source")
+            modes = row.get("modes")
+            adaptive = modes.get("adaptive") if isinstance(modes, dict) else None
+            prediction = adaptive.get("prediction") if isinstance(adaptive, dict) else None
+            window = row.get("window")
+            timestamp = window.get("timestamp") if isinstance(window, dict) else None
+            freshness = row.get("freshness")
+            queue_quality = row.get("queue_measurement_quality")
+            allocations = adaptive.get("flow_allocations_mbps") if isinstance(adaptive, dict) else None
+            total_bandwidth = _finite(adaptive.get("total_bandwidth_mbps")) if isinstance(adaptive, dict) else None
+            percentages = adaptive.get("policy_percentages") if isinstance(adaptive, dict) else None
+            service_allocations = adaptive.get("service_class_allocation_mbps") if isinstance(adaptive, dict) else None
+            unmatched = adaptive.get("unmatched_leaf") if isinstance(adaptive, dict) else None
+            has_allocations = (
+                isinstance(allocations, dict)
+                and set(allocations) == {"5201", "5202", "5203", "5204"}
+                and all(_finite(value) is not None and _finite(value) >= 0 for value in allocations.values())
+            )
+            unmatched_rate = _finite(unmatched.get("rate_mbps")) if isinstance(unmatched, dict) else None
+            # Older schema-v1 reports remain readable; validate budget provenance
+            # strictly whenever the newer optional fields are present.
+            if total_bandwidth is not None or percentages is not None:
+                if (total_bandwidth is None or total_bandwidth <= 0
+                        or not isinstance(percentages, dict)
+                        or set(percentages) != {"gaming", "video", "web", "bulk"}
+                        or not isinstance(service_allocations, dict)
+                        or set(service_allocations) != {"gaming", "video", "web", "bulk"}):
+                    return None
+                weights = [_finite(percentages[key]) for key in ("gaming", "video", "web", "bulk")]
+                rates = [_finite(service_allocations[key]) for key in ("gaming", "video", "web", "bulk")]
+                if (any(value is None or value < 0 for value in [*weights, *rates])
+                        or not math.isclose(sum(weights), 100.0, abs_tol=0.01)):
+                    return None
+                if unmatched_rate is None or not math.isclose(sum(rates) + unmatched_rate, total_bandwidth, abs_tol=0.01):
+                    return None
+                service_budget = total_bandwidth - unmatched_rate
+                if any(
+                    not math.isclose(rates[index], service_budget * weights[index] / 100.0, abs_tol=0.01)
+                    for index in range(4)
+                ):
+                    return None
+            measured = row.get("measured")
+            if not isinstance(measured, dict):
+                return None
+            required_metrics = ("throughput_mbps", "latency_ms", "jitter_ms", "packet_loss_percent")
+            metric_values = [_finite(measured.get(field)) for field in required_metrics]
+            if (any(value is None or value < 0 for value in metric_values)
+                    or metric_values[-1] is None or metric_values[-1] > 100):
+                return None
+            if (row.get("status") != "planned"
+                    or not isinstance(experiment_id, str) or not re.fullmatch(r"[0-9a-f]{32}", experiment_id)
+                    or scenario not in expected_scenarios or source not in {"h1", "h2", "h3", "h4"}
+                    or not isinstance(timestamp, str) or not has_allocations
+                    or unmatched_rate is None or unmatched_rate < 0
+                    or not isinstance(adaptive, dict) or adaptive.get("status") != "planned"):
+                return None
+            declared_experiment = report.get("experiment")
+            if isinstance(declared_experiment, dict) and (
+                declared_experiment.get("experiment_id") != experiment_id
+                or declared_experiment.get("scenario") != scenario
+                or not isinstance(declared_experiment.get("sources"), list)
+                or source not in declared_experiment.get("sources", [])
+            ):
+                return None
+            try:
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            confidence = _finite(prediction.get("confidence")) if isinstance(prediction, dict) else None
+            if (parsed.tzinfo is None or parsed.utcoffset() is None or not isinstance(prediction, dict)
+                    or prediction.get("congestion") not in {"LOW", "MEDIUM", "HIGH"}
+                    or confidence is None or not 0 <= confidence <= 1
+                    or not isinstance(freshness, dict) or freshness.get("status") != "fresh"
+                    or not isinstance(queue_quality, dict) or queue_quality.get("status") != "ready"):
+                return None
+            stored_age = _finite(freshness.get("age_seconds"))
+            if stored_age is None or stored_age < -MAX_FUTURE_SKEW_SECONDS or stored_age > MAX_TELEMETRY_AGE_SECONDS:
+                return None
         return "experiment-runner"
     if (
         report.get("offline_only") is True
@@ -708,8 +889,37 @@ def _report_summary(report_id: str, document: Any) -> ReportSummary | None:
         if report_type == "campaign-validation"
         else None
     )
+    freshness_status: Literal["fresh", "stale", "future", "unknown"] = "unknown"
+    if report_type == "experiment-runner":
+        statuses: list[str] = []
+        for item in document["results"]:
+            window = item.get("window") if isinstance(item, dict) else None
+            timestamp = window.get("timestamp") if isinstance(window, dict) else None
+            if not isinstance(timestamp, str):
+                statuses.append("unknown")
+                continue
+            try:
+                measured_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if measured_at.tzinfo is None or measured_at.utcoffset() is None:
+                    statuses.append("unknown")
+                    continue
+                age = (datetime.now(timezone.utc) - measured_at.astimezone(timezone.utc)).total_seconds()
+                statuses.append("stale" if age > MAX_TELEMETRY_AGE_SECONDS else "future" if age < -MAX_FUTURE_SKEW_SECONDS else "fresh")
+            except ValueError:
+                statuses.append("unknown")
+        freshness_status = "stale" if "stale" in statuses else "future" if "future" in statuses else "unknown" if "unknown" in statuses else "fresh"
     return ReportSummary(
         report_id=report_id,
+        created_at=_safe_text(document.get("created_at"), max_length=64),
+        input_record_count=(
+            int(document["counts"]["records_processed"])
+            if isinstance(document.get("counts"), dict)
+            and isinstance(document["counts"].get("records_processed"), int)
+            and not isinstance(document["counts"].get("records_processed"), bool)
+            and document["counts"]["records_processed"] >= 0
+            else None
+        ),
+        freshness_status=freshness_status,
         report_type=report_type,  # type: ignore[arg-type]
         status=status,
         campaign_status=campaign_status,
@@ -735,6 +945,21 @@ def _runner_records(document: dict[str, Any]) -> list[RunnerPlanRecord]:
         freshness = freshness if isinstance(freshness, dict) else {}
         window = item.get("window")
         window = window if isinstance(window, dict) else {}
+        timestamp_value = window.get("timestamp")
+        current_freshness = "unknown"
+        current_age: float | None = None
+        if isinstance(timestamp_value, str):
+            try:
+                measured_at = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
+                if measured_at.tzinfo is not None and measured_at.utcoffset() is not None:
+                    current_age = (datetime.now(timezone.utc) - measured_at.astimezone(timezone.utc)).total_seconds()
+                    current_freshness = (
+                        "stale" if current_age > MAX_TELEMETRY_AGE_SECONDS
+                        else "future" if current_age < -MAX_FUTURE_SKEW_SECONDS
+                        else "fresh"
+                    )
+            except ValueError:
+                pass
 
         def allocation_map(value: Any, expected: set[str]) -> dict[str, float]:
             if not isinstance(value, dict):
@@ -761,13 +986,17 @@ def _runner_records(document: dict[str, Any]) -> list[RunnerPlanRecord]:
             experiment_id=_safe_id(item.get("experiment_id")),
             scenario=_safe_text(item.get("scenario"), max_length=40),
             source=_safe_text(item.get("source"), max_length=20),
-            timestamp=_safe_text(window.get("timestamp"), max_length=64),
-            freshness_status=_recognized_status(freshness.get("status"), "not evaluated"),
-            freshness_age_seconds=_finite(freshness.get("age_seconds")),
+            timestamp=_safe_text(timestamp_value, max_length=64),
+            freshness_status=current_freshness,
+            freshness_age_seconds=current_age,
             prediction=congestion if congestion in {"LOW", "MEDIUM", "HIGH"} else None,
             confidence=confidence if confidence is not None and 0 <= confidence <= 1 else None,
             input_features=input_features,
             measured=_metric_summary(item.get("measured")),
+            total_bandwidth_mbps=_finite(adaptive.get("total_bandwidth_mbps")),
+            policy_percentages=allocation_map(
+                adaptive.get("policy_percentages"), {"gaming", "video", "web", "bulk"}
+            ),
             service_allocations_mbps=allocation_map(
                 adaptive.get("service_class_allocation_mbps"),
                 {"gaming", "video", "web", "bulk"},
@@ -775,6 +1004,10 @@ def _runner_records(document: dict[str, Any]) -> list[RunnerPlanRecord]:
             flow_allocations_mbps=allocation_map(
                 adaptive.get("flow_allocations_mbps"),
                 {"5201", "5202", "5203", "5204"},
+            ),
+            unmatched_rate_mbps=(
+                _finite(adaptive.get("unmatched_leaf", {}).get("rate_mbps"))
+                if isinstance(adaptive.get("unmatched_leaf"), dict) else None
             ),
         ))
     return records
@@ -1116,10 +1349,12 @@ def _latest_telemetry(
 ) -> LatestTelemetryResponse:
     configured = os.environ.get(TELEMETRY_FILE_ENV)
     candidates: list[tuple[datetime, dict[str, Any], str]] = []
+    configured_rejected = 0
+    configured_unavailable = False
     if configured and configured.strip():
         try:
             content = _read_configured_telemetry_text(Path(configured).expanduser())
-            rows, _ = _complete_jsonl_records(content)
+            rows, configured_rejected = _complete_jsonl_records(content)
             for timestamp, payload in rows:
                 if host is not None and payload.get("source") != host:
                     continue
@@ -1127,21 +1362,26 @@ def _latest_telemetry(
                     continue
                 candidates.append((timestamp, payload, "configured_person1_jsonl"))
         except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            pass
+            configured_unavailable = True
 
-    for timestamp, payload in _completed_experiment_telemetry():
-        if host is not None and payload.get("source") != host:
-            continue
-        if scenario is not None and payload.get("scenario") != scenario:
-            continue
-        candidates.append((timestamp, payload, "completed_experiment_person1_jsonl"))
+    if not (configured and configured.strip()):
+        for timestamp, payload in _completed_experiment_telemetry():
+            if host is not None and payload.get("source") != host:
+                continue
+            if scenario is not None and payload.get("scenario") != scenario:
+                continue
+            candidates.append((timestamp, payload, "completed_experiment_person1_jsonl"))
     if not candidates:
         if configured and configured.strip():
             source = "configured_person1_jsonl"
             message = (
-                "No valid telemetry record matches the requested host and scenario filters."
+                "No valid telemetry record in the explicitly configured ADAPTIVE_QOS_TELEMETRY_FILE matches the requested host and scenario filters; automatic completed-run discovery is not mixed with the override."
                 if host is not None or scenario is not None
-                else "The configured telemetry file is missing, unsafe, empty, or invalid; no valid completed experiment measurement was found."
+                else (
+                    "The explicitly configured telemetry file is unavailable or unsafe; automatic completed-run discovery is not mixed with it."
+                    if configured_unavailable
+                    else f"The explicitly configured telemetry file has no complete valid measurement ({configured_rejected} invalid records rejected); automatic completed-run discovery is not mixed with it."
+                )
             )
         else:
             source = "none"
@@ -1159,7 +1399,14 @@ def _latest_telemetry(
     age = (now - parsed_time).total_seconds()
     if age > MAX_TELEMETRY_AGE_SECONDS:
         status: Literal["available", "stale", "unavailable"] = "stale"
-        message = "Latest validated measurement is stale."
+        age_text = f"{age:.1f} seconds old; the freshness limit is {MAX_TELEMETRY_AGE_SECONDS} seconds."
+        if source == "configured_person1_jsonl":
+            message = (
+                f"The explicitly configured ADAPTIVE_QOS_TELEMETRY_FILE measurement is stale: {age_text} "
+                "Automatic completed-run discovery is not mixed with an explicit file override. Clear that setting to use the newest eligible completed-run measurement."
+            )
+        else:
+            message = f"Latest validated completed-run measurement is stale: {age_text}"
     elif age < -MAX_FUTURE_SKEW_SECONDS:
         status = "unavailable"
         message = "Latest measurement timestamp is too far in the future."
@@ -1223,7 +1470,7 @@ def telemetry_history(
         except (OSError, RuntimeError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             pass
 
-    completed_records = _completed_experiment_telemetry(
+    completed_records = [] if configured and configured.strip() else _completed_experiment_telemetry(
         max_run_directories=MAX_TELEMETRY_HISTORY_RUNS,
         max_total_bytes=max(0, MAX_TELEMETRY_HISTORY_BYTES - total_bytes),
         max_records=MAX_TELEMETRY_HISTORY_SCAN_RECORDS,
@@ -1264,7 +1511,11 @@ def telemetry_history(
         message = "No recorded telemetry matches the requested host and scenario filters."
         status = "unavailable"
     else:
-        message = "No valid records were found in the configured or completed-experiment telemetry sources."
+        message = (
+            "No valid record was found in the explicitly configured telemetry file; automatic experiment discovery is not mixed with it."
+            if configured and configured.strip()
+            else "No valid records were found in completed-experiment telemetry."
+        )
         status = "unavailable"
 
     return TelemetryHistoryResponse(
@@ -1294,10 +1545,12 @@ def qos_dry_run_decision(
             raise HTTPException(status_code=422, detail="QoS decision accepts only host and scenario filters.")
     telemetry = latest_telemetry(host=host, scenario=scenario)
     result = _decision_loop_for(host, scenario).evaluate(telemetry)
-    result["application_enabled"] = (
-        os.environ.get(QOS_APPLICATION_ENV) == "1"
-        and tc_controller.LIVE_TC_OWNERSHIP_GUARANTEED
-    )
+    result["application_blockers"] = []
+    if os.environ.get(QOS_APPLICATION_ENV) != "1":
+        result["application_blockers"].append("application_disabled")
+    if not tc_controller.LIVE_TC_OWNERSHIP_GUARANTEED:
+        result["application_blockers"].append("exclusive_tc_ownership_unavailable")
+    result["application_enabled"] = not result["application_blockers"]
     return DryRunDecisionResponse(**result)
 
 
@@ -1486,21 +1739,25 @@ def _list_report_summaries(root: Path) -> list[ReportSummary]:
             ))
         else:
             summaries.append(summary)
-    return sorted(summaries, key=lambda item: item.report_id)
+    return sorted(summaries, key=lambda item: (item.created_at or "", item.report_id), reverse=True)
 
 
 @app.get("/api/reports", response_model=ReportsResponse)
 def list_reports() -> ReportsResponse:
-    root = _configured_report_root()
+    directory_status, message, root = _report_directory_status()
     if root is None:
         return ReportsResponse(
             status="unavailable",
-            message=f"Set {REPORT_DIRECTORY_ENV} to an explicitly approved report directory.",
+            directory_status=directory_status,
+            message=message,
         )
+    reports = _list_report_summaries(root)
     return ReportsResponse(
         status="available",
-        message="Only recognized JSON reports from the configured directory are listed.",
-        reports=_list_report_summaries(root),
+        directory_status="valid",
+        message=("Configured report directory is valid and contains no compatible reports." if not reports
+                 else "Compatible validated offline reports are available."),
+        reports=reports,
     )
 
 

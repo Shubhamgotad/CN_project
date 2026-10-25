@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import uuid
 from typing import TextIO
 
 
@@ -68,3 +69,25 @@ def open_exclusive_text(path: str | Path, *, newline: str | None = None) -> Text
         encoding="utf-8",
         newline=newline,
     )
+
+
+def write_exclusive_text(path: str | Path, content: str) -> Path:
+    """Atomically publish a complete report without replacing an existing file.
+
+    A private temporary is written and fsynced in the destination directory;
+    hard-link creation atomically fails if another process already owns the name.
+    """
+    destination = Path(path)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open_exclusive_text(temporary) as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+        return destination
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass

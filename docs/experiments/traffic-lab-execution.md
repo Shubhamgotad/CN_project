@@ -7,6 +7,12 @@ read-only topology check and launches the existing traffic generator with fixed
 argv arguments. Client selection controls the actual source host(s); the server
 validates the selection and maps each supported host to its UDP destination port.
 
+The configured `s1`–`s2` bottleneck is 10 Mbps. The selected `rate_mbps` is an
+iperf3 UDP offered-rate target for each flow, not a link-capacity setting or a
+promise of delivered throughput. Aggregate offered load is the per-flow target
+multiplied by the actual flow count; telemetry throughput and utilization are
+measured separately against the configured bottleneck capacity.
+
 ## Supported execution bounds
 
 - Normal: one UDP flow from the selected host (`h1`-`h4`) to its corresponding
