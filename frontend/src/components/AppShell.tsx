@@ -2,7 +2,6 @@ import {
   Activity,
   Bot,
   ChartNoAxesCombined,
-  Coffee,
   FlaskConical,
   Gauge,
   LayoutDashboard,
@@ -48,7 +47,7 @@ export function AppShell() {
     <div className="app-frame">
       <aside className={`sidebar ${mobileMenuOpen ? "sidebar--open" : ""}`}>
         <div className="brand-lockup">
-          <div className="brand-mark"><Coffee size={20} /></div>
+          <div className="brand-mark"><Network size={20} /></div>
           <div>
             <strong>Adaptive QoS</strong>
             <span>Network studio</span>
@@ -78,7 +77,7 @@ export function AppShell() {
         </nav>
         <div className="sidebar-bottom">
           <div className="sidebar-bottom__icon"><Network size={17} /></div>
-          <div><strong>Offline first</strong><span>No live network controls</span></div>
+          <div><strong>Guarded local lab</strong><span>QoS changes require authorization</span></div>
         </div>
       </aside>
 

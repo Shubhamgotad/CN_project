@@ -288,7 +288,9 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
               </div>
               <div>
                 <small>Application lifecycle</small>
-                <strong>{applicationState.replaceAll("_", " ")}</strong>
+                <strong className={`qos-application-state qos-application-state--${applicationState}`}>
+                  {applicationState.replaceAll("_", " ")}
+                </strong>
                 <span>{applicationState === "applied_verified"
                   ? "Profile confirmed by WSL kernel readback."
                   : applicationState === "verification_failed"
@@ -374,7 +376,7 @@ export function AiQos({ report, reportSource, onReport }: AiQosProps) {
             <p className="qos-dry-run-note">{dryRunDecision.message}</p>
           </>
         ) : (
-          <div className="qos-dry-run-empty" role="status">
+          <div className={`qos-dry-run-empty qos-dry-run-empty--${dryRunDecision?.status ?? "loading"}`} role="status">
             <strong>{dryRunDecision?.status === "stale" ? "Telemetry is stale" : "No safe QoS decision available"}</strong>
             <span>{dryRunDecision?.message ?? "Waiting for a validated telemetry response."}</span>
             <span>Stale, unavailable, or unsupported telemetry never produces a policy proposal.</span>
